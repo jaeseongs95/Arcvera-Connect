@@ -378,7 +378,7 @@ impl Engine {
         let weak = Arc::downgrade(&session);
         let on_event = Arc::new(move |event| { if let Some(session) = weak.upgrade() { session.observe(event); } });
         let info = session.info()?;
-        let adapter = match self.runtime_snapshot().and_then(|selected| {
+        let adapter = match self.runtime_snapshot_cancelled(&session.stop_requested).and_then(|selected| {
             let server = selected.server_executable.clone();
             let kind = selected.server_kind.clone();
             self.prepare_start_with(selected, &session.stop_requested,
@@ -677,7 +677,13 @@ impl Engine {
         self.get_codex_settings()
     }
 
-    fn codex_executable(&self) -> Result<std::ffi::OsString, String> { Ok(self.runtime_snapshot()?.executable) }
+    fn codex_executable(&self) -> Result<std::ffi::OsString, String> {
+        let executable = self.get_codex_settings()?.executable()?;
+        // Catalog and external-session queries use only the CLI. An unrelated
+        // invalid server choice must not prevent browsing existing sessions.
+        if !codex::is_runtime_launcher(&executable) { return Ok(executable); }
+        Ok(codex::resolve_runtime_source(&executable, &executable, "cli", false, &self.inner.exiting)?.executable)
+    }
 
     fn change_runtime_selection_with(&self, save: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
         {
@@ -703,7 +709,12 @@ impl Engine {
     }
 
     fn runtime_snapshot(&self) -> Result<RuntimeSnapshot, String> {
+        self.runtime_snapshot_cancelled(&self.inner.exiting)
+    }
+
+    fn runtime_snapshot_cancelled(&self, cancelled: &Arc<AtomicBool>) -> Result<RuntimeSnapshot, String> {
         self.runtime_pair_snapshot_with(|| {
+            if cancelled.load(Ordering::Acquire) || self.inner.exiting.load(Ordering::Acquire) { return Err("종료 또는 중단 요청으로 실행 패키지를 확인하지 않았습니다.".into()); }
             let settings = self.get_codex_settings()?;
             let executable = settings.executable()?;
             let automatic_server = settings.app_server.saved_path.is_none();
@@ -711,7 +722,7 @@ impl Engine {
             // launcher root is not part of that package. Manual choices still fail explicitly.
             let server = if automatic_server && codex::is_runtime_launcher(&executable) { executable.clone() }
                 else { settings.app_server.executable()? };
-            let source = codex::resolve_runtime_source(&executable, &server, &settings.app_server.kind, automatic_server, &self.inner.exiting)?;
+            let source = codex::resolve_runtime_source(&executable, &server, &settings.app_server.kind, automatic_server, cancelled)?;
             Ok((source.executable, source.server_executable, source.server_kind, source.source_manifest_sha256))
         })
     }
@@ -1189,6 +1200,30 @@ mod runtime_preparation_tests {
         assert!(engine.verify_prepared_runtime(&prepared, &AtomicBool::new(false)).is_err());
         assert_eq!(original.source_manifest_sha256.as_deref(), Some("first-manifest"));
         assert_eq!(original.executable, std::ffi::OsString::from("package-cli.exe"));
+    }
+
+    #[test]
+    fn stopped_start_does_not_resolve_settings_or_invalidate_a_ready_pair() {
+        let engine = engine();
+        let original = select(&engine, "admitted.exe");
+        let prepared = engine.prepare_selected_runtime_with(original.clone(), false, &AtomicBool::new(false), |_| Ok(())).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(true));
+        let error = engine.runtime_snapshot_cancelled(&cancelled).unwrap_err();
+        assert!(error.contains("중단 요청"));
+        assert_eq!(engine.inner.runtime.lock().unwrap().generation, original.generation);
+        engine.verify_prepared_runtime(&prepared, &AtomicBool::new(false)).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cli_only_browsing_does_not_depend_on_an_invalid_manual_server() {
+        let engine = engine();
+        let cli = std::env::current_exe().unwrap();
+        let cli = crate::codex_settings::validate(&cli).unwrap();
+        engine.set_codex_executable(Some(&cli)).unwrap();
+        engine.inner.store.lock().unwrap().set_app_server_executable(Some("Z:\\missing-server-fixture.exe")).unwrap();
+        assert!(engine.get_codex_settings().unwrap().app_server.error.is_some());
+        assert_eq!(engine.codex_executable().unwrap(), std::ffi::OsString::from(cli));
     }
 
     #[test]
