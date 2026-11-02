@@ -180,8 +180,8 @@ mod tests {
     fn launcher_pins_actual_pair_and_preserves_manual_server() {
         let automatic = fixture(response(), true).unwrap();
         let package = root().join("versions/revision-33/bin");
-        assert_eq!(automatic.executable, package.join("codex.exe").into_os_string());
-        assert_eq!(automatic.server_executable, package.join("codex-app-server.exe").into_os_string());
+        assert_eq!(Path::new(&automatic.executable), package.join("codex.exe"));
+        assert_eq!(Path::new(&automatic.server_executable), package.join("codex-app-server.exe"));
         assert_eq!(automatic.server_kind, "standalone");
         assert_eq!(automatic.source_manifest_sha256, Some("a".repeat(64)));
         let manual = fixture(response(), false).unwrap();
@@ -196,7 +196,7 @@ mod tests {
         next["appServerPath"] = json!(next_package.join("bin/codex-app-server.exe"));
         let next = fixture(next, true).unwrap();
         assert_ne!(next.executable, automatic.executable);
-        assert_eq!(automatic.executable, package.join("codex.exe").into_os_string());
+        assert_eq!(Path::new(&automatic.executable), package.join("codex.exe"));
     }
 
     #[test]

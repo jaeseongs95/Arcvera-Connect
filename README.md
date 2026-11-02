@@ -195,8 +195,9 @@ CLIs connect the terminal, status observer and mobile controls to the same exist
 daemon through its default proxy. Shared enable, disable and pairing affect all
 conversations on that server. At startup, the app reuses a running daemon or starts
 the installed daemon, then verifies its connection before restoring sessions. A
-failed start leaves saved sessions available for retry. The app does not install,
-replace or stop the shared daemon.
+failed start leaves saved sessions available for retry. Startup does not replace or
+stop the shared daemon. Changing its version is a separate, confirmed action in
+**Executable settings → Check server versions → Match versions**.
 Automatic startup requires the CLI's `app-server daemon start --existing-installation`
 option. With older CLIs, start the shared server before opening the app.
 
@@ -342,7 +343,8 @@ not parse terminal text. Earlier pages and large originals are fetched on demand
 
 Conversation view requires a runtime supporting passive subscriptions and atomic idle user input.
 Selecting a newer executable does not automatically upgrade an already running shared server.
-Conversation view checks the connected server; the app never stops or replaces an existing daemon.
+Conversation view checks the connected server and does not itself stop or replace it.
+Use the separately confirmed version transition in executable settings when needed.
 Older servers show a capability limitation; the app does not fall back to operations that can trigger
 queued work or merge a new message into an active turn. Terminal view remains available. Weekly
 usage also reads only through an existing shared server; unavailable reads preserve the last

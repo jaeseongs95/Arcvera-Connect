@@ -20,20 +20,20 @@ async function openSettings(page: Page, hold = false) {
   await page.locator('#settings-open').click(); await page.locator('#codex-settings-open').click();
 }
 
-test('선택 명령줄과 다음 시작 서버와 실행 중 서버의 경로·버전을 구분하고 조회 외 명령을 보내지 않는다', async ({page}) => {
+test('선택 명령줄과 서버 후보와 실행 중 서버의 경로·버전을 구분하고 조회 외 명령을 보내지 않는다', async ({page}) => {
   await openSettings(page);
   expect(await page.evaluate(() => (window as any).compatibilityFixture.calls.filter((c:any) => c.command==='runtime_compatibility').length)).toBe(0);
   await page.locator('.compatibility-refresh').click();
   await expect(page.locator('.compatibility-details')).toContainText('codex-cli 0.2.0');
   await expect(page.locator('.compatibility-details')).toContainText('0.1.0');
-  await expect(page.locator('.compatibility-details dt')).toHaveText(['선택한 명령줄 실행 파일','선택한 명령줄 버전','다음 시작에 선택된 서버 실행 파일','다음 시작에 선택된 서버 버전','실제 실행 중인 서버 실행 파일','기존 연결에서 보고한 서버 버전','서브에이전트 관리','안전한 유휴 압축','지정 작업만 중단']);
+  await expect(page.locator('.compatibility-details dt')).toHaveText(['선택한 명령줄 실행 파일','선택한 명령줄 버전','서버 후보 실행 파일','서버 후보 버전','실제 실행 중인 서버 실행 파일','기존 연결에서 보고한 서버 버전','서브에이전트 관리','안전한 유휴 압축','지정 작업만 중단']);
   await expect(page.locator('.compatibility-details dd')).toHaveText(['D:\\tools\\codex.exe','codex-cli 0.2.0','D:\\next\\codex-server.exe','0.3.0','미확인','0.1.0','지원되지 않음','미확인','미확인']);
   await expect(page.locator('.compatibility-help')).toContainText('실행 중인 서버는 바뀌지');
   await expect(page.locator('.compatibility-scope')).toContainText('버전이 같아도 출처·파일 해시·실행 세대를 확인하기 전에는 같은 패키지로 확정하지 않습니다');
   await page.locator('#codex-settings-close').click();
   await page.locator('#language-select').selectOption('en');
   await page.locator('#codex-settings-open').click(); await page.locator('.compatibility-refresh').click();
-  await expect(page.locator('.compatibility-details dt')).toHaveText(['Selected CLI executable','Selected CLI version','Server executable selected for next start','Server version selected for next start','Actually running server executable','Server version reported by existing connections','Subagent management','Safe idle compaction','Interrupt exact turn']);
+  await expect(page.locator('.compatibility-details dt')).toHaveText(['Selected CLI executable','Selected CLI version','Server candidate executable','Server candidate version','Actually running server executable','Server version reported by existing connections','Subagent management','Safe idle compaction','Interrupt exact turn']);
   await expect(page.locator('.compatibility-details dd')).toHaveText(['D:\\tools\\codex.exe','codex-cli 0.2.0','D:\\next\\codex-server.exe','0.3.0','Unknown','0.1.0','Not supported','Unknown','Unknown']);
   await expect(page.locator('.compatibility-scope')).toContainText('Matching versions do not confirm the same package');
   await expect(page.locator('.compatibility-details')).toContainText('Not supported');

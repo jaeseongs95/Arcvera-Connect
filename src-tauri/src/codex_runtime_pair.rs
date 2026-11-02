@@ -117,6 +117,11 @@ fn inspect_commands(
         report.message = Some("선택한 CLI와 앱서버의 전체 버전이 다릅니다. 서버를 자동으로 변경하지 않았습니다.".into());
     } else {
         let observed = (|| -> Result<(), String> {
+            if !shared::supports_shared(&run(exe, &["app-server", "--help"])?)? {
+                report.state = "embedded".into();
+                report.message = Some("선택한 CLI는 공유 서버를 지원하지 않아 CLI에 내장된 개별 서버를 사용합니다.".into());
+                return Ok(());
+            }
             let passive_status = supports_passive_status(&run(exe, &["app-server", "daemon", "--help"])?)?;
             let bytes = if passive_status { run(exe, &["app-server", "daemon", "status", "--json"])? }
                 else { run(exe, &["app-server", "daemon", "version"])? };
@@ -199,6 +204,14 @@ mod tests {
     const R28: &str = "0.165.0+native-r28.20261029";
     const R33: &str = "0.166.0+native-r33.20261102";
 
+    fn app_server_help(shared: bool) -> Vec<u8> {
+        if shared {
+            b"Usage: codex app-server [OPTIONS] [COMMAND]\n\nCommands:\n  daemon  Manage server\n  proxy   Relay\n\nOptions:\n  -h, --help\n".to_vec()
+        } else {
+            b"Usage: codex app-server [OPTIONS]\n\nOptions:\n  -h, --help\n".to_vec()
+        }
+    }
+
     fn daemon_help(passive: bool) -> Vec<u8> {
         format!("Usage: codex app-server daemon [OPTIONS] <COMMAND>\n\nCommands:\n  start    Start existing\n  version  Read version\n{}  help     Print help\n\nOptions:\n  -h, --help\n", if passive { "  status   Read passive state\n" } else { "" }).into_bytes()
     }
@@ -212,6 +225,9 @@ mod tests {
         inspect_fixture_help(cli, server, Ok(daemon_help(false)), daemon)
     }
     fn inspect_fixture_help(cli: &str, server: &str, help: Result<Vec<u8>, String>, daemon: Result<Vec<u8>, String>) -> (Result<RuntimePairStatus, String>, Vec<String>) {
+        inspect_fixture_all_help(cli, server, Ok(app_server_help(true)), help, daemon)
+    }
+    fn inspect_fixture_all_help(cli: &str, server: &str, app_help: Result<Vec<u8>, String>, help: Result<Vec<u8>, String>, daemon: Result<Vec<u8>, String>) -> (Result<RuntimePairStatus, String>, Vec<String>) {
         let mut calls = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(20);
         let result = inspect_commands(&OsString::from("cli.exe"), &OsString::from("server.exe"), "standalone",
@@ -221,6 +237,7 @@ mod tests {
                 match (exe.to_str().unwrap(), args) {
                     ("cli.exe", ["--version"]) => Ok(format!("codex-cli {cli}\n").into_bytes()),
                     ("server.exe", ["--version"]) => Ok(format!("codex-app-server {server}\r\n").into_bytes()),
+                    ("cli.exe", ["app-server", "--help"]) => app_help.clone(),
                     ("cli.exe", ["app-server", "daemon", "--help"]) => help.clone(),
                     ("cli.exe", ["app-server", "daemon", "version"]) => daemon.clone(),
                     ("cli.exe", ["app-server", "daemon", "status", "--json"]) => daemon.clone(),
@@ -242,7 +259,7 @@ mod tests {
             assert_eq!(report.cli_version, R32);
             assert_eq!(report.managed_version.as_deref(), Some(managed));
             assert_eq!(report.running_version.as_deref(), Some(running));
-            assert_eq!(calls, ["cli.exe --version", "server.exe --version", "cli.exe app-server daemon --help", "cli.exe app-server daemon version"]);
+            assert_eq!(calls, ["cli.exe --version", "server.exe --version", "cli.exe app-server --help", "cli.exe app-server daemon --help", "cli.exe app-server daemon version"]);
         }
     }
 
@@ -264,6 +281,7 @@ mod tests {
                 calls.push(args.join(" "));
                 match args {
                     ["--version"] => Ok(format!("codex-cli {R32}\n").into_bytes()),
+                    ["app-server", "--help"] => Ok(app_server_help(true)),
                     ["app-server", "daemon", "--help"] => Ok(daemon_help(false)),
                     ["app-server", "daemon", "version"] => Ok(serde_json::to_vec(&status(R32, R32)).unwrap()),
                     _ => panic!("변경 명령 금지"),
@@ -271,7 +289,7 @@ mod tests {
             }).unwrap();
         assert_eq!(report.state, "matched");
         assert_eq!(report.selected_server_executable, "cli.exe");
-        assert_eq!(calls, ["--version", "--version", "app-server daemon --help", "app-server daemon version"]);
+        assert_eq!(calls, ["--version", "--version", "app-server --help", "app-server daemon --help", "app-server daemon version"]);
     }
 
     #[test]
@@ -283,7 +301,7 @@ mod tests {
             let report = report.unwrap();
             assert_eq!(report.state, "unavailable");
             assert!(report.message.is_some());
-            assert_eq!(calls.len(), 4);
+            assert_eq!(calls.len(), 5);
             assert_eq!(calls.last().unwrap(), "cli.exe app-server daemon version");
         }
     }
@@ -327,7 +345,7 @@ mod tests {
 
     #[test]
     fn cancellation_before_during_and_after_last_query_is_not_a_success() {
-        for cancel_at in [0, 1, 2, 3, 4] {
+        for cancel_at in [0, 1, 2, 3, 4, 5] {
             let cancelled = Arc::new(AtomicBool::new(cancel_at == 0));
             let mut calls = 0;
             let report = inspect_commands(&OsString::from("cli.exe"), &OsString::from("server.exe"), "standalone",
@@ -335,6 +353,7 @@ mod tests {
                     calls += 1;
                     if calls == cancel_at { cancelled.store(true, Ordering::Release); }
                     if args == ["--version"] { Ok(R32.as_bytes().to_vec()) }
+                    else if args == ["app-server", "--help"] { Ok(app_server_help(true)) }
                     else if args == ["app-server", "daemon", "--help"] { Ok(daemon_help(false)) }
                     else { Ok(serde_json::to_vec(&status(R32, R32)).unwrap()) }
                 });
@@ -378,7 +397,7 @@ mod tests {
                 assert!(report.managed_cli_executable.is_some() && report.socket_path.is_some());
             }
             assert_eq!(calls.last().unwrap(), "cli.exe app-server daemon status --json");
-            assert_eq!(calls.len(), 4);
+            assert_eq!(calls.len(), 5);
         }
     }
 
@@ -402,7 +421,7 @@ mod tests {
             Ok(b"Usage: codex app-server daemon [OPTIONS] <COMMAND>\n\nOptions:\n  -h, --help\n".to_vec())] {
             let (report, calls) = inspect_fixture_help(R33, R33, help, Err("다른 명령을 조회하면 안 됨".into()));
             assert_eq!(report.unwrap().state, "unavailable");
-            assert_eq!(calls.len(), 3);
+            assert_eq!(calls.len(), 4);
         }
         let korean = String::from_utf8(daemon_help(true)).unwrap().replace("Commands:", "명령어:");
         assert!(supports_passive_status(korean.as_bytes()).unwrap());
@@ -419,8 +438,36 @@ mod tests {
         for response in [Err("fixture status 조회 실패".into()), Ok(b"{partial".to_vec())] {
             let (report, calls) = inspect_fixture_help(R33, R33, Ok(daemon_help(true)), response);
             assert_eq!(report.unwrap().state, "unavailable");
-            assert_eq!(calls.len(), 4);
+            assert_eq!(calls.len(), 5);
             assert_eq!(calls.last().unwrap(), "cli.exe app-server daemon status --json");
+        }
+    }
+
+    #[test]
+    fn explicitly_unsupported_shared_server_uses_embedded_without_daemon_queries() {
+        let (report, calls) = inspect_fixture_all_help(R32, R32, Ok(app_server_help(false)),
+            Err("daemon 도움말 조회 금지".into()), Err("daemon 상태 조회 금지".into()));
+        let report = report.unwrap();
+        assert_eq!(report.state, "embedded");
+        assert_eq!(report.cli_version, R32);
+        assert_eq!(report.selected_server_version, R32);
+        assert!(report.message.unwrap().contains("내장된 개별 서버"));
+        assert!(report.managed_cli_executable.is_none() && report.managed_version.is_none()
+            && report.running_version.is_none() && report.socket_path.is_none());
+        assert_eq!(calls, ["cli.exe --version", "server.exe --version", "cli.exe app-server --help"]);
+    }
+
+    #[test]
+    fn failed_or_malformed_shared_help_is_not_embedded() {
+        for help in [Err("fixture app-server help 실패".into()), Ok(b"invalid help".to_vec()),
+            Ok(b"Usage: codex app-server [OPTIONS] [COMMAND]\n\nOptions:\n  -h, --help\n".to_vec()),
+            Ok(b"Usage: codex app-server [OPTIONS]\n".to_vec()), Ok(vec![0xff])] {
+            let (report, calls) = inspect_fixture_all_help(R32, R32, help,
+                Err("daemon 조회 금지".into()), Err("daemon 조회 금지".into()));
+            let report = report.unwrap();
+            assert_eq!(report.state, "unavailable");
+            assert!(report.message.is_some());
+            assert_eq!(calls, ["cli.exe --version", "server.exe --version", "cli.exe app-server --help"]);
         }
     }
 }

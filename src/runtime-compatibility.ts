@@ -30,8 +30,8 @@ export function createRuntimeCompatibility(call: <T>(command: string) => Promise
     for (const [title, value] of [
       [t('선택한 명령줄 실행 파일', 'Selected CLI executable'), report.executable],
       [t('선택한 명령줄 버전', 'Selected CLI version'), report.cliVersion ?? t('미확인', 'Unknown')],
-      [t('다음 시작에 선택된 서버 실행 파일', 'Server executable selected for next start'), report.selectedServerExecutable ?? t('미확인', 'Unknown')],
-      [t('다음 시작에 선택된 서버 버전', 'Server version selected for next start'), report.selectedServerVersion ?? t('미확인', 'Unknown')],
+      [t('서버 후보 실행 파일', 'Server candidate executable'), report.selectedServerExecutable ?? t('미확인', 'Unknown')],
+      [t('서버 후보 버전', 'Server candidate version'), report.selectedServerVersion ?? t('미확인', 'Unknown')],
       [t('실제 실행 중인 서버 실행 파일', 'Actually running server executable'), t('미확인', 'Unknown')],
       [t('기존 연결에서 보고한 서버 버전', 'Server version reported by existing connections'), report.serverVersion ?? t('미확인', 'Unknown')],
       [t('서브에이전트 관리', 'Subagent management'), label(report.subagents)],

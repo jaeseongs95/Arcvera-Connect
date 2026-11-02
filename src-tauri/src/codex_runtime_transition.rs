@@ -155,6 +155,9 @@ fn preview_commands(exe: &OsString, server: &OsString, kind: &str, pair: Runtime
         if report.pair.cli_version != report.pair.selected_server_version {
             return Err("선택한 CLI와 앱서버의 전체 버전을 먼저 맞추세요.".into());
         }
+        if report.pair.state == "embedded" {
+            return Err("이 CLI는 내장된 개별 서버를 사용하므로 공유 서버를 전환할 필요가 없습니다.".into());
+        }
         if report.pair.state == "matched" {
             return Err("선택한 CLI와 관리·실행 서버의 버전이 이미 같습니다. 전환하지 않았습니다.".into());
         }
@@ -292,6 +295,20 @@ mod tests {
             assert_ne!(fixture(pair(), evidence, help).fingerprint, baseline);
         }
         assert_eq!(fixture(pair(), evidence(), help()).fingerprint, baseline);
+    }
+
+    #[test]
+    fn embedded_runtime_never_inspects_or_transitions_a_shared_package() {
+        let mut embedded = pair();
+        embedded.state = "embedded".into();
+        embedded.managed_cli_executable = None; embedded.managed_version = None;
+        embedded.running_version = None; embedded.socket_path = None;
+        let report = preview_commands(&OsString::from("cli"), &OsString::from("server"), "standalone", embedded,
+            &Arc::new(AtomicBool::new(false)), Instant::now() + Duration::from_secs(20),
+            || panic!("내장 개별 서버는 공유 패키지를 읽으면 안 됨"),
+            |_, _| panic!("내장 개별 서버는 전환 도움말도 조회하면 안 됨")).unwrap();
+        assert!(!report.can_apply);
+        assert!(report.reason.unwrap().contains("전환할 필요가 없습니다"));
     }
 
     #[test]

@@ -873,7 +873,7 @@ impl Engine {
 
     fn require_pair(exe: &std::ffi::OsString, server: &std::ffi::OsString, kind: &str, cancelled: &Arc<AtomicBool>) -> Result<(), String> {
         let report = codex::inspect_runtime_pair(exe, server, kind, cancelled)?;
-        if report.state != "matched" {
+        if !matches!(report.state.as_str(), "matched" | "embedded") {
             return Err(Self::pair_error(&report));
         }
         Ok(())
@@ -886,7 +886,7 @@ impl Engine {
     fn prepare_pair(exe: &std::ffi::OsString, server: &std::ffi::OsString, kind: &str, cancelled: &Arc<AtomicBool>) -> Result<(), String> {
         let report = codex::inspect_runtime_pair(exe, server, kind, cancelled)?;
         let can_start_selected = report.state == "stopped" && report.managed_version.as_deref() == Some(report.cli_version.as_str()) && report.cli_version == report.selected_server_version;
-        if report.state != "matched" && !can_start_selected { return Err(Self::pair_error(&report)); }
+        if !matches!(report.state.as_str(), "matched" | "embedded") && !can_start_selected { return Err(Self::pair_error(&report)); }
         codex::prepare_runtime_with_executable(exe, cancelled)?;
         // A different client may replace the shared endpoint during preparation.
         Self::require_pair(exe, server, kind, cancelled)
@@ -1146,6 +1146,10 @@ fn size(cols: u16, rows: u16) -> PtySize { PtySize { cols, rows, pixel_width: 0,
 fn validate_size(cols: u16, rows: u16) -> Result<(), String> {
     if !(2..=1000).contains(&cols) || !(1..=1000).contains(&rows) { Err("terminal size must be 2..1000 columns and 1..1000 rows".into()) } else { Ok(()) }
 }
+
+#[cfg(all(test, windows))]
+#[path = "session_runtime_source_tests.rs"]
+mod runtime_source_tests;
 
 #[cfg(all(test, windows))]
 #[path = "session_launch_guard_tests.rs"]

@@ -1,6 +1,6 @@
 import { test, expect, type Page } from '@playwright/test';
 
-async function settings(page: Page, options: { holdPreview?: boolean; holdApply?: boolean; holdSelection?: boolean; canApply?: boolean; state?: 'matched' | 'mismatch' | 'stopped' | 'unavailable'; outcome?: string; success?: boolean; status?: string; rejectApply?: boolean; malformed?: boolean } = {}) {
+async function settings(page: Page, options: { holdPreview?: boolean; holdApply?: boolean; holdSelection?: boolean; canApply?: boolean; state?: 'matched' | 'mismatch' | 'stopped' | 'embedded' | 'unavailable'; outcome?: string; success?: boolean; status?: string; rejectApply?: boolean; malformed?: boolean } = {}) {
   await page.addInitScript(options => {
     const state = window as any; state.isTauri = true;
     let callback = 0;
@@ -251,3 +251,16 @@ for (const canApply of [true, false]) {
     }
   });
 }
+
+test('명시적 개별 서버 방식은 공유 서버 전환을 제안하지 않는다', async ({ page }) => {
+  await settings(page, { state: 'embedded', canApply: false });
+  await page.evaluate(() => {
+    const value = (window as any).transitionFixture.preview;
+    value.reason = '이 CLI는 내장된 개별 서버를 사용하므로 공유 서버를 전환할 필요가 없습니다.';
+    value.pair.managedCliExecutable = value.pair.managedVersion = value.pair.runningVersion = value.pair.socketPath = null;
+  });
+  await page.locator('.transition-preview').click();
+  await expect(page.locator('.transition-status')).toHaveText('이 CLI는 내장된 개별 서버를 사용합니다.');
+  await expect(page.locator('.transition-align')).toBeHidden();
+  expect(await calls(page, 'apply_runtime_transition')).toEqual([]);
+});
