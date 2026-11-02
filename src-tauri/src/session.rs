@@ -877,14 +877,28 @@ impl Engine {
         // package/daemon observations without holding the runtime/store lock.
         let current = codex::preview_runtime_transition(&selected.executable, &selected.server_executable, &selected.server_kind, &self.inner.exiting)?;
         if !current.can_apply || current.fingerprint != fingerprint { return Err("확인 중 서버 또는 패키지가 바뀌었습니다. 전환하지 않았습니다. 다시 조회하세요.".into()); }
-        let mut reply = codex::apply_runtime_transition(&selected.executable, &self.inner.exiting)?;
+        let reply = codex::apply_runtime_transition(&selected.executable, &self.inner.exiting)?;
+        Ok(Self::finish_runtime_transition_with(reply,
+            || codex::inspect_runtime_pair(&selected.executable, &selected.server_executable, &selected.server_kind, &self.inner.exiting),
+            || codex::prepare_runtime_with_executable(&selected.executable, &self.inner.exiting)))
+    }
+
+    fn finish_runtime_transition_with(mut reply: codex::RuntimeTransitionReply,
+        mut inspect: impl FnMut() -> Result<codex::RuntimePairStatus, String>, prepare: impl FnOnce() -> Result<(), String>,
+    ) -> codex::RuntimeTransitionReply {
         if reply.success {
-            match codex::inspect_runtime_pair(&selected.executable, &selected.server_executable, &selected.server_kind, &self.inner.exiting) {
-                Ok(pair) if pair.state == "matched" => {},
-                _ => { reply.success = false; reply.outcome = "unknown".into(); reply.message = Some("전환 명령은 끝났지만 실제 서버 버전을 확인하지 못했습니다. 자동으로 다시 실행하지 말고 현재 버전을 조회하세요.".into()); }
+            let verified = match inspect() {
+                Ok(pair) if pair.state == "matched" => true,
+                // A successful update installs but does not start a stopped daemon.
+                // Reuse preparation's fresh version checks before and after start.
+                Ok(pair) if pair.state == "stopped" => matches!(Self::prepare_pair_with(pair, prepare, inspect), Ok(pair) if pair.state == "matched"),
+                _ => false,
+            };
+            if !verified {
+                reply.success = false; reply.outcome = "unknown".into(); reply.message = Some("전환 명령은 끝났지만 실제 서버 버전을 확인하지 못했습니다. 자동으로 다시 실행하지 말고 현재 버전을 조회하세요.".into());
             }
         }
-        Ok(reply)
+        reply
     }
 
     fn require_pair(exe: &std::ffi::OsString, server: &std::ffi::OsString, kind: &str, cancelled: &Arc<AtomicBool>) -> Result<(), String> {
@@ -900,12 +914,21 @@ impl Engine {
     }
 
     fn prepare_pair(exe: &std::ffi::OsString, server: &std::ffi::OsString, kind: &str, cancelled: &Arc<AtomicBool>) -> Result<(), String> {
-        let report = codex::inspect_runtime_pair(exe, server, kind, cancelled)?;
+        Self::prepare_pair_with(codex::inspect_runtime_pair(exe, server, kind, cancelled)?,
+            || codex::prepare_runtime_with_executable(exe, cancelled),
+            || codex::inspect_runtime_pair(exe, server, kind, cancelled)).map(|_| ())
+    }
+
+    fn prepare_pair_with(report: codex::RuntimePairStatus, prepare: impl FnOnce() -> Result<(), String>,
+        inspect: impl FnOnce() -> Result<codex::RuntimePairStatus, String>,
+    ) -> Result<codex::RuntimePairStatus, String> {
         let can_start_selected = report.state == "stopped" && report.managed_version.as_deref() == Some(report.cli_version.as_str()) && report.cli_version == report.selected_server_version;
         if !matches!(report.state.as_str(), "matched" | "embedded") && !can_start_selected { return Err(Self::pair_error(&report)); }
-        codex::prepare_runtime_with_executable(exe, cancelled)?;
+        prepare()?;
         // A different client may replace the shared endpoint during preparation.
-        Self::require_pair(exe, server, kind, cancelled)
+        let report = inspect()?;
+        if !matches!(report.state.as_str(), "matched" | "embedded") { return Err(Self::pair_error(&report)); }
+        Ok(report)
     }
 
     pub fn catalog_list(&self, request: codex::CatalogQuery) -> Result<codex::CatalogPage, String> {
@@ -1255,6 +1278,111 @@ mod runtime_preparation_tests {
         assert!(error.contains("확인한 뒤에만"));
         assert_eq!(engine.inner.runtime.lock().unwrap().generation, 0);
         assert!(!engine.inner.runtime.lock().unwrap().changing);
+    }
+
+    fn transition_pair(state: &str) -> codex::RuntimePairStatus {
+        let version = "0.166.0+native-r33.20261102";
+        codex::RuntimePairStatus {
+            cli_version: version.into(), selected_server_executable: "selected-server.exe".into(),
+            selected_server_version: version.into(), managed_cli_executable: Some("managed-cli.exe".into()),
+            managed_version: Some(version.into()), running_version: (state == "matched").then(|| version.into()),
+            socket_path: Some("selected-server.sock".into()), state: state.into(), message: None,
+        }
+    }
+
+    fn updated_reply() -> codex::RuntimeTransitionReply {
+        codex::RuntimeTransitionReply { status: "updated".into(), success: true, outcome: "updated".into(), message: None }
+    }
+
+    fn finish_transition_fixture(reply: codex::RuntimeTransitionReply, observations: Vec<Result<codex::RuntimePairStatus, String>>,
+        preparation: Result<(), String>,
+    ) -> (codex::RuntimeTransitionReply, usize, usize) {
+        let engine = engine();
+        let mut observations = observations.into_iter();
+        let mut inspections = 0;
+        let mut preparations = 0;
+        let reply = Engine::finish_runtime_transition_with(reply, || {
+            unlocked(&engine);
+            inspections += 1;
+            observations.next().expect("예정하지 않은 서버 재조회")
+        }, || {
+            unlocked(&engine);
+            preparations += 1;
+            preparation
+        });
+        assert!(observations.next().is_none(), "필수 서버 재검사를 생략함");
+        (reply, preparations, inspections)
+    }
+
+    #[test]
+    fn successful_stopped_transition_starts_the_selected_pair_and_verifies_running_version() {
+        let (reply, preparations, inspections) = finish_transition_fixture(updated_reply(),
+            vec![Ok(transition_pair("stopped")), Ok(transition_pair("matched"))], Ok(()));
+        assert!(reply.success);
+        assert_eq!(reply.outcome, "updated");
+        assert_eq!((preparations, inspections), (1, 2));
+    }
+
+    #[test]
+    fn failed_or_unknown_transition_reply_never_inspects_or_prepares() {
+        for (status, outcome) in [("rejected", "failed"), ("operationOutcomeUnknown", "unknown")] {
+            let original = codex::RuntimeTransitionReply {
+                status: status.into(), success: false, outcome: outcome.into(), message: Some("업데이트 결과".into()),
+            };
+            let (reply, preparations, inspections) = finish_transition_fixture(original, vec![], Ok(()));
+            assert!(!reply.success);
+            assert_eq!(reply.status, status);
+            assert_eq!(reply.outcome, outcome);
+            assert_eq!(reply.message.as_deref(), Some("업데이트 결과"));
+            assert_eq!((preparations, inspections), (0, 0));
+        }
+    }
+
+    #[test]
+    fn successful_transition_does_not_prepare_an_already_running_matched_pair() {
+        let (reply, preparations, inspections) = finish_transition_fixture(updated_reply(),
+            vec![Ok(transition_pair("matched"))], Ok(()));
+        assert!(reply.success);
+        assert_eq!((preparations, inspections), (0, 1));
+    }
+
+    #[test]
+    fn transition_never_starts_a_mismatched_or_unconfirmed_pair() {
+        let mut pairs: Vec<_> = ["mismatch", "unavailable", "embedded"].into_iter().map(transition_pair).collect();
+        for boundary in 0..3 {
+            let mut pair = transition_pair("stopped");
+            match boundary {
+                0 => pair.managed_version = None,
+                1 => pair.managed_version = Some("0.166.0+native-r32.20261101".into()),
+                _ => pair.selected_server_version = "0.166.0+native-r32.20261101".into(),
+            }
+            pairs.push(pair);
+        }
+        for observation in pairs.into_iter().map(Ok).chain(std::iter::once(Err("상태 조회 실패".into()))) {
+            let (reply, preparations, inspections) = finish_transition_fixture(updated_reply(), vec![observation], Ok(()));
+            assert!(!reply.success);
+            assert_eq!(reply.outcome, "unknown");
+            assert_eq!((preparations, inspections), (0, 1));
+        }
+    }
+
+    #[test]
+    fn transition_preparation_failure_and_post_start_drift_preserve_unknown_without_retry() {
+        let (reply, preparations, inspections) = finish_transition_fixture(updated_reply(),
+            vec![Ok(transition_pair("stopped"))], Err("시작 실패".into()));
+        assert!(!reply.success);
+        assert_eq!(reply.outcome, "unknown");
+        assert_eq!((preparations, inspections), (1, 1));
+
+        for observation in [Ok(transition_pair("mismatch")), Ok(transition_pair("stopped")),
+            Ok(transition_pair("embedded")), Err("시작 후 조회 실패".into())] {
+            let (reply, preparations, inspections) = finish_transition_fixture(updated_reply(),
+                vec![Ok(transition_pair("stopped")), observation], Ok(()));
+            assert!(!reply.success, "시작 뒤 실제 matched 관측 없이 성공을 보고함");
+            assert_eq!(reply.outcome, "unknown");
+            assert!(reply.message.as_deref().unwrap().contains("자동으로 다시 실행하지 말고"));
+            assert_eq!((preparations, inspections), (1, 2));
+        }
     }
 
     #[test]
