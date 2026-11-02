@@ -174,11 +174,21 @@ struct Session {
 }
 struct SubagentReceipt { digest: [u8;32], status: &'static str }
 impl Session {
+    // Call with info locked so activation/stop and the public snapshot share
+    // one metadata boundary. Vendor observations may arrive before the PTY.
+    fn snapshot(&self, info: &SessionInfo) -> SessionInfo {
+        let mut snapshot = info.clone();
+        match self.phase.load(Ordering::Acquire) {
+            0 => snapshot.state = "starting".into(),
+            3 => snapshot.active = false,
+            _ => {},
+        }
+        snapshot
+    }
+
     fn info(&self) -> Result<SessionInfo, String> {
         let guard = self.info.lock().map_err(|_| "session metadata lock poisoned")?;
-        let mut info = guard.clone();
-        if self.phase.load(Ordering::Acquire) == 3 { info.active = false; }
-        Ok(info)
+        Ok(self.snapshot(&guard))
     }
 
     fn update(&self, change: impl FnOnce(&mut SessionInfo), status_only: bool) -> Result<(), String> {
@@ -186,8 +196,9 @@ impl Session {
             let mut info = self.info.lock().map_err(|_| "session metadata lock poisoned")?;
             if status_only && self.phase.load(Ordering::Acquire) >= 2 { return Ok(()); }
             change(&mut info);
-            self.store.lock().map_err(|_| "metadata store lock poisoned")?.save_session(&info)?;
-            info.clone()
+            let snapshot = self.snapshot(&info);
+            self.store.lock().map_err(|_| "metadata store lock poisoned")?.save_session(&snapshot)?;
+            snapshot
         };
         (self.sink)(BackendEvent::Changed(snapshot))
     }
@@ -199,9 +210,10 @@ impl Session {
         }, true);
         if result.is_err() {
             // Persistence/delivery failure is surfaced as an error state, never
-            // reported as successfully persisted metadata. No token or output logged.
+            // reported as successfully persisted metadata. During preparation it
+            // stays internal until activation, like any vendor status.
             let snapshot = if let Ok(mut info) = self.info.lock() {
-                if self.phase.load(Ordering::Acquire) < 2 { info.state = "error".into(); Some(info.clone()) } else { None }
+                if self.phase.load(Ordering::Acquire) < 2 { info.state = "error".into(); Some(self.snapshot(&info)) } else { None }
             } else { None };
             if let Some(info) = snapshot { let _ = (self.sink)(BackendEvent::Changed(info)); }
         }
@@ -454,10 +466,13 @@ impl Engine {
         // won during prepare/openpty must also terminate the newly installed child.
         if session.stop_requested.load(Ordering::Acquire) { process.terminate()?; }
         else {
-            session.phase.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).ok();
             // Process liveness does not prove the vendor is running a turn.
-            // Only an adapter observation may report idle/running/waiting.
-            session.update(|info| { if info.state == "starting" { info.state = "unknown".into(); } }, true)?;
+            // Publish the latest preparation observation only after installation,
+            // under the same metadata lock that decides stop/finish ownership.
+            session.update(|info| {
+                session.phase.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).ok();
+                if info.state == "starting" { info.state = "unknown".into(); }
+            }, true)?;
         }
         let reading = session.clone();
         let reader_thread = thread::Builder::new().name("pty-output".into()).spawn(move || -> Result<(), String> {
@@ -612,12 +627,13 @@ impl Engine {
         next.project_id = project_id.map(str::to_owned);
         next.project_assigned = true;
         next.project_revision = crate::project::next_revision(next.project_revision)?;
-        self.inner.store.lock().map_err(|_| "metadata store lock poisoned")?.save_session(&next)?;
-        *info = next.clone();
+        let snapshot = session.snapshot(&next);
+        self.inner.store.lock().map_err(|_| "metadata store lock poisoned")?.save_session(&snapshot)?;
+        *info = next;
         drop(info);
         drop(sessions);
-        (self.inner.sink)(BackendEvent::Changed(next.clone())).map_err(|e| format!("Session project saved; notification failed: {e}"))?;
-        Ok(next)
+        (self.inner.sink)(BackendEvent::Changed(snapshot.clone())).map_err(|e| format!("Session project saved; notification failed: {e}"))?;
+        Ok(snapshot)
     }
 
     pub fn delete_project(&self, id: &str) -> Result<(), String> {
@@ -625,16 +641,16 @@ impl Engine {
         // 모든 info를 잡은 동안 시작·이동·상태 저장이 삭제를 추월하지 못한다.
         let sessions = self.inner.sessions.lock().map_err(|_| "session registry lock poisoned")?;
         self.check_project_admission()?;
-        let mut infos = sessions.values().map(|session| session.info.lock().map_err(|_| "session metadata lock poisoned"))
+        let mut infos = sessions.values().map(|session| session.info.lock().map(|info| (session, info)).map_err(|_| "session metadata lock poisoned"))
             .collect::<Result<Vec<_>, _>>()?;
         let detached = self.inner.store.lock().map_err(|_| "metadata store lock poisoned")?.delete_project(id)?;
         let mut changed = Vec::new();
-        for info in &mut infos {
+        for (session, info) in &mut infos {
             if let Some((_, revision)) = detached.iter().find(|(id, _)| id == &info.id) {
                 info.project_id = None;
                 info.project_assigned = true;
                 info.project_revision = *revision;
-                changed.push((**info).clone());
+                changed.push(session.snapshot(info));
             }
         }
         drop(infos);
@@ -1398,6 +1414,188 @@ mod lifecycle_tests {
         StartRequest { cwd: std::env::current_dir().unwrap().to_string_lossy().into_owned(), title: "lifetime fixture".into(), project_id: None, project_assigned: false, thread_id: None, cols: 80, rows: 24 }
     }
 
+    fn with_preparing_metadata(test: impl FnOnce(Engine, &Path, std::sync::mpsc::Receiver<BackendEvent>)) {
+        let directory = std::env::temp_dir().join(format!("opendiy-preparing-state-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let database = directory.join("workspace.sqlite3");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let engine = Engine::new(&database, Arc::new(move |event| sender.send(event).map_err(|e| e.to_string()))).unwrap();
+        let store = Arc::downgrade(&engine.inner.store);
+        test(engine, &database, receiver);
+        // stop() can return just before the reaper releases its final Session.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while store.strong_count() != 0 {
+            assert!(Instant::now() < deadline, "fixture metadata owner did not finish");
+            thread::sleep(Duration::from_millis(2));
+        }
+        for file in ["workspace.sqlite3-wal", "workspace.sqlite3-shm", "workspace.sqlite3"] {
+            let path = directory.join(file);
+            if path.exists() { std::fs::remove_file(path).unwrap(); }
+        }
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    fn persisted_preparing_metadata(database: &Path, id: &str) -> SessionInfo {
+        // Store::sessions deliberately returns restored/inactive suggestions;
+        // inspect this fixture's actual saved snapshot instead.
+        let connection = rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let metadata: String = connection.query_row("SELECT metadata FROM session_metadata WHERE id=?1", [id], |row| row.get(0)).unwrap();
+        serde_json::from_str(&metadata).unwrap()
+    }
+
+    #[test]
+    fn preparing_vendor_status_stays_starting_on_every_public_metadata_path() {
+        for state in ["idle", "running", "waiting"] {
+            with_preparing_metadata(|engine, database, receiver| {
+                let session = engine.allocate(&request()).unwrap();
+                let allocated = session.info().unwrap();
+                session.observe(CodexEvent::Status(state.into()));
+                assert_eq!(persisted_preparing_metadata(database, &allocated.id).state, "starting");
+                let thread_id = Uuid::new_v4().to_string();
+                session.observe(CodexEvent::ThreadId(thread_id.clone()));
+                let visible = engine.list().unwrap().pop().unwrap();
+                assert_eq!(visible.state, "starting", "early {state} must not enable terminal input");
+                assert!(visible.active);
+                assert_eq!(visible.thread_id.as_deref(), Some(thread_id.as_str()));
+                assert!(engine.list_pending_questions().unwrap()["items"].as_array().unwrap().is_empty());
+                assert!(engine.resize(&visible.id, visible.generation, 100, 30).unwrap_err().contains("not live"));
+                assert!(engine.write(&visible.id, visible.generation, "input").unwrap_err().contains("not live"));
+                assert!(session.process.lock().unwrap().is_none());
+
+                let project = engine.create_project("preparing fixture", None).unwrap();
+                let moved = engine.move_session_to_project(&visible.id, visible.generation, Some(&project.id)).unwrap();
+                assert_eq!(moved.state, "starting");
+                assert_eq!(persisted_preparing_metadata(database, &visible.id).state, "starting");
+                engine.delete_project(&project.id).unwrap();
+                let persisted = persisted_preparing_metadata(database, &visible.id);
+                assert_eq!(persisted.state, "starting");
+                assert!(persisted.active && persisted.project_assigned && persisted.project_id.is_none());
+                assert_eq!(persisted.thread_id.as_deref(), Some(thread_id.as_str()));
+                let events: Vec<_> = receiver.try_iter().filter_map(|event| if let BackendEvent::Changed(info) = event { Some(info) } else { None }).collect();
+                assert_eq!(events.len(), 5, "allocation, status, thread ID, project move and deletion");
+                assert!(events.iter().all(|info| info.state == "starting" && info.active));
+                assert!(events.iter().skip(2).all(|info| info.thread_id.as_deref() == Some(thread_id.as_str())));
+                assert_eq!(session.info.lock().unwrap().state, state, "project updates must retain the vendor observation for activation");
+                session.finish("exited").unwrap();
+            });
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn preparing_latest_status_is_published_after_real_pty_activation() {
+        for latest in ["idle", "running", "waiting"] {
+            with_preparing_metadata(|engine, database, receiver| {
+                let session = engine.allocate(&request()).unwrap();
+                let thread_id = Uuid::new_v4().to_string();
+                for state in ["idle", "running", "waiting", latest] { session.observe(CodexEvent::Status(state.into())); }
+                session.observe(CodexEvent::ThreadId(thread_id.clone()));
+                assert_eq!(engine.list().unwrap()[0].state, "starting");
+                for event in receiver.try_iter() { if let BackendEvent::Changed(info) = event { assert_eq!(info.state, "starting"); } }
+                let shell = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32/WindowsPowerShell/v1.0/powershell.exe");
+                let mut command = CommandBuilder::new(shell);
+                command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "[Console]::WriteLine('PREPARING_PTY_READY'); Start-Sleep -Seconds 30"]);
+                let started = engine.launch(session.clone(), command, None, 80, 24).unwrap();
+                struct Cleanup(Engine, String, u64);
+                impl Drop for Cleanup { fn drop(&mut self) { let _ = self.0.stop(&self.1, self.2); } }
+                let _cleanup = Cleanup(engine.clone(), started.id.clone(), started.generation);
+                // Match the headless renderer in self_test: ConPTY inherits
+                // the cursor and may block even ClosePseudoConsole until DSR
+                // is answered. Wait for real output before attempting stop.
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut output = String::new();
+                let mut answered_queries = 0;
+                let mut activated = false;
+                while !output.contains("PREPARING_PTY_READY") {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    match receiver.recv_timeout(remaining).unwrap_or_else(|error| panic!("preparing PTY readiness failed: {error}; state={:?}; output={output:?}", session.info())) {
+                        BackendEvent::Output(chunk) => {
+                            engine.acknowledge(&chunk.id, chunk.generation, chunk.seq).unwrap();
+                            output.push_str(&chunk.data);
+                            // Count across frame boundaries, as xterm does.
+                            let queries = output.matches("\x1b[6n").count();
+                            while answered_queries < queries {
+                                engine.write(&started.id, started.generation, "\x1b[1;1R").unwrap();
+                                answered_queries += 1;
+                            }
+                        }
+                        BackendEvent::Changed(info) => {
+                            assert!(info.active, "fixture ended before readiness: {info:?}");
+                            activated |= info.state == latest;
+                        }
+                    }
+                }
+                assert!(activated, "activation must publish the latest preparation state");
+                assert_eq!(session.phase.load(Ordering::Acquire), 1);
+                assert!(session.process.lock().unwrap().is_some());
+                assert_eq!(started.state, latest);
+                assert_eq!(started.thread_id.as_deref(), Some(thread_id.as_str()));
+                assert_eq!(engine.list().unwrap()[0].state, latest);
+                let persisted = persisted_preparing_metadata(database, &started.id);
+                assert_eq!(persisted.state, latest);
+                assert_eq!(persisted.thread_id.as_deref(), Some(thread_id.as_str()));
+                engine.resize(&started.id, started.generation, 100, 30).unwrap();
+                engine.write(&started.id, started.generation, "\r").unwrap();
+                engine.stop(&started.id, started.generation).unwrap();
+                session.observe(CodexEvent::Status("running".into()));
+                assert_eq!(engine.list().unwrap()[0].state, "stopped");
+                assert!(!persisted_preparing_metadata(database, &started.id).active);
+            });
+        }
+    }
+
+    #[test]
+    fn preparing_stop_wins_over_activation_and_late_observations() {
+        with_preparing_metadata(|engine, database, receiver| {
+            let session = engine.allocate(&request()).unwrap();
+            let thread_id = Uuid::new_v4().to_string();
+            session.observe(CodexEvent::Status("idle".into()));
+            session.observe(CodexEvent::ThreadId(thread_id.clone()));
+            let starting = session.info().unwrap();
+            session.request_stop().unwrap();
+            session.observe(CodexEvent::Status("running".into()));
+            session.observe(CodexEvent::ThreadId("late-thread".into()));
+            assert_eq!(session.info().unwrap().state, "stopping");
+            assert_eq!(persisted_preparing_metadata(database, &starting.id).state, "stopping");
+            assert!(engine.launch(session.clone(), CommandBuilder::new("must-not-launch-preparing-fixture"), None, 80, 24).unwrap_err().contains("stopped before launch"));
+            session.observe(CodexEvent::Status("waiting".into()));
+            session.observe(CodexEvent::ThreadId("later-thread".into()));
+            let stopped = engine.list().unwrap().pop().unwrap();
+            assert_eq!(stopped.state, "stopped");
+            assert!(!stopped.active);
+            assert_eq!(stopped.thread_id.as_deref(), Some(thread_id.as_str()));
+            assert_eq!(session.phase.load(Ordering::Acquire), 3);
+            assert!(session.process.lock().unwrap().is_none());
+            let persisted = persisted_preparing_metadata(database, &starting.id);
+            assert_eq!(persisted.state, "stopped");
+            assert!(!persisted.active);
+            assert_eq!(persisted.thread_id.as_deref(), Some(thread_id.as_str()));
+            assert!(receiver.try_iter().all(|event| !matches!(event, BackendEvent::Changed(info) if ["idle", "running", "waiting"].contains(&info.state.as_str()))));
+        });
+    }
+
+    #[test]
+    fn preparing_observer_failure_does_not_publish_input_ready_state() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let fail_next = Arc::new(AtomicBool::new(false));
+        let fail_sink = fail_next.clone();
+        let engine = Engine::new(Path::new(":memory:"), Arc::new(move |event| {
+            sender.send(event).map_err(|e| e.to_string())?;
+            if fail_sink.swap(false, Ordering::AcqRel) { Err("fixture notification failure".into()) } else { Ok(()) }
+        })).unwrap();
+        let session = engine.allocate(&request()).unwrap();
+        fail_next.store(true, Ordering::Release);
+        session.observe(CodexEvent::Status("idle".into()));
+        assert_eq!(session.info().unwrap().state, "starting");
+        assert_eq!(session.info.lock().unwrap().state, "error", "retain the delivery failure for activation");
+        let events: Vec<_> = receiver.try_iter().collect();
+        assert_eq!(events.len(), 3, "allocation, failed status notification and fallback");
+        assert!(events.into_iter().all(|event| matches!(event, BackendEvent::Changed(info) if info.state == "starting" && info.active)));
+        session.finish("error").unwrap();
+        assert_eq!(session.info().unwrap().state, "error");
+        assert!(!session.info().unwrap().active);
+    }
+
     #[test]
     fn conversation_and_attachment_admission_reject_stale_generations_without_a_transport() {
         let engine = Engine::new(Path::new(":memory:"),Arc::new(|_|Ok(()))).unwrap();
@@ -1535,6 +1733,7 @@ mod lifecycle_tests {
     fn waiting_terminal_inbox_is_a_read_only_fallback_without_inventing_question_metadata() {
         let engine = Engine::new(Path::new(":memory:"),Arc::new(|_|Ok(()))).unwrap();
         let session = engine.allocate(&request()).unwrap();
+        session.phase.store(1, Ordering::Release); // The fallback describes a live terminal.
         session.update(|info|info.state="waiting".into(),true).unwrap();
         let inbox = engine.list_pending_questions().unwrap(); let items = inbox["items"].as_array().unwrap();
         assert_eq!(items.len(),1); assert_eq!(items[0]["kind"],"unsupported"); assert_eq!(items[0]["canRespond"],false);
