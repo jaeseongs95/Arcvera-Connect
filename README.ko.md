@@ -27,6 +27,11 @@ Codex 실행 기반은 [OpenDIY Codex](https://github.com/jaeseongs95/opendiy-co
 [참고 프로젝트 라이선스](https://github.com/paulallington/Claudes/blob/v1.9.82/LICENSE)를
 확인할 수 있습니다.
 
+v1.0.0에서는 설치된 `opendiy-codex-launcher.exe`도 실행 파일로 선택할 수 있습니다.
+새 요청마다 실행기가 선택한 패키지를 확인하고 그 안의 CLI와 서버 후보를 함께 사용합니다.
+이미 열린 세션은 기존 실행 경로를 유지하며, 직접 지정한 서버도 그대로 유지합니다.
+패키지 조회에 실패하면 다른 실행 파일로 대체하지 않고 원인을 안내합니다.
+
 ## 언어 선택
 
 오른쪽 위 **⚙ 설정**을 열고 **언어**에서 **한국어** 또는 **English**를 선택하세요.

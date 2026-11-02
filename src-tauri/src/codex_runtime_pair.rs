@@ -23,7 +23,7 @@ fn bounded_text<'a>(text: &'a str, label: &str, limit: usize) -> Result<&'a str,
 }
 
 // 의도적으로 SemVer의 순서 비교를 하지 않는다. build metadata까지 같은 값만 통과한다.
-fn normalized_version(text: &str) -> Result<String, String> {
+pub(super) fn normalized_version(text: &str) -> Result<String, String> {
     bounded_text(text, "버전", 256)?;
     let version = text.strip_prefix("codex-cli ")
         .or_else(|| text.strip_prefix("codex-app-server ")).unwrap_or(text);

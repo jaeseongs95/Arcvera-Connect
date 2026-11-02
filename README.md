@@ -54,6 +54,12 @@ and history queries. The screen shows the saved path, resolved executable and
 where it came from. Cancelling the chooser keeps the previous setting.
 Changing it leaves running terminals alone.
 
+In v1.0.0, you can also select the installed `opendiy-codex-launcher.exe`.
+Desktop resolves its selected package for each new request and uses that package’s
+CLI and automatic server candidate together. Open sessions keep their admitted
+executable paths. A manually selected server stays selected; a failed launcher
+lookup is reported without falling back to another executable.
+
 Choose **Use automatic discovery** to clear the app's saved override. Resolution then uses
 `AGENT_GRID_CODEX`, if set, followed by the native executable on `PATH`.
 The saved app preference has priority over both. Missing or invalid executables

@@ -51,6 +51,10 @@ mod runtime;
 pub use runtime::RuntimeCompatibility;
 pub(crate) use runtime::inspect as inspect_runtime;
 
+#[path = "codex_runtime_source.rs"]
+mod runtime_source;
+pub(crate) use runtime_source::{resolve as resolve_runtime_source, is_launcher as is_runtime_launcher};
+
 #[path = "codex_runtime_pair.rs"]
 mod runtime_pair;
 pub use runtime_pair::RuntimePairStatus;

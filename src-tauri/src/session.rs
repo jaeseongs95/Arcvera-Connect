@@ -286,13 +286,14 @@ struct RuntimeSelection {
     executable: Option<std::ffi::OsString>,
     server_executable: Option<std::ffi::OsString>,
     server_kind: Option<String>,
+    source_manifest_sha256: Option<String>,
     ready: bool,
     preparing: bool,
     changing: bool,
 }
 
 #[derive(Clone, Debug)]
-struct RuntimeSnapshot { generation: u64, executable: std::ffi::OsString, server_executable: std::ffi::OsString, server_kind: String }
+struct RuntimeSnapshot { generation: u64, executable: std::ffi::OsString, server_executable: std::ffi::OsString, server_kind: String, source_manifest_sha256: Option<String> }
 #[derive(Debug)]
 struct PreparedRuntime { selection: RuntimeSnapshot, preparation: u64 }
 
@@ -676,7 +677,7 @@ impl Engine {
         self.get_codex_settings()
     }
 
-    fn codex_executable(&self) -> Result<std::ffi::OsString, String> { self.get_codex_settings()?.executable() }
+    fn codex_executable(&self) -> Result<std::ffi::OsString, String> { Ok(self.runtime_snapshot()?.executable) }
 
     fn change_runtime_selection_with(&self, save: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
         {
@@ -693,6 +694,7 @@ impl Engine {
             runtime.executable = None;
             runtime.server_executable = None;
             runtime.server_kind = None;
+            runtime.source_manifest_sha256 = None;
             runtime.ready = false;
             runtime.preparing = false;
         }
@@ -703,38 +705,46 @@ impl Engine {
     fn runtime_snapshot(&self) -> Result<RuntimeSnapshot, String> {
         self.runtime_pair_snapshot_with(|| {
             let settings = self.get_codex_settings()?;
-            Ok((settings.executable()?, settings.app_server.executable()?, settings.app_server.kind))
+            let executable = settings.executable()?;
+            let automatic_server = settings.app_server.saved_path.is_none();
+            // A launcher resolves its package server; a sibling at the stable
+            // launcher root is not part of that package. Manual choices still fail explicitly.
+            let server = if automatic_server && codex::is_runtime_launcher(&executable) { executable.clone() }
+                else { settings.app_server.executable()? };
+            let source = codex::resolve_runtime_source(&executable, &server, &settings.app_server.kind, automatic_server, &self.inner.exiting)?;
+            Ok((source.executable, source.server_executable, source.server_kind, source.source_manifest_sha256))
         })
     }
 
     #[cfg(test)]
     fn runtime_snapshot_with(&self, resolve: impl FnOnce() -> Result<std::ffi::OsString, String>) -> Result<RuntimeSnapshot, String> {
-        self.runtime_pair_snapshot_with(|| resolve().map(|executable| (executable.clone(), executable, "cli".into())))
+        self.runtime_pair_snapshot_with(|| resolve().map(|executable| (executable.clone(), executable, "cli".into(), None)))
     }
 
-    fn runtime_pair_snapshot_with(&self, resolve: impl FnOnce() -> Result<(std::ffi::OsString, std::ffi::OsString, String), String>) -> Result<RuntimeSnapshot, String> {
+    fn runtime_pair_snapshot_with(&self, resolve: impl FnOnce() -> Result<(std::ffi::OsString, std::ffi::OsString, String, Option<String>), String>) -> Result<RuntimeSnapshot, String> {
         let generation = {
             let runtime = self.inner.runtime.lock().map_err(|_| "실행파일 선택 잠금이 손상되었습니다.")?;
             if runtime.changing { return Err("실행파일 설정을 저장 중입니다. 잠시 후 다시 시도하세요.".into()); }
             runtime.generation
         };
-        let (executable, server_executable, server_kind) = resolve()?;
+        let (executable, server_executable, server_kind, source_manifest_sha256) = resolve()?;
         let mut runtime = self.inner.runtime.lock().map_err(|_| "실행파일 선택 잠금이 손상되었습니다.")?;
         if runtime.changing || runtime.generation != generation { return Err("실행파일 선택이 바뀌었습니다. 다시 시도하세요.".into()); }
-        if runtime.executable.as_ref() != Some(&executable) || runtime.server_executable.as_ref() != Some(&server_executable) || runtime.server_kind.as_ref() != Some(&server_kind) {
+        if runtime.executable.as_ref() != Some(&executable) || runtime.server_executable.as_ref() != Some(&server_executable) || runtime.server_kind.as_ref() != Some(&server_kind) || runtime.source_manifest_sha256 != source_manifest_sha256 {
             runtime.generation = runtime.generation.checked_add(1).ok_or("실행파일 선택 세대 한도에 도달했습니다.")?;
             runtime.executable = Some(executable.clone());
             runtime.server_executable = Some(server_executable.clone());
             runtime.server_kind = Some(server_kind.clone());
+            runtime.source_manifest_sha256 = source_manifest_sha256.clone();
             runtime.ready = false;
             runtime.preparing = false;
         }
-        Ok(RuntimeSnapshot { generation: runtime.generation, executable, server_executable, server_kind })
+        Ok(RuntimeSnapshot { generation: runtime.generation, executable, server_executable, server_kind, source_manifest_sha256 })
     }
 
     fn verify_runtime_selection(&self, selected: &RuntimeSnapshot, runtime: &RuntimeSelection, cancelled: &AtomicBool) -> Result<(), String> {
         if self.inner.exiting.load(Ordering::Acquire) || cancelled.load(Ordering::Acquire) { return Err("종료 또는 중단 요청으로 실행파일 준비 결과를 사용하지 않았습니다.".into()); }
-        if runtime.changing || runtime.generation != selected.generation || runtime.executable.as_ref() != Some(&selected.executable) || runtime.server_executable.as_ref() != Some(&selected.server_executable) || runtime.server_kind.as_ref() != Some(&selected.server_kind) { return Err("CLI 또는 앱 서버 선택이 바뀌었습니다. 다시 준비하세요.".into()); }
+        if runtime.changing || runtime.generation != selected.generation || runtime.executable.as_ref() != Some(&selected.executable) || runtime.server_executable.as_ref() != Some(&selected.server_executable) || runtime.server_kind.as_ref() != Some(&selected.server_kind) || runtime.source_manifest_sha256 != selected.source_manifest_sha256 { return Err("CLI 또는 앱 서버 선택이 바뀌었습니다. 다시 준비하세요.".into()); }
         Ok(())
     }
 
@@ -1152,13 +1162,33 @@ mod runtime_preparation_tests {
     fn changing_only_server_path_or_role_invalidates_the_previous_ready_pair() {
         for (new_server, new_kind) in [("server-b.exe", "standalone"), ("server-a.exe", "cli")] {
             let engine = engine();
-            let original = engine.runtime_pair_snapshot_with(|| Ok(("cli.exe".into(), "server-a.exe".into(), "standalone".into()))).unwrap();
+            let original = engine.runtime_pair_snapshot_with(|| Ok(("cli.exe".into(), "server-a.exe".into(), "standalone".into(), None))).unwrap();
             let prepared = engine.prepare_selected_runtime_with(original.clone(), false, &AtomicBool::new(false), |_| Ok(())).unwrap();
-            let changed = engine.runtime_pair_snapshot_with(|| { unlocked(&engine); Ok(("cli.exe".into(), new_server.into(), new_kind.into())) }).unwrap();
+            let changed = engine.runtime_pair_snapshot_with(|| { unlocked(&engine); Ok(("cli.exe".into(), new_server.into(), new_kind.into(), None)) }).unwrap();
             assert!(changed.generation > original.generation);
             assert!(!engine.inner.runtime.lock().unwrap().ready);
             assert!(engine.verify_prepared_runtime(&prepared, &AtomicBool::new(false)).is_err());
         }
+    }
+
+    #[test]
+    fn launcher_manifest_change_invalidates_readiness_and_keeps_the_admitted_pair_pinned() {
+        let engine = engine();
+        let snapshot = |manifest: &str| engine.runtime_pair_snapshot_with(|| {
+            unlocked(&engine);
+            Ok(("package-cli.exe".into(), "package-server.exe".into(), "standalone".into(), Some(manifest.into())))
+        }).unwrap();
+        let original = snapshot("first-manifest");
+        let prepared = engine.prepare_selected_runtime_with(original.clone(), false, &AtomicBool::new(false), |_| Ok(())).unwrap();
+        let same = snapshot("first-manifest");
+        assert_eq!(same.generation, original.generation);
+        engine.verify_prepared_runtime(&prepared, &AtomicBool::new(false)).unwrap();
+        let changed = snapshot("second-manifest");
+        assert!(changed.generation > original.generation);
+        assert!(!engine.inner.runtime.lock().unwrap().ready);
+        assert!(engine.verify_prepared_runtime(&prepared, &AtomicBool::new(false)).is_err());
+        assert_eq!(original.source_manifest_sha256.as_deref(), Some("first-manifest"));
+        assert_eq!(original.executable, std::ffi::OsString::from("package-cli.exe"));
     }
 
     #[test]
