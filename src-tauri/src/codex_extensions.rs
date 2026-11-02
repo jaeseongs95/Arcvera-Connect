@@ -94,28 +94,70 @@ fn with_rpc<T>(exe: &OsString, cwd: &Path, operation: impl FnOnce(&mut Rpc<TcpSt
 
 struct CliProcess {
     child: Child, job: Option<ProcessJob>, _gate: LaunchGate,
-    readers: Vec<JoinHandle<Result<Vec<u8>, String>>>,
+    readers: Vec<JoinHandle<Result<Vec<u8>, String>>>, stop_capture: Arc<AtomicBool>,
 }
 impl Drop for CliProcess {
     fn drop(&mut self) {
         if let Some(job) = self.job.take() { let _ = job.terminate(); }
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // Escaped daemons may still own the write ends; EOF is not our lifetime boundary.
+        self.stop_capture.store(true, Ordering::Release);
         for reader in self.readers.drain(..) { let _ = reader.join(); }
     }
 }
+#[cfg(any(not(windows), test))]
 fn capture(mut pipe: impl Read + Send + 'static, overflow: Arc<AtomicBool>) -> JoinHandle<Result<Vec<u8>, String>> {
+    capture_read(move |block| pipe.read(block), overflow)
+}
+fn capture_read(mut read: impl FnMut(&mut [u8]) -> io::Result<usize> + Send + 'static,
+    overflow: Arc<AtomicBool>) -> JoinHandle<Result<Vec<u8>, String>> {
     thread::spawn(move || {
         let mut bytes = Vec::new();
         let mut block = [0u8; 16 * 1024];
         loop {
-            let count = pipe.read(&mut block).map_err(|e| format!("Read Codex command output: {e}"))?;
+            let count = read(&mut block).map_err(|e| format!("Read Codex command output: {e}"))?;
             if count == 0 { return Ok(bytes); }
             let remaining = MAX_FRAME.saturating_sub(bytes.len());
             bytes.extend_from_slice(&block[..count.min(remaining)]);
             if count > remaining { overflow.store(true, Ordering::Release); }
         }
     })
+}
+#[cfg(windows)]
+fn capture_pipe(mut pipe: impl Read + std::os::windows::io::AsRawHandle + Send + 'static,
+    overflow: Arc<AtomicBool>, stop: Arc<AtomicBool>) -> JoinHandle<Result<Vec<u8>, String>> {
+    use windows_sys::Win32::{Foundation::ERROR_BROKEN_PIPE, System::Pipes::PeekNamedPipe};
+    let mut drain_remaining = None;
+    capture_read(move |block| loop {
+        // Observe stop before peeking: a stale pre-stop byte count could lose the
+        // launcher's final writes. Each read handle is owned by this reader alone.
+        let stopping = stop.load(Ordering::Acquire);
+        let mut available = 0;
+        // SAFETY: pipe owns this anonymous pipe read handle for the entire call;
+        // no other thread reads or issues I/O on this same handle.
+        if unsafe { PeekNamedPipe(pipe.as_raw_handle(), std::ptr::null_mut(), 0,
+            std::ptr::null_mut(), &mut available, std::ptr::null_mut()) } == 0 {
+            let error = io::Error::last_os_error();
+            return if error.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) { Ok(0) } else { Err(error) };
+        }
+        if stopping && drain_remaining.is_none() { drain_remaining = Some((available as usize).min(MAX_FRAME + 1)); }
+        // Freeze a finite drain budget after child/job cleanup. An escaped daemon
+        // writing more bytes must not extend this command's lifetime indefinitely.
+        // MAX_FRAME + 1 is enough to retain bounded output and prove overflow.
+        let ready = drain_remaining.unwrap_or(available as usize).min(available as usize).min(block.len());
+        if ready != 0 {
+            let count = pipe.read(&mut block[..ready])?;
+            if let Some(remaining) = drain_remaining.as_mut() { *remaining -= count; }
+            return Ok(count);
+        }
+        if drain_remaining.is_some() { return Ok(0); }
+        thread::sleep(Duration::from_millis(20));
+    }, overflow)
+}
+#[cfg(not(windows))]
+fn capture_pipe(pipe: impl Read + Send + 'static, overflow: Arc<AtomicBool>, _stop: Arc<AtomicBool>) -> JoinHandle<Result<Vec<u8>, String>> {
+    capture(pipe, overflow)
 }
 // JSON 명령과 startup 도움말이 같은 프로세스 소유권·출력 상한을 사용한다.
 pub(super) fn command_stdout(exe: &OsString, cwd: &Path, args: &[String], timeout: Duration) -> Result<Vec<u8>, String> {
@@ -156,11 +198,11 @@ fn command_output_with_job(exe: &OsString, cwd: &Path, args: &[String], deadline
     command.args(args).current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     hidden(&mut command);
     let child = command.spawn().map_err(|e| format!("Start Codex command: {e}"))?;
-    let mut process = CliProcess { child, job: None, _gate: gate, readers: Vec::new() };
+    let mut process = CliProcess { child, job: None, _gate: gate, readers: Vec::new(), stop_capture: Arc::new(AtomicBool::new(false)) };
     process.job = Some(if daemon_launcher { ProcessJob::assign_daemon_launcher(&process.child)? } else { ProcessJob::assign_std(&process.child)? });
     let overflow = Arc::new(AtomicBool::new(false));
-    process.readers.push(capture(process.child.stdout.take().ok_or("Codex stdout pipe is missing")?, overflow.clone()));
-    process.readers.push(capture(process.child.stderr.take().ok_or("Codex stderr pipe is missing")?, overflow.clone()));
+    process.readers.push(capture_pipe(process.child.stdout.take().ok_or("Codex stdout pipe is missing")?, overflow.clone(), process.stop_capture.clone()));
+    process.readers.push(capture_pipe(process.child.stderr.take().ok_or("Codex stderr pipe is missing")?, overflow.clone(), process.stop_capture.clone()));
     process._gate.release()?;
     let status = loop {
         check_cancelled(cancelled)?;
@@ -169,15 +211,18 @@ fn command_output_with_job(exe: &OsString, cwd: &Path, args: &[String], deadline
         if Instant::now() >= deadline { return Err("Codex command timed out; its result is unknown. Refresh before retrying".into()); }
         thread::sleep(Duration::from_millis(20));
     };
-    // Stop owned descendants before joining pipes: a grandchild must not keep
-    // stdout open after the command exits. No external process is targeted.
+    // Stop owned descendants, then drain the final buffered output without
+    // waiting for write handles held by intentionally escaped daemons to close.
     if let Some(job) = process.job.take() { job.terminate()?; }
+    process.stop_capture.store(true, Ordering::Release);
     // 한 reader의 오류로 나머지 JoinHandle을 버리지 않고 모두 정산한다.
     let joined: Vec<_> = process.readers.drain(..).map(|reader| {
         reader.join().map_err(|_| "Codex command output reader panicked".to_owned()).and_then(|output| output)
     }).collect();
     let mut output = joined.into_iter().collect::<Result<Vec<_>, String>>()?;
     if overflow.load(Ordering::Acquire) { return Err("Codex command output exceeded 8 MiB; refresh before retrying".into()); }
+    check_cancelled(cancelled)?;
+    if Instant::now() >= deadline { return Err("Codex command timed out; its result is unknown. Refresh before retrying".into()); }
     Ok(CliCommandOutput { status, stdout: output.remove(0), stderr: output.remove(0) })
 }
 fn cli(exe: &OsString, cwd: &Path, args: &[String], timeout: Duration) -> Result<Value, String> {
@@ -647,21 +692,37 @@ switch ($Mode) {
     fn owned_cli_runner_fixture_child() {
         let root = env::current_dir().unwrap();
         let mode = fs::read_to_string(root.join("mode.txt")).unwrap();
+        if mode == "escaped-sleeper" {
+            io::stdout().write_all(b"escaped-daemon-stdout\n").unwrap(); io::stdout().flush().unwrap();
+            io::stderr().write_all(b"escaped-daemon-stderr\n").unwrap(); io::stderr().flush().unwrap();
+        }
         fs::write(root.join("entered.txt"), std::process::id().to_string()).unwrap();
         if mode == "flood" {
             for _ in 0..20 { io::stdout().write_all(&vec![b'x';1024*1024]).unwrap(); }
-        } else if mode == "timeout" || mode == "pipe-leak" {
+        } else if mode == "timeout" || mode == "pipe-leak" || (mode.starts_with("escaped-") && mode != "escaped-sleeper") {
             let child_root=root.join("child"); fs::create_dir(&child_root).unwrap();
-            fs::write(child_root.join("mode.txt"), "sleep").unwrap();
+            fs::write(child_root.join("mode.txt"), if mode.starts_with("escaped-") { "escaped-sleeper" } else { "sleep" }).unwrap();
             let mut command=Command::new(env::current_exe().unwrap());
             command.args(["--exact","codex::extensions::tests::owned_cli_runner_fixture_child","--ignored","--nocapture"]).current_dir(&child_root).stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
-            hidden(&mut command); let child=command.spawn().unwrap();
+            hidden(&mut command);
+            if mode.starts_with("escaped-") {
+                use std::os::windows::process::CommandExt;
+                use windows_sys::Win32::System::Threading::{CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW};
+                command.creation_flags(CREATE_BREAKAWAY_FROM_JOB | CREATE_NO_WINDOW);
+            }
+            let child=command.spawn().unwrap();
             let deadline=Instant::now()+Duration::from_secs(30);
             while !child_root.join("entered.txt").exists() { assert!(Instant::now()<deadline,"자손 fixture 시작 실패"); thread::sleep(Duration::from_millis(2)); }
             fs::write(root.join("pids.tmp"), format!("{},{}",std::process::id(),child.id())).unwrap();
             fs::rename(root.join("pids.tmp"),root.join("pids.txt")).unwrap();
             while !root.join("release.txt").exists() { assert!(Instant::now()<deadline,"부모 시험의 핸들 관측 실패"); thread::sleep(Duration::from_millis(2)); }
-            if mode == "pipe-leak" { std::process::exit(0); }
+            if mode == "escaped-pipe" {
+                io::stdout().write_all(&b"launcher-final-stdout\n".repeat(16384)).unwrap(); io::stdout().flush().unwrap();
+                io::stderr().write_all(&b"launcher-final-stderr\n".repeat(16384)).unwrap(); io::stderr().flush().unwrap();
+            } else if mode == "escaped-overflow" {
+                for _ in 0..20 { io::stdout().write_all(&vec![b'x';1024*1024]).unwrap(); }
+            }
+            if mode == "pipe-leak" || mode == "escaped-pipe" { std::process::exit(0); }
         }
         thread::sleep(Duration::from_secs(120));
         std::process::exit(0);
@@ -704,6 +765,85 @@ switch ($Mode) {
                 assert_eq!(status,0,"소유 fixture {pid}가 종료되지 않음");
             }
             println!("CLI 자원 수명 시험: mode={mode}, ready=true, originalHandlesExited=true, elapsed={:?}",started.elapsed());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    #[cfg(windows)]
+    fn daemon_launcher_capture_reaps_readers_without_stopping_escaped_pipe_holders() {
+        use windows_sys::Win32::{Foundation::{CloseHandle, HANDLE},
+            System::Threading::{OpenProcess, TerminateProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE}};
+        struct OwnedFixture(HANDLE);
+        impl Drop for OwnedFixture {
+            fn drop(&mut self) { unsafe {
+                // Only handles opened for the live, explicitly published fixture PIDs.
+                if WaitForSingleObject(self.0, 0) == 258 { TerminateProcess(self.0, 1); WaitForSingleObject(self.0, 1000); }
+                CloseHandle(self.0);
+            } }
+        }
+        let root = env::temp_dir().join(format!("agent-grid-cli-escaped-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let exe = env::current_exe().unwrap().into_os_string();
+        let args = vec!["--exact".into(), "codex::extensions::tests::owned_cli_runner_fixture_child".into(),
+            "--ignored".into(), "--nocapture".into()];
+        for mode in ["escaped-pipe", "escaped-timeout", "escaped-cancel", "escaped-overflow"] {
+            let directory = root.join(mode); fs::create_dir(&directory).unwrap();
+            fs::write(directory.join("mode.txt"), mode).unwrap();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let (send, receive) = std::sync::mpsc::channel();
+            let (worker_exe, worker_root, worker_args, worker_cancelled) = (exe.clone(), directory.clone(), args.clone(), cancelled.clone());
+            let started = Instant::now(); let deadline = started + Duration::from_secs(6);
+            let worker = thread::spawn(move || {
+                let result = command_output_with_job(&worker_exe, &worker_root, &worker_args, deadline, Some(&worker_cancelled), true);
+                let _ = send.send(result);
+            });
+            let pids = directory.join("pids.txt");
+            while !pids.exists() {
+                if let Ok(result) = receive.try_recv() { panic!("{mode} fixture 준비 전 종료: {}", result.err().unwrap_or_else(|| "예상 밖 성공".into())); }
+                assert!(Instant::now() < deadline, "{mode} fixture 준비 실패");
+                thread::sleep(Duration::from_millis(2));
+            }
+            let processes = fs::read_to_string(pids).unwrap().split(',').map(|pid| {
+                let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, pid.parse().unwrap()) };
+                assert!(!handle.is_null(), "{mode} live fixture handle 없음");
+                let process = OwnedFixture(handle);
+                assert_eq!(unsafe { WaitForSingleObject(process.0, 0) }, 258, "{mode} fixture가 관측 전에 종료됨");
+                process
+            }).collect::<Vec<_>>();
+            assert_eq!(processes.len(), 2);
+            fs::write(directory.join("release.txt"), "observed").unwrap();
+            if mode == "escaped-cancel" { cancelled.store(true, Ordering::Release); }
+            let remaining = (deadline + Duration::from_secs(2)).saturating_duration_since(Instant::now());
+            let result = match receive.recv_timeout(remaining) {
+                Ok(result) => result,
+                Err(error) => {
+                    // Clean only our fixture handles before joining a regressed worker.
+                    // This also prevents the old EOF bug from stranding CI children.
+                    drop(processes); worker.join().unwrap();
+                    panic!("{mode}: escaped pipe holder blocked command completion: {error}");
+                }
+            };
+            worker.join().unwrap();
+            if mode == "escaped-pipe" {
+                let output = result.unwrap_or_else(|error| panic!("{mode}: {error}"));
+                assert!(output.status.success());
+                assert!(output.stdout.ends_with(&b"launcher-final-stdout\n".repeat(16384)), "launcher stdout tail lost");
+                assert!(output.stderr.ends_with(&b"launcher-final-stderr\n".repeat(16384)), "launcher stderr tail lost");
+                assert!(output.stdout.windows(b"escaped-daemon-stdout\n".len()).any(|part| part == b"escaped-daemon-stdout\n"));
+                assert!(output.stderr.windows(b"escaped-daemon-stderr\n".len()).any(|part| part == b"escaped-daemon-stderr\n"));
+            } else {
+                let error = result.err().expect("오류 fixture를 성공으로 처리함");
+                let expected = match mode { "escaped-timeout" => "timed out", "escaped-cancel" => "cancel", _ => "exceeded 8 MiB" };
+                assert!(error.contains(expected), "{mode}: {error}");
+            }
+            assert_eq!(unsafe { WaitForSingleObject(processes[0].0, 1000) }, 0, "launcher was not reaped");
+            assert_eq!(unsafe { WaitForSingleObject(processes[1].0, 0) }, 258, "capture cleanup stopped the escaped daemon");
+            // Command return implies both reader joins finished; the original daemon
+            // handle is still live here, so EOF could not have supplied that completion.
+            assert!(started.elapsed() < Duration::from_secs(8));
+            println!("escaped CLI capture: mode={mode}, bothReadersJoined=true, daemonStillRunning=true, elapsed={:?}", started.elapsed());
+            assert_ne!(unsafe { TerminateProcess(processes[1].0, 1) }, 0, "terminate own fixture daemon");
+            assert_eq!(unsafe { WaitForSingleObject(processes[1].0, 1000) }, 0, "own fixture daemon did not exit");
         }
         fs::remove_dir_all(root).unwrap();
     }

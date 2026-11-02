@@ -161,6 +161,11 @@ fn preview_commands(exe: &OsString, server: &OsString, kind: &str, pair: Runtime
         if report.pair.state == "matched" {
             return Err("선택한 CLI와 관리·실행 서버의 버전이 이미 같습니다. 전환하지 않았습니다.".into());
         }
+        if report.pair.state == "stopped" && report.pair.managed_version.is_none()
+            && report.pair.running_version.is_none() && report.pair.managed_cli_executable.is_some()
+            && report.pair.socket_path.is_some() {
+            return Err("공유 서버 패키지가 미설치 상태입니다. 현재 CLI의 안전한 서버 전환 명령은 첫 설치를 지원하지 않으므로 선택한 패키지의 별도 준비가 필요합니다.".into());
+        }
         if !matches!(report.pair.state.as_str(), "mismatch" | "stopped")
             || report.pair.managed_cli_executable.is_none() || report.pair.managed_version.is_none()
             || (report.pair.state == "mismatch" && report.pair.running_version.is_none())
@@ -350,8 +355,32 @@ mod tests {
         }
         let mut invalid = pair(); invalid.state = "stopped".into();
         assert!(!fixture(invalid, evidence(), help()).can_apply);
-        let mut missing = pair(); missing.state = "stopped".into(); missing.running_version = None; missing.managed_version = None;
-        assert!(!fixture(missing, evidence(), help()).can_apply);
+    }
+
+    #[test]
+    fn uninstalled_stopped_requires_separate_preparation_without_update_or_package_reads() {
+        let mut stopped = pair(); stopped.state = "stopped".into();
+        stopped.running_version = None; stopped.managed_version = None;
+        let report = preview_commands(&OsString::from("cli"), &OsString::from("server"), "standalone", stopped,
+            &Arc::new(AtomicBool::new(false)), Instant::now() + Duration::from_secs(20),
+            || panic!("첫 설치 미지원이면 패키지 읽기 금지"),
+            |_, _| panic!("첫 설치를 위한 자동 시작·전환 명령 금지")).unwrap();
+        assert!(!report.can_apply);
+        assert!(report.package_root.is_none());
+        assert_eq!(report.fingerprint.len(), 64);
+        assert!(report.reason.unwrap().contains("첫 설치를 지원하지 않으므로"));
+    }
+
+    #[test]
+    fn mismatch_with_missing_managed_or_running_version_remains_blocked() {
+        for missing_managed in [true, false] {
+            let mut missing = pair();
+            if missing_managed { missing.managed_version = None; } else { missing.running_version = None; }
+            let report = preview_commands(&OsString::from("cli"), &OsString::from("server"), "standalone", missing,
+                &Arc::new(AtomicBool::new(false)), Instant::now() + Duration::from_secs(20),
+                || panic!("불명 버전 패키지 읽기 금지"), |_, _| panic!("불명 버전 명령 금지")).unwrap();
+            assert!(!report.can_apply);
+        }
     }
 
     #[test]

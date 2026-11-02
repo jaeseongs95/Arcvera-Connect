@@ -146,7 +146,10 @@ fn inspect_commands(
                 _ => return Err("공유 서버의 실행 상태를 확인하지 못했습니다. 중지 상태로 추정하지 않았습니다.".into()),
             };
             let reported_cli = normalized_version(field(&value, "cliVersion", 256)?)?;
-            let managed = normalized_version(field(&value, "managedCodexVersion", 256)?)?;
+            // Passive stopped explicitly reports null when no managed package is installed.
+            // Missing fields and non-string values in every other state remain errors.
+            let managed = if stopped && value.get("managedCodexVersion") == Some(&Value::Null) { None }
+                else { Some(normalized_version(field(&value, "managedCodexVersion", 256)?)?) };
             let running = if stopped {
                 if value.get("appServerVersion") != Some(&Value::Null) {
                     return Err("공유 서버의 중지 상태와 실행 버전이 서로 맞지 않습니다.".into());
@@ -160,17 +163,20 @@ fn inspect_commands(
             }
             report.managed_cli_executable = Some(managed_path);
             report.socket_path = Some(socket);
-            report.managed_version = Some(managed.clone());
+            report.managed_version = managed.clone();
             report.running_version = running.clone();
             if reported_cli != report.cli_version {
                 return Err("공유 서버 조회가 보고한 CLI 버전이 선택한 실행 파일 버전과 다릅니다.".into());
             }
             if stopped {
                 report.state = "stopped".into();
-                report.message = Some(if managed == report.cli_version {
-                    "공유 서버가 중지되어 있습니다. 선택한 버전과 관리 버전은 같습니다.".into()
-                } else { "공유 서버가 중지되어 있으며 관리 버전이 선택한 버전과 다릅니다. 서버 전환 확인이 필요합니다.".into() });
-            } else if managed != report.cli_version || running.as_deref() != Some(report.cli_version.as_str()) {
+                report.message = Some(match managed.as_deref() {
+                    None => "공유 서버 패키지가 미설치 상태입니다. 선택한 패키지의 별도 준비가 필요합니다.".into(),
+                    Some(version) if version == report.cli_version =>
+                        "공유 서버가 중지되어 있습니다. 선택한 버전과 관리 버전은 같습니다.".into(),
+                    Some(_) => "공유 서버가 중지되어 있으며 관리 버전이 선택한 버전과 다릅니다. 서버 전환 확인이 필요합니다.".into(),
+                });
+            } else if managed.as_deref() != Some(report.cli_version.as_str()) || running.as_deref() != Some(report.cli_version.as_str()) {
                 report.state = "mismatch".into();
                 report.message = Some("선택한 버전과 관리 중이거나 실행 중인 서버의 전체 버전이 다릅니다. 서버 전환 확인이 필요합니다.".into());
             } else {
@@ -402,17 +408,60 @@ mod tests {
     }
 
     #[test]
-    fn stopped_requires_confirmed_managed_version_matching_cli_probe_and_null_running_version() {
+    fn stopped_requires_explicit_version_fields_matching_cli_probe_and_absolute_paths() {
         let mut base = status(R33, R33);
         base["status"] = json!("stopped"); base["cliVersion"] = json!(R33); base["appServerVersion"] = Value::Null;
-        for (key, invalid) in [("managedCodexVersion", Value::Null), ("managedCodexPath", Value::Null),
-            ("socketPath", Value::Null), ("cliVersion", json!(R32)), ("appServerVersion", json!(R33))] {
-            let mut value = base.clone(); value[key] = invalid;
-            let report = inspect_fixture_help(R33, R33, Ok(daemon_help(true)), Ok(serde_json::to_vec(&value).unwrap())).0.unwrap();
-            assert_eq!(report.state, "unavailable", "field={key}");
+        for managed in [json!(R33), Value::Null] {
+            base["managedCodexVersion"] = managed;
+            for (key, invalid) in [("managedCodexVersion", json!(42)), ("managedCodexVersion", json!("")),
+                ("managedCodexVersion", json!("not-a-version")), ("managedCodexPath", Value::Null),
+                ("managedCodexPath", json!("relative/codex.exe")), ("socketPath", Value::Null),
+                ("socketPath", json!("relative/server.sock")), ("cliVersion", json!(R32)),
+                ("appServerVersion", json!(R33)), ("appServerVersion", json!(false))] {
+                let mut value = base.clone(); value[key] = invalid;
+                let report = inspect_fixture_help(R33, R33, Ok(daemon_help(true)), Ok(serde_json::to_vec(&value).unwrap())).0.unwrap();
+                assert_eq!(report.state, "unavailable", "field={key}");
+            }
+            for key in ["managedCodexVersion", "appServerVersion", "managedCodexPath", "socketPath", "cliVersion"] {
+                let mut value = base.clone(); value.as_object_mut().unwrap().remove(key);
+                assert_eq!(inspect_fixture_help(R33, R33, Ok(daemon_help(true)), Ok(serde_json::to_vec(&value).unwrap())).0.unwrap().state, "unavailable", "missing={key}");
+            }
         }
-        let mut value = base; value.as_object_mut().unwrap().remove("appServerVersion");
-        assert_eq!(inspect_fixture_help(R33, R33, Ok(daemon_help(true)), Ok(serde_json::to_vec(&value).unwrap())).0.unwrap().state, "unavailable");
+    }
+
+    #[test]
+    fn passive_stopped_with_explicit_null_versions_reports_uninstalled_without_mutation() {
+        let mut value = status(R33, R33);
+        value["status"] = json!("stopped"); value["cliVersion"] = json!(R33);
+        value["managedCodexVersion"] = Value::Null; value["appServerVersion"] = Value::Null;
+        value["reason"] = Value::Null;
+        let bytes = serde_json::to_vec(&value).unwrap();
+        let (report, calls) = inspect_fixture_help(R33, R33, Ok(daemon_help(true)), Ok(bytes.clone()));
+        let report = report.unwrap();
+        assert_eq!(report.state, "stopped");
+        assert!(report.managed_version.is_none() && report.running_version.is_none());
+        assert_eq!(report.managed_cli_executable.as_deref(), value["managedCodexPath"].as_str());
+        assert_eq!(report.socket_path.as_deref(), value["socketPath"].as_str());
+        assert!(report.message.unwrap().contains("미설치"));
+        assert_eq!(calls, ["cli.exe --version", "server.exe --version", "cli.exe app-server --help",
+            "cli.exe app-server daemon --help", "cli.exe app-server daemon status --json"]);
+        // Legacy version has no passive stopped contract, even with explicit nulls.
+        assert_eq!(inspect_fixture(R33, R33, Ok(bytes)).0.unwrap().state, "unavailable");
+    }
+
+    #[test]
+    fn passive_running_requires_present_non_null_versions() {
+        for key in ["managedCodexVersion", "appServerVersion"] {
+            for invalid in [Value::Null, json!(false), json!("not-a-version")] {
+                let mut value = status(R33, R33); value["cliVersion"] = json!(R33); value[key] = invalid;
+                assert_eq!(inspect_fixture_help(R33, R33, Ok(daemon_help(true)),
+                    Ok(serde_json::to_vec(&value).unwrap())).0.unwrap().state, "unavailable", "field={key}");
+            }
+            let mut value = status(R33, R33); value["cliVersion"] = json!(R33);
+            value.as_object_mut().unwrap().remove(key);
+            assert_eq!(inspect_fixture_help(R33, R33, Ok(daemon_help(true)),
+                Ok(serde_json::to_vec(&value).unwrap())).0.unwrap().state, "unavailable", "missing={key}");
+        }
     }
 
     #[test]
