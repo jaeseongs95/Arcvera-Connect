@@ -54,6 +54,8 @@ export function savedSessionMetadata({ title, cwd, threadId, projectId, projectA
 // A stale generation must never overwrite a newer process or feed its terminal.
 export function updateSession(previous: Session | undefined, next: SessionInfo): Session {
   if (previous && next.generation < previous.generation) return previous;
+  // Preparing is one-way within a process generation; observer delivery can lag PTY activation.
+  if (previous?.generation === next.generation && previous.state !== 'starting' && next.state === 'starting') next = { ...next, state: previous.state };
   // Cleanup is terminal for this generation; a delayed status snapshot cannot revive ownership.
   if (previous?.generation === next.generation && previous.active === false && next.active) return previous;
   if (previous?.generation === next.generation && (previous.projectRevision ?? 0) > (next.projectRevision ?? 0)) next = { ...next, projectId: previous.projectId, projectAssigned: previous.projectAssigned, projectRevision: previous.projectRevision };

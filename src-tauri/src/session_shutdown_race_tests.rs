@@ -160,6 +160,7 @@ fn shared_reaper_handoff_during_observer_join_reports_unknown_for_stop_and_shutd
         let no_more_connections = listener.try_clone().unwrap();
         listener.set_nonblocking(true).unwrap();
         let server_cwd = cwd.clone();
+        let (activate, activated) = mpsc::sync_channel(1);
         let server = thread::spawn(move || {
             let mut connections = Vec::new();
             // 시작 전 준비가 짧은 초기화 연결을 닫은 뒤 실제 세션 관측자가 별도로 연결한다.
@@ -187,7 +188,14 @@ fn shared_reaper_handoff_during_observer_join_reports_unknown_for_stop_and_shutd
                         assert_eq!(request["params"],json!({"threadId":id}),"원래 대화의 수동 구독 외 변경은 허용하지 않는다");
                         json!({"thread":{"id":id,"cwd":server_cwd,"turns":[],"status":{"type":"active"}}})
                     },
-                    "thread/read" => json!({"thread":{"id":id,"cwd":server_cwd,"status":{"type":"active"}}}),
+                    "thread/read" => {
+                        // 준비 중 running은 외부 starting으로 투영되며 관측자가
+                        // 같은 상태를 재발행하지 않는다. 실제 PTY 활성화 뒤에만
+                        // 이 RPC 응답을 보내 실제 observer의 running sink를 막는다.
+                        assert_eq!(methods.iter().filter(|method|method.as_str()=="thread/read").count(),1);
+                        activated.recv_timeout(Duration::from_secs(8)).expect("PTY 활성화 신호가 필요하다");
+                        json!({"thread":{"id":id,"cwd":server_cwd,"status":{"type":"active"}}})
+                    },
                     _ => panic!("예상하지 않은 변경 요청: {method}"),
                 };
                 ws.send(Message::Text(json!({"id":request["id"],"result":result}).to_string().into())).unwrap();
@@ -220,9 +228,12 @@ fn shared_reaper_handoff_during_observer_join_reports_unknown_for_stop_and_shutd
         stage("launch 진입");
         let started = engine.start(start).unwrap();
         stage("launch 반환");
-        entry.recv_timeout(Duration::from_secs(8)).unwrap();
         let session = engine.lookup(&started.id, started.generation).unwrap();
         let process = session.process.lock().unwrap().as_ref().unwrap().clone();
+        assert_eq!(session.phase.load(Ordering::Acquire), 1, "실제 PTY 활성화 뒤 관측을 허용해야 한다");
+        activate.send(()).unwrap();
+        entry.recv_timeout(Duration::from_secs(8)).expect("활성화 후 실제 observer의 running sink가 막혀야 한다");
+        assert_eq!(session.info().unwrap().state, "running");
         let mut output = String::new();
         let mut answered = 0;
         until("TUI PID 기록", || {

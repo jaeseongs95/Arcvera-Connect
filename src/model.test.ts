@@ -91,3 +91,21 @@ test('terminal rows stay bounded at 32 while saved metadata uses a separate 512-
   assert.throws(() => parseLayout({ ...value, sessions: Array.from({ length: 513 }, () => sessions[0]) }), RangeError);
   assert.deepEqual(oversized?.rowSizes, rowSizes);
 });
+
+test('delayed preparation snapshots cannot disable an activated session in the same generation', () => {
+  for (const state of ['idle', 'running', 'waiting', 'unknown', 'error', 'stopping']) {
+    const current = { ...base, state, seq: 17, projectId: 'newer', projectAssigned: true, projectRevision: 4 };
+    const delayed = { ...base, state: 'starting', threadId: 'resolved-thread', projectId: 'older', projectAssigned: true, projectRevision: 3 };
+    const updated = updateSession(current, delayed);
+    assert.equal(updated.state, state, 'preparing must not supersede '+state);
+    assert.equal(updated.threadId, 'resolved-thread');
+    assert.equal(updated.seq, 17);
+    assert.equal(updated.projectId, 'newer');
+    assert.equal(updated.projectRevision, 4);
+    assert.equal(updateSession(current, { ...delayed, generation: 3 }).state, 'starting');
+  }
+  const preparing = { ...base, state: 'starting', seq: -1 };
+  assert.equal(updateSession(undefined, preparing).state, 'starting');
+  assert.equal(updateSession(preparing, { ...preparing, threadId: 'resolved-thread' }).threadId, 'resolved-thread');
+  assert.equal(updateSession(preparing, { ...base, state: 'idle' }).state, 'idle');
+});
