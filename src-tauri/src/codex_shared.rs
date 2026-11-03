@@ -104,7 +104,7 @@ fn first_installation(value: &Value, mut metadata: impl FnMut(&Path) -> std::io:
     // CLI operation lock 밖의 관찰이므로 확인과 시작 사이 외부 설치 경쟁은 남는다.
     let state = home.join("app-server-daemon");
     let mut paths = vec![home.join("packages/app-server-daemon/current"), home.join("packages/standalone/current")];
-    paths.extend(["loaded-threads.json", "daemon.pid", "daemon.stderr.log", "daemon-updater.pid", "daemon-updater.stderr.log",
+    paths.extend(["settings.json", "loaded-threads.json", "daemon.pid", "daemon.stderr.log", "daemon-updater.pid", "daemon-updater.stderr.log",
         "app-server.pid", "app-server.stderr.log", "app-server-updater.pid", "app-server-updater.stderr.log"].map(|name| state.join(name)));
     paths.iter().all(|path| matches!(metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound))
 }

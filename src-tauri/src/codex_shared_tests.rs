@@ -93,7 +93,7 @@ fn startup_confirmed_missing_package_uses_default_start() {
 fn startup_preserves_existing_selection_recovery_and_installation_markers() {
     let root = env::current_dir().unwrap().join("target").join(format!("startup-preserve-{}", Uuid::new_v4()));
     for (index, marker) in ["packages/app-server-daemon/current", "packages/standalone/current",
-        "app-server-daemon/loaded-threads.json", "app-server-daemon/daemon.pid", "app-server-daemon/daemon.stderr.log",
+        "app-server-daemon/settings.json", "app-server-daemon/loaded-threads.json", "app-server-daemon/daemon.pid", "app-server-daemon/daemon.stderr.log",
         "app-server-daemon/daemon-updater.pid", "app-server-daemon/daemon-updater.stderr.log",
         "app-server-daemon/app-server.pid", "app-server-daemon/app-server.stderr.log",
         "app-server-daemon/app-server-updater.pid", "app-server-daemon/app-server-updater.stderr.log"].iter().enumerate() {
