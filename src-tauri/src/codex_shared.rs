@@ -13,6 +13,7 @@ pub(super) fn prepare_runtime(exe: &OsString, cwd: &Path, cancelled: &Arc<Atomic
     let value = prepare_runtime_commands(
         |args| extensions::command_stdout_until(exe, cwd, &args.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(), deadline, Some(cancelled)),
         |preserve| extensions::start_daemon_stdout_until(exe, cwd, preserve, deadline, Some(cancelled)),
+        |path| fs::symlink_metadata(path),
     )?;
     let Some(value) = value else { return Ok(()); }; // 명시 미지원 CLI의 기존 개별 서버 경로 유지.
     check_cancelled(Some(cancelled))?;
@@ -33,6 +34,7 @@ pub(super) fn prepare_runtime(exe: &OsString, cwd: &Path, cancelled: &Arc<Atomic
 fn prepare_runtime_commands(
     mut query: impl FnMut(&[&str]) -> Result<Vec<u8>, String>,
     start: impl FnOnce(bool) -> Result<Vec<u8>, String>,
+    mut metadata: impl FnMut(&Path) -> std::io::Result<fs::Metadata>,
 ) -> Result<Option<Value>, String> {
     let help = query(&["app-server", "--help"])?;
     if !supports_shared(&help)? { return Ok(None); }
@@ -63,7 +65,8 @@ fn prepare_runtime_commands(
                     }
                     preserve = !(value["status"] == "stopped"
                         && value.get("managedCodexVersion") == Some(&Value::Null)
-                        && value.get("appServerVersion") == Some(&Value::Null));
+                        && value.get("appServerVersion") == Some(&Value::Null)
+                        && first_installation(&value, &mut metadata));
                 }
             }
             let started = lifecycle_value(&start(preserve).map_err(|error| format!("공유 서버 시작 실패: {error}"))?)?;
@@ -81,6 +84,29 @@ fn prepare_runtime_commands(
             Ok(Some(ready))
         }
     }
+}
+fn first_installation(value: &Value, mut metadata: impl FnMut(&Path) -> std::io::Result<fs::Metadata>) -> bool {
+    let path = |key| value.get(key).and_then(Value::as_str).filter(|text| !text.chars().any(char::is_control))
+        .map(Path::new).filter(|path| path.is_absolute()
+            && !path.components().any(|part| matches!(part, std::path::Component::ParentDir)));
+    let (Some(socket), Some(managed)) = (path("socketPath"), path("managedCodexPath")) else { return false; };
+    let Some(control) = socket.parent() else { return false; };
+    if socket.file_name() != Some(std::ffi::OsStr::new("app-server-control.sock"))
+        || control.file_name() != Some(std::ffi::OsStr::new("app-server-control")) { return false; }
+    let Some(home) = control.parent() else { return false; };
+    let name = if cfg!(windows) { "codex.exe" } else { "codex" };
+    if !["app-server-daemon", "standalone"].iter().any(|package| {
+        let current = home.join("packages").join(package).join("current");
+        managed == current.join("bin").join(name) || managed == current.join(name)
+    }) { return false; }
+    // null 버전은 exe가 사라진 기존 current에서도 나온다. 고정 경로의 metadata만
+    // 확인하고 존재·끊어진 링크·권한 오류는 preserving 시작과 CLI 원래 오류를 보존한다.
+    // CLI operation lock 밖의 관찰이므로 확인과 시작 사이 외부 설치 경쟁은 남는다.
+    let state = home.join("app-server-daemon");
+    let mut paths = vec![home.join("packages/app-server-daemon/current"), home.join("packages/standalone/current")];
+    paths.extend(["loaded-threads.json", "daemon.pid", "daemon.stderr.log", "daemon-updater.pid", "daemon-updater.stderr.log",
+        "app-server.pid", "app-server.stderr.log", "app-server-updater.pid", "app-server-updater.stderr.log"].map(|name| state.join(name)));
+    paths.iter().all(|path| matches!(metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound))
 }
 pub(super) fn lifecycle_value(bytes: &[u8]) -> Result<Value, String> {
     serde_json::from_slice(bytes).map_err(|_| "공유 서버 상태 응답이 올바른 JSON이 아닙니다.".into())

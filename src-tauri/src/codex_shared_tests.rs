@@ -18,6 +18,7 @@ fn startup_commands_case(replies: Vec<Result<Vec<u8>, String>>, started: Result<
     let result = prepare_runtime_commands(
         |args| { calls.borrow_mut().push(args.join(" ")); replies.pop_front().expect("추가 조회 금지") },
         |preserve| { calls.borrow_mut().push(if preserve { "start --existing-installation" } else { "start" }.into()); started },
+        |path| fs::symlink_metadata(path),
     );
     assert!(replies.is_empty(), "예정된 상태 확인을 생략하면 안 된다");
     (result, calls.into_inner())
@@ -73,12 +74,88 @@ fn startup_uses_default_start_when_preserving_option_is_not_declared() {
 }
 #[test]
 fn startup_confirmed_missing_package_uses_default_start() {
-    let socket = env::current_dir().unwrap().join("startup-fixture.sock").to_str().unwrap().to_owned();
-    for state in ["stopped"] {
+    let home = env::current_dir().unwrap().join("target").join(format!("startup-fresh-{}", Uuid::new_v4()));
+    fs::create_dir_all(&home).unwrap();
+    let socket = home.join("app-server-control/app-server-control.sock").to_str().unwrap().to_owned();
+    for relative in ["packages/app-server-daemon/current/bin", "packages/app-server-daemon/current",
+        "packages/standalone/current/bin", "packages/standalone/current"] {
+        let name = if cfg!(windows) { "codex.exe" } else { "codex" };
+        let passive = json!({"status":"stopped","managedCodexVersion":null,"appServerVersion":null,
+            "socketPath":socket,"managedCodexPath":home.join(relative).join(name)});
         let (result, calls) = startup_commands_case(vec![Ok(startup_help()), Err("연결 없음".into()), Ok(startup_start_help()),
-            Ok(startup_installation(state, Value::Null, Value::Null)), Ok(startup_status("running", &socket))], Ok(startup_status("started", &socket)));
+            Ok(serde_json::to_vec(&passive).unwrap()), Ok(startup_status("running", &socket))], Ok(startup_status("started", &socket)));
         assert!(result.unwrap().is_some());
         assert_eq!(calls, ["app-server --help", "app-server daemon version", "app-server daemon start --help", "app-server daemon status --json", "start", "app-server daemon version"]);
+    }
+    fs::remove_dir(&home).unwrap();
+}
+#[test]
+fn startup_preserves_existing_selection_recovery_and_installation_markers() {
+    let root = env::current_dir().unwrap().join("target").join(format!("startup-preserve-{}", Uuid::new_v4()));
+    for (index, marker) in ["packages/app-server-daemon/current", "packages/standalone/current",
+        "app-server-daemon/loaded-threads.json", "app-server-daemon/daemon.pid", "app-server-daemon/daemon.stderr.log",
+        "app-server-daemon/daemon-updater.pid", "app-server-daemon/daemon-updater.stderr.log",
+        "app-server-daemon/app-server.pid", "app-server-daemon/app-server.stderr.log",
+        "app-server-daemon/app-server-updater.pid", "app-server-daemon/app-server-updater.stderr.log"].iter().enumerate() {
+        let home = root.join(index.to_string());
+        let marker = home.join(marker);
+        if marker.file_name() == Some(std::ffi::OsStr::new("current")) {
+            fs::create_dir_all(marker.join("bin")).unwrap(); // current만 남고 실행 파일은 사라진 설치.
+        } else {
+            fs::create_dir_all(marker.parent().unwrap()).unwrap();
+            fs::write(&marker, b"owned installation marker").unwrap();
+        }
+        let recovery = home.join("app-server-daemon/loaded-threads.json");
+        // 첫 사례는 감사에서 발견한 current/bin 누락 + 복구 자료 + PID/socket 없음이다.
+        if index == 0 {
+            fs::create_dir_all(recovery.parent().unwrap()).unwrap();
+            fs::write(&recovery, b"owned recovery sentinel").unwrap();
+        }
+        let socket = home.join("app-server-control/app-server-control.sock");
+        let name = if cfg!(windows) { "codex.exe" } else { "codex" };
+        let passive = json!({"status":"stopped","managedCodexVersion":null,"appServerVersion":null,
+            "socketPath":socket,"managedCodexPath":home.join("packages/app-server-daemon/current/bin").join(name)});
+        let (result, calls) = startup_commands_case(vec![Ok(startup_help()), Err("연결 없음".into()), Ok(startup_start_help()),
+            Ok(serde_json::to_vec(&passive).unwrap())], Err("선택한 CLI의 설치 오류 원문".into()));
+        assert!(result.unwrap_err().contains("선택한 CLI의 설치 오류 원문"));
+        assert_eq!(calls.last().unwrap(), "start --existing-installation");
+        assert!(fs::symlink_metadata(&marker).is_ok());
+        if index == 0 { assert_eq!(fs::read(&recovery).unwrap(), b"owned recovery sentinel"); }
+    }
+    fs::remove_dir_all(&root).unwrap();
+}
+#[test]
+fn startup_metadata_observation_failure_keeps_preserving_start_and_cli_error() {
+    let home = env::current_dir().unwrap().join("target/startup-metadata-seam");
+    let name = if cfg!(windows) { "codex.exe" } else { "codex" };
+    let passive = json!({"status":"stopped","managedCodexVersion":null,"appServerVersion":null,
+        "socketPath":home.join("app-server-control/app-server-control.sock"),
+        "managedCodexPath":home.join("packages/app-server-daemon/current/bin").join(name)});
+    let mut replies = std::collections::VecDeque::from([Ok(startup_help()), Err("연결 없음".into()),
+        Ok(startup_start_help()), Ok(serde_json::to_vec(&passive).unwrap())]);
+    let mut observations = 0;
+    let result = prepare_runtime_commands(
+        |_| replies.pop_front().expect("추가 조회 금지"),
+        |preserve| { assert!(preserve); Err("CLI 원래 권한 오류: Access denied".into()) },
+        |_| { observations += 1; Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)) },
+    );
+    assert!(result.unwrap_err().contains("CLI 원래 권한 오류: Access denied"));
+    assert_eq!(observations, 1);
+    assert!(replies.is_empty());
+}
+#[test]
+fn startup_unrecognized_installation_paths_never_authorize_default_start() {
+    let home = env::current_dir().unwrap().join("target/startup-path-seam");
+    let name = if cfg!(windows) { "codex.exe" } else { "codex" };
+    let valid = json!({"socketPath":home.join("app-server-control/app-server-control.sock"),
+        "managedCodexPath":home.join("packages/app-server-daemon/current/bin").join(name)});
+    for (key, path) in [("socketPath", Value::Null), ("managedCodexPath", Value::Null),
+        ("managedCodexPath", json!("relative/current/bin/codex.exe")),
+        ("socketPath", json!(home.join("unrecognized/socket.sock"))),
+        ("managedCodexPath", json!(home.join("outside/current/bin").join(name))),
+        ("managedCodexPath", json!(home.join("../other/packages/app-server-daemon/current/bin").join(name)))] {
+        let mut invalid = valid.clone(); invalid[key] = path;
+        assert!(!first_installation(&invalid, |_| panic!("검증하지 않은 경로의 metadata 조회 금지")));
     }
 }
 #[test]
