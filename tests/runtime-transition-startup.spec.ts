@@ -19,7 +19,7 @@ async function failedStartup(page: Page, result: 'updated' | 'unknown' | 'malfor
           savedPath: null, resolvedPath: 'D:\\fixture\\bin\\codex.exe', source: 'path', error: null,
           appServer: { savedPath: null, resolvedPath: 'D:\\fixture\\bin\\codex-app-server.exe', source: 'sibling', kind: 'standalone', error: null },
         };
-        if (command === 'prepare_runtime') { if (++fixture.preparations === 1) throw 'CLI와 공유 서버 버전이 다릅니다'; return null; }
+        if (command === 'prepare_runtime') { if (++fixture.preparations === 1) throw '공유 서버에 연결할 수 없습니다'; return null; }
         if (command === 'runtime_transition_preview') return {
           pair: { cliVersion: 'R33', selectedServerExecutable: 'D:\\fixture\\bin\\codex-app-server.exe', selectedServerVersion: 'R33', managedCliExecutable: 'D:\\managed\\codex.exe', managedVersion: 'R28', runningVersion: 'R28', socketPath: 'D:\\fixture.sock', state: 'mismatch', message: null },
           canApply: true, fingerprint: 'confirmed-pair', reason: null, packageRoot: 'D:\\fixture',
@@ -37,7 +37,7 @@ async function failedStartup(page: Page, result: 'updated' | 'unknown' | 'malfor
     };
   }, result);
   await page.goto('/');
-  await expect(page.locator('#runtime-banner')).toContainText('CLI와 공유 서버 버전이 다릅니다');
+  await expect(page.locator('#runtime-banner')).toContainText('공유 서버에 연결할 수 없습니다');
   await expect(page.locator('#runtime-settings')).toHaveText('서버 확인·복구');
   await page.locator('#runtime-settings').click();
   await expect(page.locator('.transition-details dd')).toHaveText(['R33', 'D:\\fixture\\bin\\codex-app-server.exe', 'R33', 'D:\\managed\\codex.exe', 'R28', 'R28']);
@@ -69,7 +69,7 @@ test('시작 실패 복구 진입은 버전을 한 번 조회하고 작업 종�
   await page.evaluate(() => (window as any).pairStartup.release());
 });
 
-test('버전 불일치에서 확인된 전환 완료 뒤에만 공유 서버를 다시 준비하고 저장 작업을 복원한다', async ({ page }) => {
+test('연결 실패 뒤 사용자가 선택한 전환이 완료되면 서버를 준비하고 저장 작업을 복원한다', async ({ page }) => {
   await failedStartup(page, 'updated');
   expect(await count(page, 'prepare_runtime')).toBe(1);
   expect(await count(page, 'start_session')).toBe(0);

@@ -391,14 +391,9 @@ impl Engine {
         let on_event = Arc::new(move |event| { if let Some(session) = weak.upgrade() { session.observe(event); } });
         let info = session.info()?;
         let adapter = match self.runtime_snapshot_cancelled(&session.stop_requested).and_then(|selected| {
-            let server = selected.server_executable.clone();
-            let kind = selected.server_kind.clone();
             self.prepare_start_with(selected, &session.stop_requested,
-                |exe| Self::prepare_pair(exe, &server, &kind, &session.stop_requested),
-                |exe| {
-                    Self::require_pair(exe, &server, &kind, &session.stop_requested)?;
-                    codex::prepare_with_cancellation(exe, Path::new(&info.cwd), info.thread_id.as_deref(), on_event, session.stop_requested.clone())
-                })
+                |exe| codex::prepare_runtime_with_executable(exe, &session.stop_requested),
+                |exe| codex::prepare_with_cancellation(exe, Path::new(&info.cwd), info.thread_id.as_deref(), on_event, session.stop_requested.clone()))
         }) {
             Ok(adapter) => adapter,
             Err(error) => { session.finish("error")?; return Err(error); }
@@ -834,9 +829,9 @@ impl Engine {
     pub fn prepare_runtime(&self) -> Result<(), String> {
         if self.inner.exiting.load(Ordering::Acquire) { return Err("앱이 종료 중이어서 공유 서버를 시작하지 않았습니다.".into()); }
         let selected = self.runtime_snapshot()?;
-        let server = selected.server_executable.clone();
-        let kind = selected.server_kind.clone();
-        self.prepare_selected_runtime_with(selected, true, &self.inner.exiting, |exe| Self::prepare_pair(exe, &server, &kind, &self.inner.exiting)).map(|_| ())
+        // Startup is decided by the adapter's live handshake, never version labels.
+        self.prepare_selected_runtime_with(selected, true, &self.inner.exiting,
+            |exe| codex::prepare_runtime_with_executable(exe, &self.inner.exiting)).map(|_| ())
     }
 
     pub fn runtime_pair_status(&self) -> Result<codex::RuntimePairStatus, String> {
@@ -890,8 +885,8 @@ impl Engine {
             let verified = match inspect() {
                 Ok(pair) if pair.state == "matched" => true,
                 // A successful update installs but does not start a stopped daemon.
-                // Reuse preparation's fresh version checks before and after start.
-                Ok(pair) if pair.state == "stopped" => matches!(Self::prepare_pair_with(pair, prepare, inspect), Ok(pair) if pair.state == "matched"),
+                // Verify the explicitly requested package before and after start.
+                Ok(pair) if pair.state == "stopped" => matches!(Self::prepare_transition_pair_with(pair, prepare, inspect), Ok(pair) if pair.state == "matched"),
                 _ => false,
             };
             if !verified {
@@ -901,36 +896,18 @@ impl Engine {
         reply
     }
 
-    fn require_pair(exe: &std::ffi::OsString, server: &std::ffi::OsString, kind: &str, cancelled: &Arc<AtomicBool>) -> Result<(), String> {
-        let report = codex::inspect_runtime_pair(exe, server, kind, cancelled)?;
-        if !matches!(report.state.as_str(), "matched" | "embedded") {
-            return Err(Self::pair_error(&report));
-        }
-        Ok(())
-    }
-
     fn pair_error(report: &codex::RuntimePairStatus) -> String {
         format!("{}. CLI: {}, 선택 서버: {}, 실행 서버: {}. 실행 파일 설정에서 서버 버전을 확인하세요. 자동 복원과 서버 전환은 수행하지 않았습니다.", report.message.as_deref().unwrap_or("서버 버전을 확인하지 못했습니다"), report.cli_version, report.selected_server_version, report.running_version.as_deref().unwrap_or("미확인"))
     }
 
-    fn prepare_pair(exe: &std::ffi::OsString, server: &std::ffi::OsString, kind: &str, cancelled: &Arc<AtomicBool>) -> Result<(), String> {
-        Self::prepare_pair_with(codex::inspect_runtime_pair(exe, server, kind, cancelled)?,
-            || codex::prepare_runtime_with_executable(exe, cancelled),
-            || codex::inspect_runtime_pair(exe, server, kind, cancelled)).map(|_| ())
-    }
-
-    fn prepare_pair_with(report: codex::RuntimePairStatus, prepare: impl FnOnce() -> Result<(), String>,
+    fn prepare_transition_pair_with(report: codex::RuntimePairStatus, prepare: impl FnOnce() -> Result<(), String>,
         inspect: impl FnOnce() -> Result<codex::RuntimePairStatus, String>,
     ) -> Result<codex::RuntimePairStatus, String> {
-        // An unreachable socket is not proof that the daemon stopped. Delegate
-        // the start decision to the CLI's existing-installation path only when
-        // every verified version agrees; never replace another installation.
-        let can_start_selected = matches!(report.state.as_str(), "stopped" | "unconfirmed")
-            && report.managed_version.as_deref() == Some(report.cli_version.as_str())
-            && report.cli_version == report.selected_server_version
-            && report.running_version.as_deref().is_none_or(|version| version == report.cli_version);
-        if !matches!(report.state.as_str(), "matched" | "embedded") && !can_start_selected { return Err(Self::pair_error(&report)); }
-        let expected_state = if report.state == "embedded" { "embedded" } else { "matched" };
+        // Only explicit package replacement verifies that its requested target
+        // was selected. Ordinary startup and session connection never use this.
+        if report.state != "stopped" || report.managed_version.as_deref() != Some(report.cli_version.as_str())
+            || report.cli_version != report.selected_server_version { return Err(Self::pair_error(&report)); }
+        let expected_state = "matched";
         let expected_cli_version = report.cli_version;
         let expected_server_version = report.selected_server_version;
         prepare()?;
@@ -1302,69 +1279,6 @@ mod runtime_preparation_tests {
 
     fn updated_reply() -> codex::RuntimeTransitionReply {
         codex::RuntimeTransitionReply { status: "updated".into(), success: true, outcome: "updated".into(), message: None }
-    }
-
-    #[test]
-    fn unconfirmed_matching_installation_prepares_once_and_requires_fresh_matched_status() {
-        let preparations = std::cell::Cell::new(0);
-        let inspections = std::cell::Cell::new(0);
-        let result = Engine::prepare_pair_with(transition_pair("unconfirmed"), || {
-            preparations.set(preparations.get() + 1);
-            Ok(())
-        }, || {
-            inspections.set(inspections.get() + 1);
-            Ok(transition_pair("matched"))
-        });
-        assert_eq!(result.unwrap().state, "matched");
-        assert_eq!((preparations.get(), inspections.get()), (1, 1));
-    }
-
-    #[test]
-    fn preparation_rejects_unavailable_or_conflicting_versions_without_starting() {
-        let other = "0.165.0+native-r28.20261029";
-        let mut pairs = vec![transition_pair("unavailable"), transition_pair("mismatch")];
-        for state in ["stopped", "unconfirmed"] {
-            for boundary in 0..4 {
-                let mut pair = transition_pair(state);
-                match boundary {
-                    0 => pair.managed_version = None,
-                    1 => pair.managed_version = Some(other.into()),
-                    2 => pair.selected_server_version = other.into(),
-                    _ => pair.running_version = Some(other.into()),
-                }
-                pairs.push(pair);
-            }
-        }
-        for pair in pairs {
-            assert!(Engine::prepare_pair_with(pair, || panic!("확인되지 않은 설치를 시작함"),
-                || panic!("차단된 준비 뒤 재조회함")).is_err());
-        }
-    }
-
-    #[test]
-    fn unconfirmed_preparation_never_retries_and_rejects_unverified_post_start_status() {
-        assert_eq!(Engine::prepare_pair_with(transition_pair("unconfirmed"), || Err("시작 실패".into()),
-            || panic!("실패한 시작 뒤 재조회함")).unwrap_err(), "시작 실패");
-        for state in ["unconfirmed", "unavailable", "stopped", "mismatch", "embedded"] {
-            let preparations = std::cell::Cell::new(0);
-            let inspections = std::cell::Cell::new(0);
-            let result = Engine::prepare_pair_with(transition_pair("unconfirmed"), || {
-                preparations.set(preparations.get() + 1);
-                Ok(())
-            }, || {
-                inspections.set(inspections.get() + 1);
-                Ok(transition_pair(state))
-            });
-            assert!(result.is_err(), "실제 버전이 확인되지 않은 준비를 성공 처리함: {state}");
-            assert_eq!((preparations.get(), inspections.get()), (1, 1));
-        }
-        let mut changed = transition_pair("matched");
-        changed.cli_version = "0.166.0+native-r35.20261103".into();
-        changed.selected_server_version = changed.cli_version.clone();
-        changed.managed_version = Some(changed.cli_version.clone());
-        changed.running_version = Some(changed.cli_version.clone());
-        assert!(Engine::prepare_pair_with(transition_pair("unconfirmed"), || Ok(()), || Ok(changed)).is_err(),
-            "준비 중 전체 버전이 바뀐 서버로 복원함");
     }
 
     fn finish_transition_fixture(reply: codex::RuntimeTransitionReply, observations: Vec<Result<codex::RuntimePairStatus, String>>,

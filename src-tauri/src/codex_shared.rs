@@ -1,4 +1,4 @@
-//! 공유 서버 연결과 앱 시작 준비. 설치·교체·종료·원격 등록은 바꾸지 않는다.
+//! 공유 서버 연결과 앱 시작 준비. 최초 설치는 CLI에 맡기며 기존 서버는 자동 교체·종료하지 않는다.
 use super::*;
 use std::{fs, path::PathBuf};
 const STOP_TIMEOUT: Duration = Duration::from_secs(8);
@@ -12,7 +12,7 @@ pub(super) fn prepare_runtime(exe: &OsString, cwd: &Path, cancelled: &Arc<Atomic
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     let value = prepare_runtime_commands(
         |args| extensions::command_stdout_until(exe, cwd, &args.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(), deadline, Some(cancelled)),
-        || extensions::start_daemon_stdout_until(exe, cwd, deadline, Some(cancelled)),
+        |preserve| extensions::start_daemon_stdout_until(exe, cwd, preserve, deadline, Some(cancelled)),
     )?;
     let Some(value) = value else { return Ok(()); }; // 명시 미지원 CLI의 기존 개별 서버 경로 유지.
     check_cancelled(Some(cancelled))?;
@@ -32,7 +32,7 @@ pub(super) fn prepare_runtime(exe: &OsString, cwd: &Path, cancelled: &Arc<Atomic
 // 명령 경계를 주입하여 실행 순서·시작 횟수·실패 후 복원 금지를 합성 응답으로 검사한다.
 fn prepare_runtime_commands(
     mut query: impl FnMut(&[&str]) -> Result<Vec<u8>, String>,
-    start: impl FnOnce() -> Result<Vec<u8>, String>,
+    start: impl FnOnce(bool) -> Result<Vec<u8>, String>,
 ) -> Result<Option<Value>, String> {
     let help = query(&["app-server", "--help"])?;
     if !supports_shared(&help)? { return Ok(None); }
@@ -46,10 +46,26 @@ fn prepare_runtime_commands(
         Err(probe) => {
             let help = query(&["app-server", "daemon", "start", "--help"])
                 .map_err(|error| format!("공유 서버 시작 지원을 확인하지 못했습니다: {error}; 실행 상태 확인: {probe}"))?;
-            if !help_supports_option(&help, "--existing-installation")? {
-                return Err("선택한 CLI는 기존 설정을 보존하는 공유 서버 시작을 지원하지 않습니다. 실행 파일을 업데이트한 뒤 다시 시도하세요.".into());
+            let mut preserve = help_supports_option(&help, "--existing-installation")
+                .map_err(|error| format!("공유 서버 시작 도움말을 확인하지 못했습니다: {error}"))?;
+            if preserve {
+                // 명시 미설치만 CLI의 기본 시작에 맡긴다. 조회 실패·불확실한 설치는
+                // 보존 옵션을 유지하며 버전이나 오류 문구로 설치 상태를 추정하지 않는다.
+                if let Ok(bytes) = query(&["app-server", "daemon", "status", "--json"]) {
+                    let value = lifecycle_value(&bytes).map_err(|error| format!("공유 서버 상태 조회 실패: {error}"))?;
+                    if !matches!(value["status"].as_str(), Some("running" | "stopped" | "unknown")) {
+                        return Err("공유 서버 상태 조회의 실행 상태 형식이 올바르지 않습니다.".into());
+                    }
+                    for key in ["managedCodexVersion", "appServerVersion"] {
+                        if value.get(key).is_some_and(|v| !v.is_null() && !v.as_str().is_some_and(|s| !s.is_empty())) {
+                            return Err(format!("공유 서버 상태 조회의 {key} 형식이 올바르지 않습니다."));
+                        }
+                    }
+                    preserve = !(value.get("managedCodexVersion") == Some(&Value::Null)
+                        && value.get("appServerVersion") == Some(&Value::Null));
+                }
             }
-            let started = lifecycle_value(&start().map_err(|error| format!("공유 서버 시작 실패: {error}"))?)?;
+            let started = lifecycle_value(&start(preserve).map_err(|error| format!("공유 서버 시작 실패: {error}"))?)?;
             if !matches!(started["status"].as_str(), Some("started" | "alreadyRunning")) {
                 return Err("공유 서버 시작 결과를 확인할 수 없습니다. 세션을 복원하지 않았습니다.".into());
             }
