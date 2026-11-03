@@ -58,13 +58,7 @@ impl ControlsReport {
         self.session_id = Some(session.id.clone());
         let thread_id = session.thread_id.as_deref().expect("caller selected a bound session");
         let compatibility = engine.runtime_compatibility().and_then(|value| serde_json::to_value(value).map_err(|error|error.to_string()));
-        self.response("runtimeCompatibility", compatibility,
-            |v| v["cliVersion"].is_string() && v["cliError"].is_null() && v["serverError"].is_null()
-                && v["serverState"]=="unavailable" && v["selectedServerExecutable"].is_null() && v["selectedServerVersion"].is_null() && v["compactIfIdle"].is_null(),
-            |v| json!({"cliVersionObserved":v["cliVersion"].is_string(),"serverVersionObserved":v["serverVersion"].is_string(),
-                "serverStateUnconfirmed":v["serverState"]=="unavailable","selectedServerUnconfirmed":v["selectedServerExecutable"].is_null()&&v["selectedServerVersion"].is_null(),
-                "subagents":v["subagents"],"compactIfIdle":v["compactIfIdle"],"expectedTurnInterrupt":v["expectedTurnInterrupt"],
-                "cliErrorObserved":!v["cliError"].is_null(),"serverErrorObserved":!v["serverError"].is_null()}));
+        self.runtime_compatibility(compatibility);
         let attached = self.response("conversationAttach", engine.conversation_request(&session.id,session.generation,ConversationRequest::Attach),
             |v| v["threadId"]==thread_id && v["thread"]["id"]==thread_id && v["owner"]=="gui",
             |v| json!({"threadMatches":v["threadId"]==thread_id&&v["thread"]["id"]==thread_id,"guiOwner":v["owner"]=="gui","historyUnavailable":v["historyUnavailable"]==true,"activeTurnKnown":v["activeTurnKnown"]}));
@@ -88,6 +82,18 @@ impl ControlsReport {
         self.cron(engine, session);
         // Every failure above still reaches the existing Harness finish path.
         self.resume(engine, session, thread_id);
+    }
+    fn runtime_compatibility(&mut self, result: Result<Value, String>) {
+        // Engine reports the selected path; this read-only query does not confirm its version or server state.
+        let selected_path_observed=|v:&Value|v["selectedServerExecutable"].as_str().is_some_and(|path|!path.trim().is_empty());
+        self.response("runtimeCompatibility", result,
+            |v| v["cliVersion"].is_string() && v["cliError"].is_null() && v["serverError"].is_null()
+                && v["serverState"]=="unavailable" && selected_path_observed(v) && v["selectedServerVersion"].is_null() && v["compactIfIdle"].is_null(),
+            |v| json!({"cliVersionObserved":v["cliVersion"].is_string(),"serverVersionObserved":v["serverVersion"].is_string(),
+                "serverStateUnconfirmed":v["serverState"]=="unavailable","selectedServerExecutableObserved":selected_path_observed(v),
+                "selectedServerVersionObserved":v["selectedServerVersion"].is_string(),"selectedServerVersionUnconfirmed":v["selectedServerVersion"].is_null(),
+                "subagents":v["subagents"],"compactIfIdle":v["compactIfIdle"],"expectedTurnInterrupt":v["expectedTurnInterrupt"],
+                "cliErrorObserved":!v["cliError"].is_null(),"serverErrorObserved":!v["serverError"].is_null()}));
     }
     fn cron(&mut self, engine: &Engine, session: &SessionInfo) {
         let mut completed = 0;
@@ -182,6 +188,48 @@ fn cron_metadata(value:&Value)->Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn control_smoke_uses_engine_selected_path_without_confirming_server_version() {
+        // Public Engine response shape: inspect_runtime leaves state/version unconfirmed,
+        // then Engine::runtime_compatibility fills the configured server executable.
+        let actual=serde_json::to_value(crate::codex::RuntimeCompatibility {
+            executable:"fixture-cli.exe".into(),cli_version:Some("cli-v3".into()),cli_error:None,
+            server_state:"unavailable",server_version:Some("server-v3".into()),
+            selected_server_executable:Some("private-fixture-server.exe".into()),selected_server_version:None,server_error:None,
+            subagents:Some(true),compact_if_idle:None,expected_turn_interrupt:Some(true),
+        }).unwrap();
+        let mut report=ControlsReport::new();
+        report.runtime_compatibility(Ok(actual.clone()));
+        let check=&report.checks[0];
+        assert_eq!(check.status,"PASS");
+        assert_eq!(check.metadata["selectedServerExecutableObserved"],true);
+        assert_eq!(check.metadata["selectedServerVersionObserved"],false);
+        assert_eq!(check.metadata["selectedServerVersionUnconfirmed"],true);
+        assert_eq!(check.metadata["serverStateUnconfirmed"],true);
+        assert_eq!(check.metadata["serverVersionObserved"],true);
+        assert!(!serde_json::to_string(&report).unwrap().contains("private-fixture-server.exe"));
+        for (key,value) in [
+            ("selectedServerExecutable",Value::Null),("selectedServerExecutable",json!("")),
+            ("selectedServerExecutable",json!("  ")),("selectedServerExecutable",json!(42)),
+            ("cliVersion",Value::Null),("cliError",json!("private error")),("serverError",json!("private error")),
+            ("serverState",json!("unknown")),("serverState",json!("unsupported")),
+            ("selectedServerVersion",json!("unexpected confirmation")),("compactIfIdle",json!(true)),
+        ] {
+            let mut changed=actual.clone();
+            changed[key]=value;
+            let mut report=ControlsReport::new();
+            report.runtime_compatibility(Ok(changed));
+            assert_eq!(report.checks[0].status,"FAIL","{key}");
+            assert!(!serde_json::to_string(&report).unwrap().contains("private error"));
+        }
+        let mut missing=actual;
+        missing.as_object_mut().unwrap().remove("selectedServerExecutable");
+        let mut report=ControlsReport::new();
+        report.runtime_compatibility(Ok(missing));
+        report.runtime_compatibility(Err("private error".into()));
+        assert_eq!(report.checks.iter().map(|check|check.status).collect::<Vec<_>>(),["FAIL","FAIL"]);
+        assert!(!serde_json::to_string(&report).unwrap().contains("private error"));
+    }
     #[test]
     fn control_smoke_rejects_unknown_disconnected_and_non_applied_results_without_payload_leaks() {
         assert!(page_valid(&json!({"historyUnavailable":true,"reason":"unmaterialized"})));
