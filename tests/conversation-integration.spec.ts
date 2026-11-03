@@ -22,7 +22,9 @@ test.beforeEach(async ({ page }) => {
           if (args.request.type === 'attach' && state.attachFailure) throw new Error(state.failureRaw ?? 'fixture attach failure');
           if (args.request.type === 'handoffToTerminal' && state.handoffFailure) throw new Error(state.failureRaw ?? 'fixture handoff failure');
           if (args.request.type === 'detach' && state.detachFailure) throw new Error(state.failureRaw ?? 'fixture detach failure');
-          if (args.request.type === 'contextStatus') return { passiveSubscriptionSupported: true, ...state.contextSnapshot };
+          // This synthetic runtime implements the compact method and the cron
+          // transport; list readiness remains a separate response below.
+          if (args.request.type === 'contextStatus') return { passiveSubscriptionSupported: true, compactSupported: true, cronSupported: true, ...state.contextSnapshot };
           if (args.request.type === 'compact') {
             if (state.compactFailure) {
               Object.assign(state.contextSnapshot, { canCompact: false, tokenUsageFresh: false, reason: 'unknownResult', revision: 3 });
