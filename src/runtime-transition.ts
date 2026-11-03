@@ -50,7 +50,7 @@ export function createRuntimeTransition(call: <T>(command: string, args?: Record
   const nullableText = (value: unknown) => value === null || typeof value === 'string' && value.length <= 8192;
   function render() {
     $('#runtime-transition-title').textContent = t('공유 서버 버전 전환', 'Shared server version transition');
-    $('.transition-help').textContent = t('서버 버전은 버튼을 눌러 확인합니다. 버전이 다르면 작업을 자동 복원하지 않으며, 모든 작업이 끝난 뒤 확인을 받아 전환합니다.', 'Check server versions explicitly. If versions differ, saved work is not restored automatically. Transition only after all work has finished and you confirm.');
+    $('.transition-help').textContent = t('버전이 달라도 연결이 가능하면 세션을 시작하고 복원합니다. 서버 교체를 원할 때만 모든 작업이 끝난 뒤 확인하고 전환하세요.', 'Sessions start and restore across different versions when the connection works. Only transition the server if you want to replace it, after all work has finished and you confirm.');
     refresh.textContent = t('서버 버전 확인', 'Check server versions');
     align.textContent = t('버전 맞추기…', 'Align server version…');
     refresh.disabled = blocked || !!pending;
