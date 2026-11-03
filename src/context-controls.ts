@@ -10,6 +10,9 @@ interface ContextStatus {
   active: boolean | null;
   canCompact: boolean;
   passiveSubscriptionSupported?: boolean;
+  subagentsSupported?: boolean;
+  cronSupported?: boolean;
+  compactSupported?: boolean;
   reason?: string;
   revision?: number;
 }
@@ -22,7 +25,7 @@ interface Options {
   prepare(): Promise<void>;
   compact(): Promise<{ status?: string }>;
   notify(ko: string, error: boolean, en: string): void;
-  passiveSubscriptionChanged?(supported: boolean): void;
+  capabilitiesChanged?(supported: { passiveSubscription: boolean; subagents: boolean; cron: boolean }): void;
 }
 
 /** One small snapshot per visible card; observation never claims the GUI input lease. */
@@ -34,22 +37,30 @@ export function createContextControls(options: Options) {
   const amount = usage.querySelector('span')!;
   const fill = usage.querySelector<SVGCircleElement>('.context-fill')!;
   let snapshot: ContextStatus | undefined;
-  let visible = false; let disposed = false; let epoch = 0;
+  let visible = false; let disposed = false; let epoch = 0; let supportEpoch = 0;
   let reading = false; let busy = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let revision = -1;
   const abort = new AbortController();
   const read = () => options.call<ContextStatus>('conversation_request', { id: options.sessionId, generation: options.generation, request: { type: 'contextStatus' } });
   const alive = (version: number) => !disposed && visible && epoch === version;
-  const canAttempt = () => !!snapshot && (snapshot.canCompact === true || (snapshot.reason === 'guiDisconnected' && snapshot.connected === true && snapshot.active === false && !snapshot.compacting));
+  const canAttempt = () => snapshot?.compactSupported === true && (snapshot.canCompact === true || (snapshot.reason === 'guiDisconnected' && snapshot.connected === true && snapshot.active === false && !snapshot.compacting));
+  function publishCapabilities() {
+    options.capabilitiesChanged?.({ passiveSubscription: snapshot?.passiveSubscriptionSupported === true, subagents: snapshot?.subagentsSupported === true, cron: snapshot?.cronSupported === true });
+  }
+  function invalidateCapabilities() {
+    supportEpoch++;
+    if (snapshot) snapshot = { ...snapshot, passiveSubscriptionSupported: false, subagentsSupported: false, cronSupported: false, compactSupported: false };
+    publishCapabilities();
+  }
   function accept(value: ContextStatus) {
-    if (!value || typeof value !== 'object') return;
+    if (!value || typeof value !== 'object' || Array.isArray(value)) { invalidateCapabilities(); return; }
     if (typeof value.revision === 'number' && Number.isSafeInteger(value.revision) && value.revision >= 0) {
       if (value.revision < revision) return;
       revision = value.revision;
     }
     snapshot = value;
-    options.passiveSubscriptionChanged?.(value.passiveSubscriptionSupported === true);
+    publishCapabilities();
   }
   function reason() {
     if (busy || snapshot?.compacting) return t('컨텍스트 압축 중 · 완료 확인 대기', 'Compacting context · waiting for confirmation');
@@ -82,6 +93,7 @@ export function createContextControls(options: Options) {
     bindAttribute(usage, 'title', ko, en); bindAttribute(usage, 'aria-label', ko, en);
     compact.title = reason(); compact.setAttribute('aria-label', reason());
     usage.disabled = !visible || reading;
+    compact.hidden = snapshot?.compactSupported !== true;
     compact.disabled = !visible || busy || !canAttempt();
     compact.setAttribute('aria-busy', String(busy || snapshot?.compacting === true));
   }
@@ -91,12 +103,12 @@ export function createContextControls(options: Options) {
   }
   async function refresh() {
     if (disposed || !visible || reading) return;
-    reading = true; const version = epoch; render();
+    reading = true; const version = epoch; const supportVersion = supportEpoch; render();
     try {
       const value = await read();
-      if (alive(version)) accept(value);
+      if (alive(version) && supportVersion === supportEpoch) accept(value);
     } catch {
-      if (alive(version)) snapshot = { ...snapshot, connected: false, guiConnected: false, tokenUsageFresh: false, compacting: false, active: null, canCompact: false, reason: 'disconnected' };
+      if (alive(version) && supportVersion === supportEpoch) { snapshot = { ...snapshot, connected: false, guiConnected: false, tokenUsageFresh: false, compacting: false, active: null, canCompact: false, reason: 'disconnected' }; invalidateCapabilities(); }
     } finally {
       reading = false;
       if (!disposed) { render(); schedule(version === epoch ? 2000 : 0); }
@@ -108,10 +120,11 @@ export function createContextControls(options: Options) {
     try {
       await options.prepare();
       if (!alive(version)) return;
+      const supportVersion = supportEpoch;
       const current = await read();
-      if (!alive(version)) return;
+      if (!alive(version) || supportVersion !== supportEpoch) return;
       accept(current);
-      if (snapshot?.canCompact !== true || snapshot.guiConnected !== true) {
+      if (snapshot?.compactSupported !== true || snapshot.canCompact !== true || snapshot.guiConnected !== true) {
         options.notify('현재 연결·작업 상태에서는 압축할 수 없습니다. 상태를 확인한 뒤 다시 시도하세요.', false, 'Compaction is unavailable in the current connection or activity state. Check the status before trying again.'); return;
       }
       const result = await options.compact();
@@ -120,7 +133,7 @@ export function createContextControls(options: Options) {
       else if (result.status === 'skippedBusy') options.notify('다른 작업이 시작되어 압축하지 않았습니다.', false, 'Another task started, so context was not compacted.');
       else options.notify('현재 상태에서는 압축을 시작하지 못했습니다. 연결과 대기 중인 요청을 확인하세요.', false, 'Compaction could not start. Check the connection and pending requests.');
     } catch {
-      if (alive(version)) options.notify('압축 결과를 확인하지 못했습니다. 자동으로 다시 요청하지 않습니다.', true, 'The compaction result could not be confirmed. It will not be retried automatically.');
+      if (alive(version)) { invalidateCapabilities(); options.notify('압축 결과를 확인하지 못했습니다. 자동으로 다시 요청하지 않습니다.', true, 'The compaction result could not be confirmed. It will not be retried automatically.'); }
     } finally {
       busy = false;
       if (!disposed) { render(); schedule(0); }
@@ -133,7 +146,7 @@ export function createContextControls(options: Options) {
   return {
     setVisible(value: boolean) {
       if (disposed || visible === value) return;
-      visible = value; epoch++; clearTimeout(timer); render();
+      visible = value; epoch++; clearTimeout(timer); if (!visible) invalidateCapabilities(); render();
       if (visible) void refresh();
     },
     dispose() { if (disposed) return; disposed = true; epoch++; visible = false; clearTimeout(timer); abort.abort(); unlanguage(); snapshot = undefined; options.statusHost.hidden = true; options.statusHost.textContent = ''; host.replaceChildren(); },

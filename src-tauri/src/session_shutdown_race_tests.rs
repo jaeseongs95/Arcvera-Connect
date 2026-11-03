@@ -182,7 +182,9 @@ fn shared_reaper_handoff_during_observer_join_reports_unknown_for_stop_and_shutd
                 let method = request["method"].as_str().unwrap().to_owned();
                 methods.push(method.clone());
                 let result = match method.as_str() {
-                    "initialize" => json!({}),
+                    // This fixture exercises the observer join/reaper race, so
+                    // explicitly declare the passive protocol it implements.
+                    "initialize" => json!({"opendiyCapabilities":{"passiveSubscription":true}}),
                     "initialized" => continue,
                     _ if preparation => panic!("사전 준비 연결이 대화 변경 또는 관측을 요청했다: {method}"),
                     "thread/start" => json!({"thread":{"id":id,"cwd":server_cwd,"status":{"type":"idle"}}}),

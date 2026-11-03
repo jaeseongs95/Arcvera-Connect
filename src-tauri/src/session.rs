@@ -983,8 +983,15 @@ impl Engine {
         let thread_id = info.thread_id.ok_or("원래 대화 식별자가 아직 확인되지 않았습니다. 잠시 후 다시 시도하세요.")?;
         let process = session.process.lock().map_err(|_| "session process lock poisoned")?.clone().ok_or("session process is unavailable")?;
         let connection = process.adapter.lock().map_err(|_| "session adapter lock poisoned")?.as_ref().and_then(CodexSession::conversation_connection).ok_or("이 세션은 구조화 대화 연결을 지원하지 않습니다.")?;
+        let context_status=matches!(&request,codex::ConversationRequest::ContextStatus);
+        #[cfg(windows)]
+        let cron_supported=context_status && process.cron.lock().map_err(|_|"예약 제어 상태 오류")?.is_some();
+        #[cfg(not(windows))]
+        let cron_supported=false;
         drop(process);
-        connection.request_for_session(&thread_id, Path::new(&info.cwd), request,id,self.inner.attachments.clone())
+        let mut value=connection.request_for_session(&thread_id, Path::new(&info.cwd), request,id,self.inner.attachments.clone())?;
+        if context_status {value["cronSupported"]=serde_json::json!(cron_supported);}
+        Ok(value)
     }
 
     fn with_subagent_receipt(&self,id: &str,generation: u64,request: codex::SubagentRequest,execute: impl FnOnce(Arc<Session>,codex::SubagentRequest)->Result<serde_json::Value,String>) -> Result<serde_json::Value,String> {

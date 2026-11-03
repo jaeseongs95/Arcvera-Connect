@@ -9,13 +9,13 @@ async function fixture(page: Page) {
     host.style.cssText = 'position:fixed;top:20px;right:20px;z-index:9999;background:#141820'; document.body.append(host);
     const statusHost = document.createElement('span'); statusHost.hidden = true; document.body.append(statusHost);
     const data = state.contextFixture = {
-      reads: 0, preparations: 0, mutations: 0, notices: [] as any[], capabilities: [] as boolean[], failure: false, hold: false,
+      reads: 0, preparations: 0, mutations: 0, notices: [] as any[], capabilities: [] as boolean[], supportSnapshots: [] as any[], failure: false, hold: false,
       release: () => {}, holdRead: false, releaseRead: () => {}, result: 'started',
-      snapshot: { revision: 1, connected: true, guiConnected: true, tokenUsage: { total: { totalTokens: 900000 }, last: { totalTokens: 40000 }, modelContextWindow: 100000 }, tokenUsageFresh: true, compacting: false, active: false, canCompact: true } as any,
+      snapshot: { revision: 1, connected: true, guiConnected: true, tokenUsage: { total: { totalTokens: 900000 }, last: { totalTokens: 40000 }, modelContextWindow: 100000 }, tokenUsageFresh: true, compacting: false, active: false, canCompact: true, compactSupported: true } as any,
     };
     state.contextControls = createContextControls({
       host, statusHost, sessionId: 'context-session', generation: 9,
-      passiveSubscriptionChanged(supported: boolean) { data.capabilities.push(supported); },
+      capabilitiesChanged(supported: { passiveSubscription: boolean; subagents: boolean; cron: boolean }) { data.capabilities.push(supported.passiveSubscription); data.supportSnapshots.push(supported); },
       async call(command: string, args: any) {
         if (command !== 'conversation_request' || args.id !== 'context-session' || args.generation !== 9 || args.request.type !== 'contextStatus') throw Error('관측 이외의 호출');
         data.reads++; const snapshot = structuredClone(data.snapshot);
@@ -65,11 +65,13 @@ test('숨김 세대의 늦은 지원 응답은 새 세대에 적용하지 않는
   const usage = page.locator('#context-fixture .context-usage');
   await expect(usage).toHaveText('40%');
   expect(await page.evaluate(() => (window as any).contextFixture.capabilities)).toEqual([false]);
-  await page.evaluate(() => { const s = window as any; s.contextFixture.snapshot.passiveSubscriptionSupported = true; s.contextFixture.holdRead = true; });
+  await page.evaluate(() => { const s = window as any; Object.assign(s.contextFixture.snapshot, { passiveSubscriptionSupported: true, subagentsSupported: true, cronSupported: true, compactSupported: true }); s.contextFixture.holdRead = true; });
   await usage.click();
-  await page.evaluate(() => { const s = window as any; s.contextControls.setVisible(false); s.contextControls.setVisible(true); s.contextFixture.snapshot.passiveSubscriptionSupported = false; s.contextFixture.releaseRead(); });
+  await page.evaluate(() => { const s = window as any; s.contextControls.setVisible(false); s.contextControls.setVisible(true); Object.assign(s.contextFixture.snapshot, { passiveSubscriptionSupported: false, subagentsSupported: false, cronSupported: false, compactSupported: false }); s.contextFixture.releaseRead(); });
   await expect.poll(() => page.evaluate(() => (window as any).contextFixture.reads)).toBeGreaterThanOrEqual(3);
   expect(await page.evaluate(() => (window as any).contextFixture.capabilities)).not.toContain(true);
+  expect(await page.evaluate(() => (window as any).contextFixture.supportSnapshots.every((s: any) => !s.subagents && !s.cron))).toBe(true);
+  await expect(page.locator('#context-fixture .context-compact')).toBeHidden();
 });
 
 test('0과 상한의 유효 비율을 표시하고 잘못된 수치·용량을 미확인으로 표시한다', async ({ page }) => {
@@ -171,4 +173,50 @@ test('언어 변경 때 아이콘 설명과 차단 사유를 바꾸고 숫자는
   await expect(usage).toHaveText('40%');
   await expect(usage).toHaveAttribute('aria-label', /Context 40%/);
   await expect(page.locator('#context-fixture .context-compact')).toHaveAttribute('aria-label', 'Compact context');
+});
+
+
+test('압축 지원 선언만 버튼 표시를 허용하고 연결·작업 안전정책은 계속 차단한다', async ({ page }) => {
+  await fixture(page);
+  const compact = page.locator('#context-fixture .context-compact');
+  const usage = page.locator('#context-fixture .context-usage');
+  await expect(compact).toBeVisible();
+  for (const value of [false, 'true', null, undefined, true]) {
+    await page.evaluate(value => { const s = (window as any).contextFixture.snapshot; s.revision++; s.canCompact = false; s.reason = 'active'; if (value === undefined) delete s.compactSupported; else s.compactSupported = value; }, value);
+    await usage.click();
+    if (value === true) await expect(compact).toBeVisible(); else await expect(compact).toBeHidden();
+    await expect(compact).toBeDisabled();
+    await compact.evaluate((b: HTMLButtonElement) => b.click());
+    await expect(usage).toBeVisible();
+  }
+  expect(await page.evaluate(() => (window as any).contextFixture.mutations)).toBe(0);
+});
+
+test('지원 true인 이전 판본 응답은 최신 false를 되돌리지 않는다', async ({ page }) => {
+  await fixture(page);
+  const usage = page.locator('#context-fixture .context-usage');
+  await expect(usage).toHaveText('40%');
+  await page.evaluate(() => { const f = (window as any).contextFixture; Object.assign(f.snapshot, { passiveSubscriptionSupported: true, subagentsSupported: true, cronSupported: true }); f.holdRead = true; });
+  await usage.click();
+  await page.evaluate(() => { const f = (window as any).contextFixture; Object.assign(f.snapshot, { revision: 2, passiveSubscriptionSupported: false, subagentsSupported: false, cronSupported: false, compactSupported: false }); });
+  await page.locator('#context-fixture .context-compact').click();
+  await expect(page.locator('#context-fixture .context-compact')).toBeHidden();
+  await page.evaluate(() => (window as any).contextFixture.releaseRead());
+  await expect(usage).toBeEnabled();
+  expect(await page.evaluate(() => (window as any).contextFixture.supportSnapshots.at(-1))).toEqual({ passiveSubscription: false, subagents: false, cron: false });
+});
+
+test('상태 오류 뒤 늦은 과거 성공 응답은 지원 표시를 되살리지 않는다', async ({ page }) => {
+  await fixture(page);
+  const usage = page.locator('#context-fixture .context-usage');
+  await expect(usage).toHaveText('40%');
+  await page.evaluate(() => { const f = (window as any).contextFixture; Object.assign(f.snapshot, { passiveSubscriptionSupported: true, subagentsSupported: true, cronSupported: true }); f.holdRead = true; });
+  await usage.click();
+  await page.evaluate(() => { (window as any).contextFixture.failure = true; });
+  await page.locator('#context-fixture .context-compact').click();
+  await expect(page.locator('#context-fixture .context-compact')).toBeHidden();
+  await page.evaluate(() => { const f = (window as any).contextFixture; f.failure = false; f.releaseRead(); });
+  await expect(usage).toBeEnabled();
+  await expect(page.locator('#context-fixture .context-compact')).toBeHidden();
+  expect(await page.evaluate(() => (window as any).contextFixture.supportSnapshots.at(-1))).toEqual({ passiveSubscription: false, subagents: false, cron: false });
 });

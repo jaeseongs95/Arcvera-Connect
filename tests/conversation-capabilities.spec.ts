@@ -1,13 +1,14 @@
 import { expect, test, type Page } from '@playwright/test';
 
-async function fixture(page: Page, capability: unknown = true, holdStatus = false) {
-  await page.addInitScript(({ capability, holdStatus }) => {
+async function fixture(page: Page, capability: unknown = true, holdStatus = false, independent: Record<string, unknown> = {}) {
+  await page.addInitScript(({ capability, holdStatus, independent }) => {
     const state = window as any; state.isTauri = true;
     const callbacks = new Map<number, any>(); let callback = 0;
     const f = state.capabilityFixture = {
       calls: [] as any[], snapshot: { revision: 1, connected: true, guiConnected: false, active: false, canCompact: false, compacting: false, tokenUsageFresh: false } as any,
-      holdStatus, releaseStatus: () => {}, attachFailure: false, detachFailure: false, holdDetach: false, releaseDetach: () => {},
+      statusFailure: false, holdStatus, releaseStatus: () => {}, attachFailure: false, detachFailure: false, holdDetach: false, releaseDetach: () => {},
     };
+    Object.assign(f.snapshot, independent);
     if (capability !== 'absent') f.snapshot.passiveSubscriptionSupported = capability;
     state.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
     state.__TAURI_INTERNALS__ = {
@@ -26,6 +27,7 @@ async function fixture(page: Page, capability: unknown = true, holdStatus = fals
           if (type === 'contextStatus') {
             const snapshot = structuredClone(f.snapshot);
             if (f.holdStatus) { f.holdStatus = false; await new Promise<void>(resolve => { f.releaseStatus = resolve; }); }
+            if (f.statusFailure) throw Error('synthetic status error');
             return snapshot;
           }
           if (type === 'attach') {
@@ -44,7 +46,7 @@ async function fixture(page: Page, capability: unknown = true, holdStatus = fals
         return null;
       },
     };
-  }, { capability, holdStatus });
+  }, { capability, holdStatus, independent });
   await page.goto('/');
   const card = page.locator('.terminal-card[data-id="capability-session"]');
   await expect(card).toBeVisible();
@@ -56,6 +58,9 @@ for (const capability of ['absent', false, 'true', null]) {
     const card = await fixture(page, capability);
     await expect(card.locator('.context-usage')).toBeEnabled();
     await expect(card.locator('.conversation-toggle')).toBeHidden();
+    await expect(card.locator('.subagents-open')).toBeHidden();
+    await expect(card.locator('.cron-open')).toBeHidden();
+    await expect(card.locator('.context-compact')).toBeHidden();
     await card.locator('.xterm-helper-textarea').press('p');
     await expect.poll(() => page.evaluate(() => (window as any).capabilityFixture.calls.some((c: any) => c.command === 'session_write' && c.args.data === 'p'))).toBe(true);
     const passiveCalls = await page.evaluate(() => (window as any).capabilityFixture.calls.filter((c: any) => c.command === 'conversation_request' && c.args.request.type !== 'contextStatus'));
@@ -112,3 +117,49 @@ test('Attach와 Detach가 모두 실패하면 초안과 화면을 보존하며 �
   const html = await page.locator('body').evaluate(node => node.outerHTML);
   expect(html).not.toContain('PRIVATE_ATTACH_CAUSE_NEVER_REAL'); expect(html).not.toContain('PRIVATE_DETACH_CAUSE_NEVER_REAL');
 });
+
+
+for (const value of [true, false, 'true', null, 'absent']) {
+  test(`독립 기능 버튼은 대화 지원 없이도 자체 명시 지원만 반영한다: ${JSON.stringify(value)}`, async ({ page }) => {
+    const independent = value === 'absent' ? {} : { subagentsSupported: value, cronSupported: value, compactSupported: value };
+    const card = await fixture(page, false, true, independent);
+    for (const selector of ['.subagents-open', '.cron-open', '.context-compact']) await expect(card.locator(selector)).toBeHidden();
+    await page.evaluate(() => (window as any).capabilityFixture.releaseStatus());
+    await expect(card.locator('.conversation-toggle')).toBeHidden();
+    for (const selector of ['.subagents-open', '.cron-open', '.context-compact']) {
+      if (value === true) await expect(card.locator(selector)).toBeVisible();
+      else await expect(card.locator(selector)).toBeHidden();
+    }
+    await expect(card.locator('.context-usage')).toBeVisible();
+    await expect(card.locator('.context-compact')).toBeDisabled();
+    await card.locator('.xterm-helper-textarea').press('i');
+    await expect.poll(() => page.evaluate(() => (window as any).capabilityFixture.calls.some((c: any) => c.command === 'session_write' && c.args.data === 'i'))).toBe(true);
+  });
+}
+
+test('대화 지원 true는 독립 기능 버튼의 지원을 대신하지 않는다', async ({ page }) => {
+  const card = await fixture(page, true);
+  await expect(card.locator('.conversation-toggle')).toBeVisible();
+  for (const selector of ['.subagents-open', '.cron-open', '.context-compact']) await expect(card.locator(selector)).toBeHidden();
+});
+
+test('상태 조회 실패는 이전 독립 기능 지원 표시를 지우고 PTY를 보존한다', async ({ page }) => {
+  const card = await fixture(page, true, false, { subagentsSupported: true, cronSupported: true, compactSupported: true });
+  await expect(card.locator('.subagents-open')).toBeVisible();
+  await page.evaluate(() => { (window as any).capabilityFixture.statusFailure = true; });
+  await card.locator('.context-usage').click();
+  for (const selector of ['.conversation-toggle', '.subagents-open', '.cron-open', '.context-compact']) await expect(card.locator(selector)).toBeHidden();
+  await expect(card.locator('.context-usage')).toBeVisible();
+  await card.locator('.xterm-helper-textarea').press('e');
+  await expect.poll(() => page.evaluate(() => (window as any).capabilityFixture.calls.some((c: any) => c.command === 'session_write' && c.args.data === 'e'))).toBe(true);
+});
+
+
+for (const [field, selector] of [['subagentsSupported', '.subagents-open'], ['cronSupported', '.cron-open'], ['compactSupported', '.context-compact']]) {
+  test(`독립 지원 ${field}는 해당 버튼만 표시한다`, async ({ page }) => {
+    const card = await fixture(page, false, false, { [field]: true });
+    await expect(card.locator(selector)).toBeVisible();
+    for (const other of ['.subagents-open', '.cron-open', '.context-compact'].filter(value => value !== selector)) await expect(card.locator(other)).toBeHidden();
+    await expect(card.locator('.conversation-toggle')).toBeHidden();
+  });
+}

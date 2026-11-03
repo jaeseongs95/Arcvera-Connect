@@ -531,6 +531,9 @@ function mountConversation(session: Session) {
   let conversation: ReturnType<typeof createConversation> | undefined;
   const toggle = card.querySelector<HTMLButtonElement>('.conversation-toggle')!;
   toggle.hidden = true;
+  const subagentsButton = card.querySelector<HTMLButtonElement>('.subagents-open')!;
+  const cronButton = card.querySelector<HTMLButtonElement>('.cron-open')!;
+  subagentsButton.hidden = true; cronButton.hidden = true;
   toggle.setAttribute('aria-pressed', 'false');
   function getConversation() {
     if (!conversation) {
@@ -564,7 +567,7 @@ function mountConversation(session: Session) {
   contextControls.get(session.id)?.dispose();
   contextControls.set(session.id, createContextControls({
     host: card.querySelector<HTMLElement>('.context-controls')!, statusHost: card.querySelector<HTMLElement>('.session-compaction')!, sessionId: session.id, generation: session.generation, call, notify,
-    passiveSubscriptionChanged(supported) { toggle.hidden = !supported; },
+    capabilitiesChanged(supported) { toggle.hidden = !supported.passiveSubscription; subagentsButton.hidden = !supported.subagents; cronButton.hidden = !supported.cron; },
     async prepare() {
       if (toggle.disabled) throw new Error('대화 화면 전환 중');
       toggle.disabled = true;
@@ -656,10 +659,10 @@ function createTerminal(session: Session) {
   };
   const subagentsButton = card.querySelector<HTMLButtonElement>('.subagents-open')!;
   bindAttribute(subagentsButton, 'aria-label', '서브에이전트 관리', 'Manage subagents'); bindAttribute(subagentsButton, 'title', '서브에이전트 관리', 'Manage subagents');
-  subagentsButton.onclick = () => { const current = sessions.get(session.id); if (current?.active && current.threadId && !exitInProgress) void subagentManager.open(current); };
+  subagentsButton.onclick = () => { const current = sessions.get(session.id); if (!subagentsButton.hidden && current?.active && current.threadId && !exitInProgress) void subagentManager.open(current); };
   const cronButton = card.querySelector<HTMLButtonElement>('.cron-open')!;
   bindAttribute(cronButton, 'aria-label', '예약 작업', 'Scheduled jobs'); bindAttribute(cronButton, 'title', '예약 작업', 'Scheduled jobs');
-  cronButton.onclick = () => { const current = sessions.get(session.id); if (current?.active && !exitInProgress) void cronManager.open(current); };
+  cronButton.onclick = () => { const current = sessions.get(session.id); if (!cronButton.hidden && current?.active && !exitInProgress) void cronManager.open(current); };
   const projectMove = document.createElement('button'); projectMove.className = 'project-move icon-button'; projectMove.textContent = '▱'; bindAttribute(projectMove, 'aria-label', '프로젝트로 이동', 'Move to project'); bindAttribute(projectMove, 'title', '프로젝트로 이동', 'Move to project'); projectMove.onclick = () => projectManager.move(sessions.get(session.id)!); card.querySelector('.card-actions')!.prepend(projectMove);
   card.querySelector('.move-left')!.addEventListener('click', () => move(session.id, -1));
   card.querySelector('.move-right')!.addEventListener('click', () => move(session.id, 1));

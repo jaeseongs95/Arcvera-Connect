@@ -18,6 +18,10 @@ const COMPACT_IF_IDLE: &str = "thread/compact/startIfIdle";
 const HISTORY_UNAVAILABLE: &str = "대화 이력 원문을 아직 조회할 수 없습니다. 빈 이력으로 처리하지 않았습니다.";
 const PASSIVE_UNSUPPORTED: &str = "이 서버는 안전한 대화 화면 연결을 지원하지 않습니다. 터미널에서 계속 사용할 수 있습니다.";
 
+fn compact_capability(initialized: &Value) -> bool {
+    initialized["opendiyCapabilities"]["compactStartIfIdle"].as_bool() == Some(true)
+}
+
 fn passive_capability(initialized: &Value) -> bool {
     initialized["opendiyCapabilities"]["passiveSubscription"].as_bool() == Some(true)
 }
@@ -59,6 +63,8 @@ struct Control {
     stopped: Arc<AtomicBool>,
     // The observer's own initialize response; a GUI connection cannot grant it support.
     passive_supported: bool,
+    subagents_supported: bool,
+    compact_supported: bool,
     // 동일 잠금 아래 입력 주체를 바꾸고 PTY 쓰기를 시작한다.
     input: Mutex<bool>,
     owned: AtomicBool,
@@ -213,12 +219,12 @@ impl ConversationConnection {
         }
     }
     pub(super) fn from_initialize(endpoint: Endpoint, stopped: Arc<AtomicBool>, initialized: &Value) -> Self {
-        Self(Arc::new(Control {endpoint,stopped,passive_supported:passive_capability(initialized),input:Mutex::new(false),owned:AtomicBool::new(false),worker:Mutex::new(None),events:Mutex::new(Events::default()),sent:Mutex::new(HashSet::new()),unknown:AtomicBool::new(false),deleted:AtomicBool::new(false),detail:Mutex::new(None),subagents:Mutex::new(subagents::State::default())}))
+        Self(Arc::new(Control {endpoint,stopped,passive_supported:passive_capability(initialized),subagents_supported:initialized["supportsSubagentManagement"].as_bool()==Some(true),compact_supported:compact_capability(initialized),input:Mutex::new(false),owned:AtomicBool::new(false),worker:Mutex::new(None),events:Mutex::new(Events::default()),sent:Mutex::new(HashSet::new()),unknown:AtomicBool::new(false),deleted:AtomicBool::new(false),detail:Mutex::new(None),subagents:Mutex::new(subagents::State::default())}))
     }
     #[cfg(test)]
     pub(super) fn new(endpoint: Endpoint, stopped: Arc<AtomicBool>) -> Self {
         // Existing protocol fixtures explicitly exercise supported extension methods.
-        Self::from_initialize(endpoint, stopped, &json!({"opendiyCapabilities":{"passiveSubscription":true}}))
+        Self::from_initialize(endpoint, stopped, &json!({"opendiyCapabilities":{"passiveSubscription":true,"compactStartIfIdle":true}}))
     }
     pub(crate) fn terminal_write<T>(&self, write: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
         let gui = self.0.input.lock().map_err(|_| "대화 입력 소유 상태를 확인할 수 없습니다.")?;
@@ -243,6 +249,7 @@ impl ConversationConnection {
         let events=self.0.events.lock().map_err(|_| "대화 문맥 상태 오류")?;
         let reason=context_block_reason(&self.0,&events,closing);
         Ok(json!({"threadId":thread_id,"connected":events.connected||events.observer_connected,"guiConnected":events.connected,"passiveSubscriptionSupported":self.0.passive_supported,
+            "subagentsSupported":self.0.subagents_supported,"compactSupported":self.0.compact_supported,
             "tokenUsage":events.token_usage,"tokenUsageFresh":events.token_usage_fresh&&events.observer_connected&&!self.0.unknown.load(Ordering::Acquire),"compacting":events.context_compaction.is_some(),"active":events.context_active,
             "canCompact":reason.is_none(),"reason":reason,"revision":events.context_revision}))
     }
@@ -265,7 +272,7 @@ impl ConversationConnection {
         if events.requests_unavailable {return Err("요청 관측을 중단한 세션의 구독을 복구하지 않았습니다.".into());}
         events.context_active=context_active(&result["thread"]["status"]);
         events.context_turn=None;events.context_activity_revision+=1;
-        events.observer_compact_supported=result["supportsCompactIfIdle"].as_bool()==Some(true);
+        events.observer_compact_supported=self.0.compact_supported&&result["supportsCompactIfIdle"].as_bool()==Some(true);
         events.token_usage_fresh=false;events.context_compaction=None;
         events.context_revision+=1;
         events.observer_connected=true;
@@ -576,7 +583,7 @@ fn serve<S: Read + Write>(control: &Control, rpc: &mut Rpc<S>, thread_id: &str, 
         resumed["activeTurnKnown"] = json!(true);
         resumed["activeTurnId"] = current.first().filter(|turn| turn["status"] == "inProgress").and_then(|turn| turn["id"].as_str()).map_or(Value::Null,|id|json!(id));
     }
-    { let mut events = control.events.lock().map_err(|_| "대화 이벤트 상태 오류")?; if events.requests_unavailable {return Err("요청 관측을 중단한 세션의 연결을 복구하지 않았습니다.".into());} events.gui_compact_supported=resumed["supportsCompactIfIdle"].as_bool()==Some(true);
+    { let mut events = control.events.lock().map_err(|_| "대화 이벤트 상태 오류")?; if events.requests_unavailable {return Err("요청 관측을 중단한 세션의 연결을 복구하지 않았습니다.".into());} events.gui_compact_supported=control.compact_supported&&compact_capability(&initialized)&&resumed["supportsCompactIfIdle"].as_bool()==Some(true);
         let passive_interrupt=interrupt_capability(&resumed)?;
         // 이 GUI 연결에서 두 응답을 모두 읽었으므로 양쪽의 명시 지원만 채택한다.
         // 다른 관찰자 연결의 값이나 압축 지원 값은 중단 권한이 아니다.
@@ -794,6 +801,7 @@ fn context_block_reason(control: &Control, events: &Events, closing: bool) -> Op
     else if control.unknown.load(Ordering::Acquire) {Some("unknownResult")}
     else if events.requests_unavailable || !events.pending.is_empty() || !events.observed_pending.is_empty() {Some("pendingRequest")}
     else if events.context_compaction.is_some() {Some("compacting")}
+    else if !control.compact_supported {Some("unsupported")}
     else if !events.connected && !events.observer_connected {Some("disconnected")}
     else if !events.connected {Some(if events.observer_compact_supported {"guiDisconnected"}else{"unsupported"})}
     else if events.context_active==Some(true) {Some("active")}
@@ -921,7 +929,7 @@ fn validate_response(request: &Value, result: &Value) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn supported_initialize() -> Value { json!({"opendiyCapabilities":{"passiveSubscription":true}}) }
+    fn supported_initialize() -> Value { json!({"opendiyCapabilities":{"passiveSubscription":true,"compactStartIfIdle":true}}) }
 
     #[test]
     fn unsupported_declarations_never_acquire_input_or_send_passive_requests() {
@@ -940,6 +948,26 @@ mod tests {
             drop(rpc);assert_closed_without_input(&mut socket);
         }
         assert!(passive_capability(&supported_initialize()));
+    }
+    #[test]
+    fn context_support_flags_are_independent_and_require_literal_true() {
+        for advertised in [Value::Null,json!(false),json!("true"),json!(true)] {
+            let initialized=json!({"supportsSubagentManagement":advertised,"opendiyCapabilities":{"passiveSubscription":false,"compactStartIfIdle":advertised}});
+            let control=ConversationConnection::from_initialize(Endpoint::Owned{address:String::new(),token:String::new(),job:Weak::new()},Arc::new(AtomicBool::new(false)),&initialized);
+            let snapshot=control.context_status("original").unwrap();
+            assert_eq!(snapshot["passiveSubscriptionSupported"],false);
+            assert_eq!(snapshot["subagentsSupported"],advertised==json!(true));
+            assert_eq!(snapshot["compactSupported"],advertised==json!(true));
+            assert_eq!(snapshot["canCompact"],false);
+            assert_eq!(control.terminal_write(||Ok(42)).unwrap(),42);
+        }
+        for initialized in [json!({}),json!({"opendiyCapabilities":{"passiveSubscription":true}})] {
+            let control=ConversationConnection::from_initialize(Endpoint::Owned{address:String::new(),token:String::new(),job:Weak::new()},Arc::new(AtomicBool::new(false)),&initialized);
+            let snapshot=control.context_status("original").unwrap();
+            assert_eq!(snapshot["subagentsSupported"],false);assert_eq!(snapshot["compactSupported"],false);
+            let mut events=control.0.events.lock().unwrap();events.connected=true;events.context_active=Some(false);events.gui_compact_supported=true;
+            assert_eq!(context_block_reason(&control.0,&events,false),Some("unsupported"));
+        }
     }
     #[test]
     fn worker_rechecks_its_own_initialize_before_any_passive_or_fallback_request() {
@@ -1152,6 +1180,23 @@ mod tests {
         control.observer_message("original",json!({"method":"thread/tokenUsage/updated","params":{"threadId":"original","turnId":"previous","tokenUsage":{"total":{"totalTokens":100,"inputTokens":70,"cachedInputTokens":0,"outputTokens":30,"reasoningOutputTokens":0},"last":{"totalTokens":40,"inputTokens":30,"cachedInputTokens":0,"outputTokens":10,"reasoningOutputTokens":0},"modelContextWindow":1000}}})).unwrap();
         install_actor(control,move|state,receiver,cancelled|{let _=serve(&state,&mut rpc,"original",&cwd,receiver,&cancelled,&Mutex::new(None));});
         let(reply,attached)=mpsc::sync_channel(1);control.0.worker.lock().unwrap().as_ref().unwrap().sender.try_send(Work{request:ConversationRequest::Attach,reply,deadline:Instant::now()+RPC_TIMEOUT,send_context:None}).ok().unwrap();attached.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
+    }
+    #[test]
+    fn compact_requires_this_gui_initialize_even_when_passive_subscription_allows_it() {
+        for capability in [None,Some(json!(false)),Some(json!("true")),Some(Value::Null)] {
+            let(control,rpc,listener)=fixture();let cwd=env::current_dir().unwrap().canonicalize().unwrap();let expected_cwd=cwd.clone();
+            let server=thread::spawn(move|| {
+                let(stream,_)=listener.accept().unwrap();stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();let mut socket=WebSocket::from_raw_socket(stream,tungstenite::protocol::Role::Server,None);
+                let init=read_request(&mut socket);assert_eq!(init["method"],"initialize");let mut initialized=supported_initialize();initialized["opendiyCapabilities"].as_object_mut().unwrap().remove("compactStartIfIdle");
+                if let Some(capability)=capability {initialized["opendiyCapabilities"]["compactStartIfIdle"]=capability;}reply(&mut socket,&init,initialized);
+                assert_eq!(read_request(&mut socket)["method"],"initialized");let subscribe=read_request(&mut socket);assert_eq!(subscribe["method"],PASSIVE_SUBSCRIBE);
+                reply(&mut socket,&subscribe,json!({"thread":{"id":"original","cwd":expected_cwd,"turns":[],"status":{"type":"idle"}},"supportsCompactIfIdle":true}));
+                let history=read_request(&mut socket);assert_eq!(history["method"],"thread/turns/list");reply(&mut socket,&history,json!({"data":[]}));assert_closed_without_input(&mut socket);
+            });
+            compact_gui(&control,rpc,cwd);assert_eq!(control.context_status("original").unwrap()["canCompact"],false);
+            assert_eq!(control.request("original",Path::new("."),ConversationRequest::Compact).unwrap()["status"],"unsupported");
+            control.request("original",Path::new("."),ConversationRequest::Detach).unwrap();server.join().unwrap();
+        }
     }
     #[test]
     fn compact_requires_verified_gui_capability_and_resets_it_on_disconnect() {
