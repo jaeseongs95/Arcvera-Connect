@@ -21,7 +21,8 @@ test.beforeEach(async ({ page }) => {
         if (command === 'conversation_request') {
           if (args.request.type === 'attach' && state.attachFailure) throw new Error(state.failureRaw ?? 'fixture attach failure');
           if (args.request.type === 'handoffToTerminal' && state.handoffFailure) throw new Error(state.failureRaw ?? 'fixture handoff failure');
-          if (args.request.type === 'contextStatus') return state.contextSnapshot ?? {};
+          if (args.request.type === 'detach' && state.detachFailure) throw new Error(state.failureRaw ?? 'fixture detach failure');
+          if (args.request.type === 'contextStatus') return { passiveSubscriptionSupported: true, ...state.contextSnapshot };
           if (args.request.type === 'compact') {
             if (state.compactFailure) {
               Object.assign(state.contextSnapshot, { canCompact: false, tokenUsageFresh: false, reason: 'unknownResult', revision: 3 });
@@ -130,9 +131,9 @@ test('same workspace session switches views without starting a thread and preser
 });
 
 
-test('failed attach keeps the owned conversation visible and terminal input blocked', async ({ page }) => {
+test('failed attach and rejected detach keep the owned conversation visible and terminal input blocked', async ({ page }) => {
   await page.goto('/');
-  await page.evaluate(() => { (window as any).attachFailure = true; });
+  await page.evaluate(() => { (window as any).attachFailure = true; (window as any).detachFailure = true; });
   const card = page.locator('.terminal-card[data-id="chat-session"]');
   await card.locator('.conversation-toggle').click();
   await expect(card.locator('.conversation-host')).toBeVisible();
@@ -179,7 +180,7 @@ for (const language of ['ko', 'en'] as const) for (const failure of ['attach', '
     await page.evaluate(async value => { const { setLanguage } = await import('/src/i18n.ts'); setLanguage(value); }, language);
     const markers = ['private_fixture_path_701', 'token_fixture_NEVER_REAL_701', 'INTERNAL_PRIVATE_FAILURE_701'];
     await page.evaluate(values => { (window as any).failureRaw = 'D:/private_fixture_path_701/helper.exe ' + values.join(' '); }, markers);
-    if (failure === 'attach') await page.evaluate(() => { (window as any).attachFailure = true; });
+    if (failure === 'attach') await page.evaluate(() => { (window as any).attachFailure = true; (window as any).detachFailure = true; });
     else {
       await card.locator('.conversation-toggle').click();
       await expect(card.locator('.conversation-input')).toBeEnabled();

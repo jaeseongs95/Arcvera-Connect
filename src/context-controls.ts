@@ -9,6 +9,7 @@ interface ContextStatus {
   compacting: boolean;
   active: boolean | null;
   canCompact: boolean;
+  passiveSubscriptionSupported?: boolean;
   reason?: string;
   revision?: number;
 }
@@ -21,6 +22,7 @@ interface Options {
   prepare(): Promise<void>;
   compact(): Promise<{ status?: string }>;
   notify(ko: string, error: boolean, en: string): void;
+  passiveSubscriptionChanged?(supported: boolean): void;
 }
 
 /** One small snapshot per visible card; observation never claims the GUI input lease. */
@@ -47,6 +49,7 @@ export function createContextControls(options: Options) {
       revision = value.revision;
     }
     snapshot = value;
+    options.passiveSubscriptionChanged?.(value.passiveSubscriptionSupported === true);
   }
   function reason() {
     if (busy || snapshot?.compacting) return t('컨텍스트 압축 중 · 완료 확인 대기', 'Compacting context · waiting for confirmation');

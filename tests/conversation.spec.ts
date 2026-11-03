@@ -65,6 +65,33 @@ async function conversation(page: Page, options: { historyUnavailable?: boolean 
   await expect(page.locator('#conversation-fixture .conversation-input')).toBeEnabled();
 }
 const view = (page: Page) => page.locator('#conversation-fixture');
+
+for (const rejectDetach of [false, true]) {
+  test(`Attach 실패의 Detach 거절 ${rejectDetach}에서 소유권·초안·결과 미확인 가드를 보존한다`, async ({ page }) => {
+    await conversation(page);
+    await view(page).locator('.conversation-input').fill('결과 미확인 초안');
+    await page.evaluate(() => { (window as any).conversationFixture.rejectSend = true; });
+    await view(page).locator('.conversation-send').click();
+    await expect(view(page).locator('.conversation-input')).toBeDisabled();
+    await page.evaluate(async () => { await (window as any).conversation.setVisible(false); });
+    const result = await page.evaluate(async rejectDetach => {
+      const state = window as any; state.conversationFixture.failAt = 'attach'; state.conversationFixture.rawFailure = 'PRIVATE_ATTACH_REJECT_NEVER_REAL'; state.conversationFixture.rejectDetach = rejectDetach;
+      try { await state.conversation.setVisible(true); return { rejected: false, causes: [] }; }
+      catch (error: any) { return { rejected: true, causes: error.errors?.map((cause: Error) => cause.message) ?? [error.message] }; }
+    }, rejectDetach);
+    expect(result.rejected).toBe(true);
+    expect(result.causes).toContain('PRIVATE_ATTACH_REJECT_NEVER_REAL');
+    expect(await page.evaluate(() => (window as any).conversationFixture.owners)).toEqual(rejectDetach ? [true, false, true] : [true, false, true, false]);
+    expect(await page.evaluate(() => (window as any).conversation.canRestart())).toBe(false);
+    await expect(view(page).locator('.conversation-input')).toHaveValue('결과 미확인 초안');
+    await expect(view(page).locator('.conversation-input')).toBeDisabled();
+    if (rejectDetach) await expect(view(page)).toBeVisible(); else await expect(view(page)).toBeHidden();
+    const calls = await page.evaluate(() => (window as any).conversationFixture.calls.map((c: any) => c.args.request?.type));
+    expect(calls.filter((type: string) => type === 'detach')).toHaveLength(2);
+    expect(calls.filter((type: string) => type === 'send')).toHaveLength(1);
+    expect(await view(page).evaluate(node => node.outerHTML)).not.toContain('PRIVATE_ATTACH_REJECT_NEVER_REAL');
+  });
+}
 const privateFailure = 'PRIVATE_INTERNAL_FAILURE C:\\private-cli\\codex.exe token=FAKE_AUTH_TOKEN_DO_NOT_DISPLAY';
 async function expectPrivateFailureHidden(page: Page) {
   const html = await view(page).evaluate(node => node.outerHTML);

@@ -324,7 +324,7 @@ pub(super) fn prepare(cwd: &Path, requested: Option<&str>, endpoint: SharedEndpo
     let command = endpoint.tui(cwd, &id)?;
     let stopped = Arc::new(AtomicBool::new(false));
     let control = SharedControl { endpoint:endpoint.clone(),thread_id:id.clone(),cwd:cwd.into(),capabilities:super::runtime::observed_capabilities(&initialized),stopped:stopped.clone() };
-    let conversation = Some(ConversationConnection::new(super::conversation::Endpoint::Shared(endpoint.clone()), stopped.clone()));
+    let conversation = Some(ConversationConnection::from_initialize(super::conversation::Endpoint::Shared(endpoint.clone()), stopped.clone(), &initialized));
     let mobile = MobileConnection::shared(endpoint, stopped.clone());
     on_event(CodexEvent::ThreadId(id.clone()));
     on_event(CodexEvent::Status(status(&thread["status"])));

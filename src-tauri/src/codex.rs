@@ -430,11 +430,11 @@ fn launch_server_with_cancellation(exe: &OsString, cwd: &Path, thread_id: Option
     };
     session.job = Some(Arc::new(ProcessJob::assign_std(session.server.as_ref().unwrap())?));
     session.mobile = Some(MobileConnection::new(endpoint.clone(), token.clone(), session.job.as_ref().unwrap(), session.stopped.clone(), namespaced_remote));
-    session.conversation = Some(ConversationConnection::new(conversation::Endpoint::Owned {address:endpoint.clone(),token:token.clone(),job:Arc::downgrade(session.job.as_ref().unwrap())}, session.stopped.clone()));
     session._launch_gate.as_ref().unwrap().release()?;
     let job = session.job.as_ref().ok_or("Codex server has no owned process job")?;
     let mut rpc = connect(&endpoint, &token, session.server.as_mut().unwrap(), job, cancelled)?;
-    rpc.call("initialize", initialize())?;
+    let initialized = rpc.call("initialize", initialize())?;
+    session.conversation = Some(ConversationConnection::from_initialize(conversation::Endpoint::Owned {address:endpoint.clone(),token:token.clone(),job:Arc::downgrade(session.job.as_ref().unwrap())}, session.stopped.clone(), &initialized));
     rpc.send(json!({"method":"initialized","params":{}}))?;
     Ok((session, rpc))
 }

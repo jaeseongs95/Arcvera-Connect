@@ -9,12 +9,13 @@ async function fixture(page: Page) {
     host.style.cssText = 'position:fixed;top:20px;right:20px;z-index:9999;background:#141820'; document.body.append(host);
     const statusHost = document.createElement('span'); statusHost.hidden = true; document.body.append(statusHost);
     const data = state.contextFixture = {
-      reads: 0, preparations: 0, mutations: 0, notices: [] as any[], failure: false, hold: false,
+      reads: 0, preparations: 0, mutations: 0, notices: [] as any[], capabilities: [] as boolean[], failure: false, hold: false,
       release: () => {}, holdRead: false, releaseRead: () => {}, result: 'started',
       snapshot: { revision: 1, connected: true, guiConnected: true, tokenUsage: { total: { totalTokens: 900000 }, last: { totalTokens: 40000 }, modelContextWindow: 100000 }, tokenUsageFresh: true, compacting: false, active: false, canCompact: true } as any,
     };
     state.contextControls = createContextControls({
       host, statusHost, sessionId: 'context-session', generation: 9,
+      passiveSubscriptionChanged(supported: boolean) { data.capabilities.push(supported); },
       async call(command: string, args: any) {
         if (command !== 'conversation_request' || args.id !== 'context-session' || args.generation !== 9 || args.request.type !== 'contextStatus') throw Error('관측 이외의 호출');
         data.reads++; const snapshot = structuredClone(data.snapshot);
@@ -48,6 +49,29 @@ test('컨텍스트는 누적 사용량이 아닌 최근 사용량 비율을 표�
   await expect(usage).toHaveAttribute('aria-label', /미확인/);
 });
 
+test('대화 지원 관측은 명시 true만 허용하며 누락과 잘못된 값은 지원으로 간주하지 않는다', async ({ page }) => {
+  await fixture(page);
+  const usage = page.locator('#context-fixture .context-usage');
+  await expect(usage).toHaveText('40%');
+  for (const value of [true, false, 'true', null, undefined, true]) {
+    await page.evaluate(value => { const s = (window as any).contextFixture.snapshot; s.revision++; if (value === undefined) delete s.passiveSubscriptionSupported; else s.passiveSubscriptionSupported = value; }, value);
+    await usage.click();
+    await expect.poll(() => page.evaluate(() => (window as any).contextFixture.capabilities.at(-1))).toBe(value === true);
+  }
+});
+
+test('숨김 세대의 늦은 지원 응답은 새 세대에 적용하지 않는다', async ({ page }) => {
+  await fixture(page);
+  const usage = page.locator('#context-fixture .context-usage');
+  await expect(usage).toHaveText('40%');
+  expect(await page.evaluate(() => (window as any).contextFixture.capabilities)).toEqual([false]);
+  await page.evaluate(() => { const s = window as any; s.contextFixture.snapshot.passiveSubscriptionSupported = true; s.contextFixture.holdRead = true; });
+  await usage.click();
+  await page.evaluate(() => { const s = window as any; s.contextControls.setVisible(false); s.contextControls.setVisible(true); s.contextFixture.snapshot.passiveSubscriptionSupported = false; s.contextFixture.releaseRead(); });
+  await expect.poll(() => page.evaluate(() => (window as any).contextFixture.reads)).toBeGreaterThanOrEqual(3);
+  expect(await page.evaluate(() => (window as any).contextFixture.capabilities)).not.toContain(true);
+});
+
 test('0과 상한의 유효 비율을 표시하고 잘못된 수치·용량을 미확인으로 표시한다', async ({ page }) => {
   await fixture(page);
   const usage = page.locator('#context-fixture .context-usage');
@@ -69,14 +93,15 @@ test('늦게 돌아온 낮은 상태 판본이 더 최근 관측을 되돌리지
   await fixture(page);
   const usage = page.locator('#context-fixture .context-usage');
   await expect(usage).toHaveText('40%');
-  await page.evaluate(() => { (window as any).contextFixture.holdRead = true; });
+  await page.evaluate(() => { const f = (window as any).contextFixture; f.snapshot.passiveSubscriptionSupported = false; f.holdRead = true; });
   await usage.click();
-  await page.evaluate(() => { const s = (window as any).contextFixture; s.snapshot.revision = 2; s.snapshot.tokenUsage.last.totalTokens = 10000; s.result = 'skippedBusy'; });
+  await page.evaluate(() => { const s = (window as any).contextFixture; s.snapshot.revision = 2; s.snapshot.passiveSubscriptionSupported = true; s.snapshot.tokenUsage.last.totalTokens = 10000; s.result = 'skippedBusy'; });
   await page.locator('#context-fixture .context-compact').click();
   await expect(usage).toHaveText('10%');
   await page.evaluate(() => (window as any).contextFixture.releaseRead());
   await expect(usage).toBeEnabled();
   await expect(usage).toHaveText('10%');
+  expect(await page.evaluate(() => (window as any).contextFixture.capabilities.at(-1))).toBe(true);
 });
 
 test('연결 단절과 압축 뒤에는 과거 수치를 현재 사용량으로 표시하지 않는다', async ({ page }) => {

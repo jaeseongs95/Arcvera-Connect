@@ -547,7 +547,20 @@ export function createConversation(options: ConversationOptions) {
       try {
         // Claim locally before invoking: an attach error can leave the server's lease intact.
         attached = true; options.ownerChanged?.(true);
-        const value = await rpc({ type: 'attach' });
+        let value: Json;
+        try { value = await rpc({ type: 'attach' }); }
+        catch (error) {
+          connected = false;
+          // An Attach error does not establish that the server released its lease.
+          try { await rpc({ type: 'detach' }); }
+          catch (cleanupError) {
+            if (!disposed) { visible = true; host.hidden = false; failure(error); updateControls(); }
+            throw new AggregateError([error, cleanupError], 'Conversation attach cleanup failed');
+          }
+          attached = false; options.ownerChanged?.(false);
+          if (!disposed && version === epoch) { visible = false; host.hidden = true; stopPolling(); failure(error); updateControls(); }
+          throw error;
+        }
         if (!alive(version)) {
           try { await rpc({ type: 'detach' }); }
           catch (error) { if (!disposed) { visible = true; host.hidden = false; connected = false; failure(error); updateControls(); startPolling(); } throw error; }

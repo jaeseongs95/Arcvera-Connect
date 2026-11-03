@@ -530,6 +530,8 @@ function mountConversation(session: Session) {
   conversationHost.hidden = true;
   let conversation: ReturnType<typeof createConversation> | undefined;
   const toggle = card.querySelector<HTMLButtonElement>('.conversation-toggle')!;
+  toggle.hidden = true;
+  toggle.setAttribute('aria-pressed', 'false');
   function getConversation() {
     if (!conversation) {
       conversation = createConversation({ sessionId: session.id, generation: session.generation, host: conversationHost, call,
@@ -540,6 +542,7 @@ function mountConversation(session: Session) {
     return conversation!;
   }
   toggle.onclick = async () => {
+    if (toggle.hidden) return;
     toggle.disabled = true;
     try {
       getConversation();
@@ -561,6 +564,7 @@ function mountConversation(session: Session) {
   contextControls.get(session.id)?.dispose();
   contextControls.set(session.id, createContextControls({
     host: card.querySelector<HTMLElement>('.context-controls')!, statusHost: card.querySelector<HTMLElement>('.session-compaction')!, sessionId: session.id, generation: session.generation, call, notify,
+    passiveSubscriptionChanged(supported) { toggle.hidden = !supported; },
     async prepare() {
       if (toggle.disabled) throw new Error('대화 화면 전환 중');
       toggle.disabled = true;
