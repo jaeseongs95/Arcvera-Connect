@@ -1,6 +1,6 @@
 import { test, expect, type Page } from '@playwright/test';
 
-async function settings(page: Page, options: { holdPreview?: boolean; holdApply?: boolean; holdSelection?: boolean; canApply?: boolean; state?: 'matched' | 'mismatch' | 'stopped' | 'embedded' | 'unavailable'; outcome?: string; success?: boolean; status?: string; rejectApply?: boolean; malformed?: boolean } = {}) {
+async function settings(page: Page, options: { holdPreview?: boolean; holdApply?: boolean; holdSelection?: boolean; canApply?: boolean; state?: 'matched' | 'mismatch' | 'stopped' | 'embedded' | 'unconfirmed' | 'unavailable'; outcome?: string; success?: boolean; status?: string; rejectApply?: boolean; malformed?: boolean } = {}) {
   await page.addInitScript(options => {
     const state = window as any; state.isTauri = true;
     let callback = 0;
@@ -249,6 +249,21 @@ for (const canApply of [true, false]) {
       await expect(page.locator('.transition-align')).toBeDisabled();
       expect(await calls(page, 'apply_runtime_transition')).toHaveLength(0);
     }
+  });
+}
+
+for (const canApply of [true, false]) {
+  test(`연결 미확인 상태는 읽기 성공으로 표시하되 canApply=${canApply}와 무관하게 전환을 차단한다`, async ({ page }) => {
+    await settings(page, { state: 'unconfirmed', canApply });
+    await page.locator('.transition-preview').click();
+    await expect(page.locator('.transition-status')).toHaveText('현재 서버 연결 상태를 확인하지 못했습니다. 서버 버전을 다시 확인하세요.');
+    await expect(page.locator('.transition-details dd').first()).toHaveText('R33-cli');
+    await expect(page.locator('.transition-align')).toBeHidden();
+    await expect(page.locator('.transition-align')).toBeDisabled();
+    await page.locator('.transition-align').evaluate(button => button.dispatchEvent(new MouseEvent('click', { bubbles: true })));
+    await expect(page.locator('.transition-confirmation')).toBeHidden();
+    await expect(page.locator('.transition-apply')).toBeDisabled();
+    expect(await calls(page, 'apply_runtime_transition')).toHaveLength(0);
   });
 }
 

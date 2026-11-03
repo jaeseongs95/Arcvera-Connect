@@ -128,23 +128,19 @@ fn inspect_commands(
             let value: Value = serde_json::from_slice(&bytes)
                 .map_err(|_| "공유 서버 버전 응답이 올바른 JSON이 아닙니다.".to_owned())?;
             if !value.is_object() { return Err("공유 서버 버전 응답이 객체가 아닙니다.".into()); }
-            let stopped = match field(&value, "status", 64)? {
-                "running" => false,
-                "stopped" if passive_status => true,
+            let state = field(&value, "status", 64)?;
+            let stopped = state == "stopped" && passive_status;
+            let unconfirmed = state == "unknown" && passive_status;
+            match state {
+                "running" => {}
+                "stopped" if passive_status => {}
                 "unknown" if passive_status => {
-                    let reason = match value.get("reason") {
-                        Some(Value::String(reason)) => Some(bounded_text(reason, "상태 확인 사유", 4096)?),
-                        None | Some(Value::Null) => None,
-                        _ => return Err("공유 서버 상태 확인 사유 형식을 확인할 수 없습니다.".into()),
-                    };
-                    return Err(match reason {
-                        Some(reason) => format!("공유 서버의 상태를 확인하지 못했습니다: {reason}"),
-                        None => "공유 서버의 상태를 확인하지 못했습니다. 중지 상태로 추정하지 않았습니다.".into(),
-                    });
+                    let reason = field(&value, "reason", 4096)?;
+                    report.message = Some(format!("공유 서버의 상태를 확인하지 못했습니다: {reason}"));
                 }
                 // legacy version은 Running만 반환한다. 실패를 stopped로 추정하지 않는다.
                 _ => return Err("공유 서버의 실행 상태를 확인하지 못했습니다. 중지 상태로 추정하지 않았습니다.".into()),
-            };
+            }
             let reported_cli = normalized_version(field(&value, "cliVersion", 256)?)?;
             // Passive stopped explicitly reports null when no managed package is installed.
             // Missing fields and non-string values in every other state remain errors.
@@ -155,20 +151,30 @@ fn inspect_commands(
                     return Err("공유 서버의 중지 상태와 실행 버전이 서로 맞지 않습니다.".into());
                 }
                 None
-            } else { Some(normalized_version(field(&value, "appServerVersion", 256)?)?) };
+            } else if unconfirmed && value.get("appServerVersion") == Some(&Value::Null) { None }
+                else { Some(normalized_version(field(&value, "appServerVersion", 256)?)?) };
             let managed_path = field(&value, "managedCodexPath", 128 * 1024)?.to_owned();
             let socket = field(&value, "socketPath", 128 * 1024)?.to_owned();
             if !Path::new(&managed_path).is_absolute() || !Path::new(&socket).is_absolute() {
                 return Err("공유 서버 실행 파일과 소켓 경로는 절대 경로여야 합니다.".into());
             }
+            if reported_cli != report.cli_version {
+                return Err("공유 서버 조회가 보고한 CLI 버전이 선택한 실행 파일 버전과 다릅니다.".into());
+            }
             report.managed_cli_executable = Some(managed_path);
             report.socket_path = Some(socket);
             report.managed_version = managed.clone();
             report.running_version = running.clone();
-            if reported_cli != report.cli_version {
-                return Err("공유 서버 조회가 보고한 CLI 버전이 선택한 실행 파일 버전과 다릅니다.".into());
-            }
-            if stopped {
+            if unconfirmed {
+                // 검증된 패키지 정보만 보존한다. unknown을 중지나 실행 중으로 추정하지 않는다.
+                report.state = "unconfirmed".into();
+                if managed.as_deref() != Some(report.cli_version.as_str())
+                    || running.as_deref().is_some_and(|version| version != report.cli_version) {
+                    if let Some(message) = report.message.as_mut() {
+                        message.push_str("; 관리 중이거나 관측된 서버 버전이 선택한 버전과 다릅니다. 서버 전환 확인이 필요합니다.");
+                    }
+                }
+            } else if stopped {
                 report.state = "stopped".into();
                 report.message = Some(match managed.as_deref() {
                     None => "공유 서버 패키지가 미설치 상태입니다. 선택한 패키지의 별도 준비가 필요합니다.".into(),
@@ -184,7 +190,12 @@ fn inspect_commands(
             }
             Ok(())
         })();
-        if let Err(error) = observed { report.message = Some(error); }
+        if let Err(error) = observed {
+            report.message = Some(match report.message.take() {
+                Some(reason) => format!("{reason}; {error}"),
+                None => error,
+            });
+        }
     }
     checkpoint(cancelled, deadline)?;
     Ok(report)
@@ -405,6 +416,101 @@ mod tests {
             assert_eq!(calls.last().unwrap(), "cli.exe app-server daemon status --json");
             assert_eq!(calls.len(), 5);
         }
+    }
+
+    fn unconfirmed_status(managed: &str, running: Option<&str>) -> Value {
+        let mut value = status(managed, R33);
+        value["status"] = json!("unknown"); value["cliVersion"] = json!(R33);
+        value["appServerVersion"] = json!(running);
+        value["reason"] = json!("socketProbeFailed: failed to connect: os error 10061");
+        value
+    }
+
+    #[test]
+    fn passive_unknown_preserves_verified_metadata_without_inferring_stopped_or_starting() {
+        for (managed, running) in [(R33, None), (R28, None), (R33, Some(R33)), (R33, Some(R28))] {
+            let value = unconfirmed_status(managed, running);
+            let (report, calls) = inspect_fixture_help(R33, R33, Ok(daemon_help(true)),
+                Ok(serde_json::to_vec(&value).unwrap()));
+            let report = report.unwrap();
+            assert_eq!(report.state, "unconfirmed");
+            assert_eq!(report.managed_version.as_deref(), Some(managed));
+            assert_eq!(report.running_version.as_deref(), running);
+            assert_eq!(report.managed_cli_executable.as_deref(), value["managedCodexPath"].as_str());
+            assert_eq!(report.socket_path.as_deref(), value["socketPath"].as_str());
+            let message = report.message.unwrap();
+            assert!(message.contains(value["reason"].as_str().unwrap()));
+            assert_eq!(message.contains("서버 전환 확인이 필요합니다"), managed != R33 || running.is_some_and(|version| version != R33));
+            assert_eq!(calls, ["cli.exe --version", "server.exe --version", "cli.exe app-server --help",
+                "cli.exe app-server daemon --help", "cli.exe app-server daemon status --json"]);
+        }
+        // 오류 문자열을 분류하지 않는다. 다른 사유도 동일한 엄격한 메타데이터 검사를 받는다.
+        let mut value = unconfirmed_status(R33, None);
+        value["reason"] = json!("processStarting");
+        let report = inspect_fixture_help(R33, R33, Ok(daemon_help(true)),
+            Ok(serde_json::to_vec(&value).unwrap())).0.unwrap();
+        assert_eq!(report.state, "unconfirmed");
+        assert!(report.message.unwrap().contains("processStarting"));
+    }
+
+    #[test]
+    fn passive_unknown_requires_complete_consistent_metadata_and_explicit_null_running_version() {
+        let base = unconfirmed_status(R33, None);
+        let mut invalid_values = Vec::new();
+        for key in ["status", "cliVersion", "managedCodexVersion", "managedCodexPath", "socketPath", "reason"] {
+            for invalid in [Value::Null, json!(42), json!(""), json!("bad\nresponse"), json!("\u{1b}[32mvalue")] {
+                let mut value = base.clone(); value[key] = invalid;
+                invalid_values.push((key, value));
+            }
+        }
+        for (key, invalid) in [("cliVersion", json!(R28)), ("managedCodexVersion", json!("not-a-version")),
+            ("managedCodexPath", json!("relative/codex.exe")), ("socketPath", json!("relative/server.sock")),
+            ("appServerVersion", json!(false)), ("appServerVersion", json!("not-a-version")),
+            ("reason", json!("x".repeat(4097)))] {
+            let mut value = base.clone(); value[key] = invalid;
+            invalid_values.push((key, value));
+        }
+        for key in ["status", "cliVersion", "managedCodexVersion", "managedCodexPath", "socketPath", "appServerVersion", "reason"] {
+            let mut value = base.clone(); value.as_object_mut().unwrap().remove(key);
+            invalid_values.push((key, value));
+        }
+        for (key, value) in invalid_values {
+            let (report, calls) = inspect_fixture_help(R33, R33, Ok(daemon_help(true)),
+                Ok(serde_json::to_vec(&value).unwrap()));
+            let report = report.unwrap();
+            assert_eq!(report.state, "unavailable", "field={key}, value={value}");
+            assert!(report.managed_cli_executable.is_none() && report.managed_version.is_none()
+                && report.running_version.is_none() && report.socket_path.is_none(), "field={key}");
+            assert!(report.message.is_some());
+            assert_eq!(calls.len(), 5);
+            assert_eq!(calls.last().unwrap(), "cli.exe app-server daemon status --json");
+        }
+        assert_eq!(inspect_fixture(R33, R33, Ok(serde_json::to_vec(&base).unwrap())).0.unwrap().state,
+            "unavailable", "legacy version에는 unknown 메타데이터 계약이 없다");
+    }
+
+    #[test]
+    fn passive_unknown_does_not_bypass_cancellation_after_status_query() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut calls = 0;
+        let result = inspect_commands(&OsString::from("cli.exe"), &OsString::from("server.exe"), "standalone",
+            &cancelled, deadline, |_, args, received| {
+                calls += 1;
+                assert_eq!(received, deadline);
+                match args {
+                    ["--version"] => Ok(R33.as_bytes().to_vec()),
+                    ["app-server", "--help"] => Ok(app_server_help(true)),
+                    ["app-server", "daemon", "--help"] => Ok(daemon_help(true)),
+                    ["app-server", "daemon", "status", "--json"] => {
+                        cancelled.store(true, Ordering::Release);
+                        Ok(serde_json::to_vec(&unconfirmed_status(R33, None)).unwrap())
+                    }
+                    _ => panic!("읽기 전용 조회 이외 명령 금지"),
+                }
+            });
+        assert!(result.is_err());
+        assert_eq!(calls, 5);
     }
 
     #[test]

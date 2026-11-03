@@ -2,7 +2,7 @@ import { test, expect, type Page } from '@playwright/test';
 
 // Exercise the application-level preparation/restore/exit boundary, independently
 // of the transition component. No native process or shared server is started.
-async function failedStartup(page: Page, result: 'updated' | 'unknown' | 'malformed' | 'wrongStatus') {
+async function failedStartup(page: Page, result: 'updated' | 'unknown' | 'malformed' | 'wrongStatus', confirmTransition = true) {
   await page.addInitScript(result => {
     const state = window as any; state.isTauri = true;
     let callback = 0;
@@ -38,8 +38,12 @@ async function failedStartup(page: Page, result: 'updated' | 'unknown' | 'malfor
   }, result);
   await page.goto('/');
   await expect(page.locator('#runtime-banner')).toContainText('CLI와 공유 서버 버전이 다릅니다');
+  await expect(page.locator('#runtime-settings')).toHaveText('서버 확인·복구');
   await page.locator('#runtime-settings').click();
-  await page.locator('.transition-preview').click();
+  await expect(page.locator('.transition-details dd')).toHaveText(['R33', 'D:\\fixture\\bin\\codex-app-server.exe', 'R33', 'D:\\managed\\codex.exe', 'R28', 'R28']);
+  expect(await count(page, 'runtime_transition_preview')).toBe(1);
+  expect(await count(page, 'apply_runtime_transition')).toBe(0);
+  if (!confirmTransition) return;
   await page.locator('.transition-align').click();
   await page.locator('.transition-acknowledge').check();
   await page.locator('.transition-apply').click();
@@ -47,6 +51,23 @@ async function failedStartup(page: Page, result: 'updated' | 'unknown' | 'malfor
 }
 
 const count = (page: Page, command: string) => page.evaluate(command => (window as any).pairStartup.calls.filter((item: string) => item === command).length, command);
+
+test('시작 실패 복구 진입은 버전을 한 번 조회하고 작업 종료 확인 전에는 전환하지 않는다', async ({ page }) => {
+  await page.setViewportSize({ width: 800, height: 540 });
+  await failedStartup(page, 'updated', false);
+  await expect(page.locator('#runtime-transition-title')).toBeInViewport();
+  await expect(page.locator('.transition-align')).toBeVisible();
+  await page.locator('.transition-align').click();
+  await expect(page.locator('.transition-apply')).toBeDisabled();
+  await page.locator('.transition-apply').evaluate(button => button.dispatchEvent(new MouseEvent('click', { bubbles: true })));
+  expect(await count(page, 'apply_runtime_transition')).toBe(0);
+  await page.locator('.transition-acknowledge').check();
+  expect(await count(page, 'apply_runtime_transition')).toBe(0);
+  await page.locator('.transition-apply').click();
+  await expect.poll(() => count(page, 'apply_runtime_transition')).toBe(1);
+  expect(await count(page, 'runtime_transition_preview')).toBe(1);
+  await page.evaluate(() => (window as any).pairStartup.release());
+});
 
 test('버전 불일치에서 확인된 전환 완료 뒤에만 공유 서버를 다시 준비하고 저장 작업을 복원한다', async ({ page }) => {
   await failedStartup(page, 'updated');

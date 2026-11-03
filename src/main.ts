@@ -106,7 +106,7 @@ $('#app').innerHTML = `
     <header class="topbar"><div class="workspace-actions"><button id="catalog-open" class="quiet-button">세션 불러오기</button><button id="new-session" class="primary-button"><span>+</span> 새 세션</button></div><div class="top-actions"><span id="mode-label" class="mode-label">LOCAL WORKSPACE</span><button id="notifications" class="icon-button" aria-label="질문함">?<span id="notification-count" hidden></span></button><button id="settings-open" class="icon-button" aria-label="설정 열기" aria-haspopup="dialog" aria-controls="settings-dialog" title="설정">⚙</button><button id="exit" class="quiet-button">앱 종료</button></div></header>
     <div id="project-tabs" class="project-tabs" role="tablist" aria-label="프로젝트별 세션"></div>
     <section class="toolbar" aria-label="그리드 도구"><div class="session-summary"><span class="connection-dot"></span><strong id="running-count">0</strong> 실행 중 <span class="divider"></span><span id="total-count">0개 세션</span></div><div class="layout-tools"><button id="search-toggle" class="quiet-button" title="활성 터미널 검색 (Ctrl+Shift+F)">⌕ <span>검색</span></button><span class="divider"></span><span class="layout-label">열</span><div id="column-options" class="segmented" role="group" aria-label="그리드 열 수"><button data-columns="1" aria-label="1열">▯</button><button data-columns="2" class="active" aria-label="2열">▥</button><button data-columns="3" aria-label="3열">▥▯</button><button data-columns="4" aria-label="4열">▥▥</button></div></div></section>
-    <div id="runtime-banner" class="runtime-banner" role="status" hidden><span id="runtime-status"></span> <button id="runtime-retry" class="quiet-button" hidden>다시 시도</button> <button id="runtime-settings" class="quiet-button" hidden>실행 파일 설정</button></div>
+    <div id="runtime-banner" class="runtime-banner" role="status" hidden><span id="runtime-status"></span> <button id="runtime-retry" class="quiet-button" hidden>다시 시도</button> <button id="runtime-settings" class="quiet-button" hidden>서버 확인·복구</button></div>
     <div id="restore-banner" class="restore-banner" hidden><span>자동으로 연결하지 못한 저장 세션이 있습니다. 목록에서 다시 연결하거나 제거할 수 있습니다.</span><button id="restore-open" class="quiet-button">저장 세션 보기 →</button></div>
     <section id="search-bar" class="search-bar" hidden><label for="terminal-search">활성 터미널 검색</label><input id="terminal-search" placeholder="검색어 입력"/><button id="search-prev" class="quiet-button" aria-label="이전 검색 결과">↑</button><button id="search-next" class="quiet-button" aria-label="다음 검색 결과">↓</button><span id="search-result" role="status"></span><button id="search-close" class="icon-button" aria-label="검색 닫기">×</button></section>
     <section id="grid-area" class="grid-area" role="tabpanel"><div id="grid" class="terminal-grid"></div><div id="grid-handles"></div><div id="empty" class="empty"><div class="empty-grid">▦</div><h2>다음 작업을 펼쳐 보세요</h2><p>프로젝트 경로를 선택해 첫 세션을 시작하세요.<br>각 세션은 독립된 터미널에서 실행됩니다.</p><button id="empty-add" class="primary-button">+ 첫 세션 만들기</button><small>Alt + 1–9 세션 전환 · Ctrl + Tab 다음 세션</small></div></section>
@@ -337,7 +337,7 @@ function showRuntimeFailure(error: unknown) {
   bindText($('#runtime-status'), `공유서버 준비 실패: ${message(error, 'ko')}`, `Could not prepare the shared server: ${message(error, 'en')}`);
   const retry = $<HTMLButtonElement>('#runtime-retry');
   bindText(retry, '다시 시도', 'Retry'); retry.hidden = false; retry.disabled = false;
-  bindText($('#runtime-settings'), '실행 파일 설정', 'Executable settings'); $('#runtime-settings').hidden = false;
+  bindText($('#runtime-settings'), '서버 확인·복구', 'Check/recover server'); $('#runtime-settings').hidden = false;
 }
 function prepareRuntime(): Promise<void> {
   if (!native || exitInProgress) return Promise.resolve();
@@ -963,7 +963,7 @@ const executableSettings = createExecutableSettings(async <T>(command: string, a
   }
 });
 $('#codex-settings-open').onclick = () => void executableSettings.open();
-$('#runtime-settings').onclick = () => void executableSettings.open();
+$('#runtime-settings').onclick = () => void executableSettings.open({ checkServer: true });
 $('#settings-open').onclick = () => $<HTMLDialogElement>('#settings-dialog').showModal();
 for (const button of document.querySelectorAll<HTMLElement>('[data-close]')) button.onclick = () => button.closest('dialog')?.close();
 $('#column-options').onclick = event => { const button = (event.target as HTMLElement).closest<HTMLElement>('[data-columns]'); if (button) { columns = Number(button.dataset.columns); maximized = ''; renderGrid(); scheduleSave(); } };

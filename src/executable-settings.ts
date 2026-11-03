@@ -142,7 +142,7 @@ export function createExecutableSettings(call: <T>(command: string, args?: Recor
   $('#codex-settings-close').onclick = () => dialog.close();
   dialog.onclose = () => { version++; compatibility.invalidate(); transition.invalidate(); };
   return {
-    async open() {
+    async open(options: { checkServer?: boolean } = {}) {
       if (dialog.open) return;
       const token = ++version;
       compatibility.invalidate(); transition.invalidate();
@@ -153,13 +153,14 @@ export function createExecutableSettings(call: <T>(command: string, args?: Recor
       text($('#codex-executable-source'), '확인 중…', 'Checking…');
       error.hidden = true; setBusy(true, '현재 설정을 확인하는 중…', 'Checking current settings…');
       dialog.showModal(); $('#codex-settings-close').focus();
+      let loaded = false;
       try {
         // A chooser may finish after the popup closes. Read back its persisted result on reopen.
         if (mutation) { try { await mutation; } catch { /* Read the unchanged saved setting after a rejected selection. */ } }
         await transition.whenIdle();
         if (!current(token)) return;
         const settings = await call<CodexSettings>('get_codex_settings');
-        if (current(token)) { show(settings); text(status, ''); }
+        if (current(token)) { show(settings); text(status, ''); loaded = true; }
       } catch (cause) { if (current(token)) {
         placeholder('설정을 확인하지 못했습니다', 'Could not check settings');
         for (const selector of ['#app-server-executable-resolved', '#app-server-executable-source', '#app-server-executable-kind']) text($(selector), '미확인', 'Unknown');
@@ -168,6 +169,10 @@ export function createExecutableSettings(call: <T>(command: string, args?: Recor
         text(status, ''); showError(cause);
       } }
       finally { if (current(token)) setBusy(false); }
+      if (current(token) && loaded && options.checkServer) {
+        transition.check();
+        transition.element.scrollIntoView({ block: 'start' });
+      }
     },
   };
 }

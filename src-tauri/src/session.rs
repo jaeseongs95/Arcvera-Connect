@@ -922,7 +922,13 @@ impl Engine {
     fn prepare_pair_with(report: codex::RuntimePairStatus, prepare: impl FnOnce() -> Result<(), String>,
         inspect: impl FnOnce() -> Result<codex::RuntimePairStatus, String>,
     ) -> Result<codex::RuntimePairStatus, String> {
-        let can_start_selected = report.state == "stopped" && report.managed_version.as_deref() == Some(report.cli_version.as_str()) && report.cli_version == report.selected_server_version;
+        // An unreachable socket is not proof that the daemon stopped. Delegate
+        // the start decision to the CLI's existing-installation path only when
+        // every verified version agrees; never replace another installation.
+        let can_start_selected = matches!(report.state.as_str(), "stopped" | "unconfirmed")
+            && report.managed_version.as_deref() == Some(report.cli_version.as_str())
+            && report.cli_version == report.selected_server_version
+            && report.running_version.as_deref().is_none_or(|version| version == report.cli_version);
         if !matches!(report.state.as_str(), "matched" | "embedded") && !can_start_selected { return Err(Self::pair_error(&report)); }
         prepare()?;
         // A different client may replace the shared endpoint during preparation.
@@ -1292,6 +1298,62 @@ mod runtime_preparation_tests {
 
     fn updated_reply() -> codex::RuntimeTransitionReply {
         codex::RuntimeTransitionReply { status: "updated".into(), success: true, outcome: "updated".into(), message: None }
+    }
+
+    #[test]
+    fn unconfirmed_matching_installation_prepares_once_and_requires_fresh_matched_status() {
+        let preparations = std::cell::Cell::new(0);
+        let inspections = std::cell::Cell::new(0);
+        let result = Engine::prepare_pair_with(transition_pair("unconfirmed"), || {
+            preparations.set(preparations.get() + 1);
+            Ok(())
+        }, || {
+            inspections.set(inspections.get() + 1);
+            Ok(transition_pair("matched"))
+        });
+        assert_eq!(result.unwrap().state, "matched");
+        assert_eq!((preparations.get(), inspections.get()), (1, 1));
+    }
+
+    #[test]
+    fn preparation_rejects_unavailable_or_conflicting_versions_without_starting() {
+        let other = "0.165.0+native-r28.20261029";
+        let mut pairs = vec![transition_pair("unavailable"), transition_pair("mismatch")];
+        for state in ["stopped", "unconfirmed"] {
+            for boundary in 0..4 {
+                let mut pair = transition_pair(state);
+                match boundary {
+                    0 => pair.managed_version = None,
+                    1 => pair.managed_version = Some(other.into()),
+                    2 => pair.selected_server_version = other.into(),
+                    _ => pair.running_version = Some(other.into()),
+                }
+                pairs.push(pair);
+            }
+        }
+        for pair in pairs {
+            assert!(Engine::prepare_pair_with(pair, || panic!("확인되지 않은 설치를 시작함"),
+                || panic!("차단된 준비 뒤 재조회함")).is_err());
+        }
+    }
+
+    #[test]
+    fn unconfirmed_preparation_never_retries_and_rejects_unverified_post_start_status() {
+        assert_eq!(Engine::prepare_pair_with(transition_pair("unconfirmed"), || Err("시작 실패".into()),
+            || panic!("실패한 시작 뒤 재조회함")).unwrap_err(), "시작 실패");
+        for state in ["unconfirmed", "unavailable", "stopped", "mismatch"] {
+            let preparations = std::cell::Cell::new(0);
+            let inspections = std::cell::Cell::new(0);
+            let result = Engine::prepare_pair_with(transition_pair("unconfirmed"), || {
+                preparations.set(preparations.get() + 1);
+                Ok(())
+            }, || {
+                inspections.set(inspections.get() + 1);
+                Ok(transition_pair(state))
+            });
+            assert!(result.is_err(), "실제 버전이 확인되지 않은 준비를 성공 처리함: {state}");
+            assert_eq!((preparations.get(), inspections.get()), (1, 1));
+        }
     }
 
     fn finish_transition_fixture(reply: codex::RuntimeTransitionReply, observations: Vec<Result<codex::RuntimePairStatus, String>>,

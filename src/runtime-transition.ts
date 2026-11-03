@@ -4,7 +4,7 @@ type Preview = {
   pair: {
     cliVersion: string | null; selectedServerExecutable: string | null; selectedServerVersion: string | null;
     managedCliExecutable: string | null; managedVersion: string | null; runningVersion: string | null;
-    socketPath: string | null; state: 'matched' | 'mismatch' | 'stopped' | 'embedded' | 'unavailable'; message: string | null;
+    socketPath: string | null; state: 'matched' | 'mismatch' | 'stopped' | 'embedded' | 'unconfirmed' | 'unavailable'; message: string | null;
   };
   canApply: boolean; reason: string | null; fingerprint: string; packageRoot: string | null;
 };
@@ -66,7 +66,7 @@ export function createRuntimeTransition(call: <T>(command: string, args?: Record
     cancel.disabled = blocked || !!pending;
     apply.disabled = blocked || !!pending || !canApply() || !acknowledge.checked;
     const status = pending ? pendingKind === 'apply' ? t('서버 전환과 새 버전 연결을 확인하는 중… 요청은 취소할 수 없습니다.', 'Transitioning and checking the new server connection… The request cannot be canceled.') : t('서버 버전을 확인하는 중…', 'Checking server versions…')
-      : state === 'ready' ? preview?.pair.state === 'matched' ? t('현재 서버와 선택한 버전이 일치합니다.', 'The current server matches the selected version.') : preview?.pair.state === 'embedded' ? t('이 CLI는 내장된 개별 서버를 사용합니다.', 'This CLI uses its built-in per-session server.') : preview?.pair.state === 'stopped' ? t('서버가 꺼져 있음', 'Server is stopped') : preview?.pair.state === 'mismatch' ? t('현재 서버와 선택한 버전이 다릅니다. 작업 종료 후 확인이 필요합니다.', 'The current server differs from the selected version. Confirm after work finishes.') : t('현재 서버 버전을 확인하지 못했습니다.', 'The current server version could not be verified.')
+      : state === 'ready' ? preview?.pair.state === 'matched' ? t('현재 서버와 선택한 버전이 일치합니다.', 'The current server matches the selected version.') : preview?.pair.state === 'embedded' ? t('이 CLI는 내장된 개별 서버를 사용합니다.', 'This CLI uses its built-in per-session server.') : preview?.pair.state === 'stopped' ? t('서버가 꺼져 있음', 'Server is stopped') : preview?.pair.state === 'mismatch' ? t('현재 서버와 선택한 버전이 다릅니다. 작업 종료 후 확인이 필요합니다.', 'The current server differs from the selected version. Confirm after work finishes.') : preview?.pair.state === 'unconfirmed' ? t('현재 서버 연결 상태를 확인하지 못했습니다. 서버 버전을 다시 확인하세요.', 'The current server connection could not be confirmed. Check server versions again.') : t('현재 서버 버전을 확인하지 못했습니다.', 'The current server version could not be verified.')
       : state === 'updated' ? t('서버 전환과 새 버전 연결 검사가 완료되었습니다.', 'Server transition and the new version connection check are complete.')
       : state === 'failed' ? t('서버 버전 확인 또는 전환에 실패했습니다. 현재 상태는 미확인입니다. 다시 조회하세요.', 'Server version checking or transition failed. The current state is unknown. Check again.')
       : state === 'unknown' ? t('서버 전환 결과가 미확인입니다. 성공으로 간주하지 않으며 자동으로 다시 시도하지 않습니다. 현재 버전을 다시 조회하세요.', 'The server transition result is unknown. It is not treated as success and will not be retried automatically. Check the current versions again.')
@@ -95,16 +95,17 @@ export function createRuntimeTransition(call: <T>(command: string, args?: Record
     pending = operation; pendingKind = kind; render(); onPendingChange();
     void operation.finally(() => { if (pending === operation) { pending = undefined; pendingKind = undefined; } render(); onPendingChange(); });
   }
-  refresh.onclick = () => {
+  function check() {
     if (blocked || pending) return;
     confirming = false; acknowledge.checked = false; preview = undefined; message = ''; state = 'loading';
     execute<Preview>('preview', 'runtime_transition_preview', undefined, value => {
-      if (!value?.pair || !['matched', 'mismatch', 'stopped', 'embedded', 'unavailable'].includes(value.pair.state) || typeof value.canApply !== 'boolean'
+      if (!value?.pair || !['matched', 'mismatch', 'stopped', 'embedded', 'unconfirmed', 'unavailable'].includes(value.pair.state) || typeof value.canApply !== 'boolean'
         || typeof value.fingerprint !== 'string' || value.canApply && !value.fingerprint.trim() || value.fingerprint.length > 8192
         || ![value.reason, value.packageRoot, value.pair.cliVersion, value.pair.selectedServerExecutable, value.pair.selectedServerVersion, value.pair.managedCliExecutable, value.pair.managedVersion, value.pair.runningVersion, value.pair.socketPath, value.pair.message].every(nullableText)) throw new Error(t('서버 버전 응답 형식이 올바르지 않습니다.', 'Invalid server version response.'));
       preview = value; state = 'ready'; message = [...new Set([value.reason, value.pair.message].filter(Boolean))].join('\n');
     });
-  };
+  }
+  refresh.onclick = check;
   align.onclick = () => {
     if (blocked || pending || !canApply()) return;
     confirming = true; acknowledge.checked = false; render(); acknowledge.focus();
@@ -125,6 +126,7 @@ export function createRuntimeTransition(call: <T>(command: string, args?: Record
   onLanguageChange(render); render();
   return {
     element,
+    check,
     get pending() { return !!pending; },
     async whenIdle() { await pending; },
     setBlocked(value: boolean) { blocked = value; render(); },
