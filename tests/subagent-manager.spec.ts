@@ -207,6 +207,63 @@ test('종료는 두 단계 확인하고 취소·선택 변경은 확인을 해�
   expect((await mutations(page))[1].request).toMatchObject({ type: 'resume', agentId: 'agent-2' });
 });
 
+test('5초 자동 새로고침은 같은 실행 대상의 종료 확인을 보존하고 조회 중에는 확정을 막는다', async ({ page }) => {
+  await fixture(page);
+  await page.locator('.subagent-end').click();
+  await expect(page.locator('.subagent-confirm')).toBeVisible();
+  await page.evaluate(() => { (window as any).subagentFixture.holdRead = true; });
+  await page.clock.fastForward(5001);
+  await expect(page.locator('#subagents-dialog')).toHaveAttribute('aria-busy', 'true');
+  await expect(page.locator('.subagent-confirm')).toBeVisible();
+  await expect(page.locator('.subagent-confirm-end')).toBeDisabled();
+  await page.evaluate(() => (window as any).subagentFixture.releaseRead());
+  await expect(page.locator('#subagents-dialog')).toHaveAttribute('aria-busy', 'false');
+  expect(await page.evaluate(() => (window as any).subagentFixture.calls.length)).toBe(2);
+  await expect(page.locator('.subagent-confirm')).toBeVisible();
+  await expect(page.locator('.subagent-confirm-end')).toBeEnabled();
+  expect(await mutations(page)).toEqual([]);
+  await page.locator('.subagent-confirm-end').click();
+  await expect.poll(async () => (await mutations(page)).length).toBe(1);
+  expect((await mutations(page))[0].request).toMatchObject({ type: 'close', agentId: 'agent-1',
+    expectedParentRuntimeId: '11111111-1111-4111-8111-111111111111', expectedRuntimeId: '22222222-2222-4222-8222-000000000001' });
+});
+
+for (const change of ['parentRuntime', 'childRuntime', 'closeCapability', 'disconnected', 'unsupported', 'readFailure', 'unknown', 'removedAgent', 'sessionGeneration']) {
+  test(`종료 확인은 안전 조건 변경으로 철회한다: ${change}`, async ({ page }) => {
+    await fixture(page, { count: 2 });
+    await page.locator('.subagent-end').click();
+    await expect(page.locator('.subagent-confirm')).toBeVisible();
+    await page.evaluate(change => {
+      const state = window as any; const data = state.subagentFixture;
+      data.originalSnapshot = structuredClone(data.snapshot);
+      switch (change) {
+        case 'parentRuntime': data.snapshot.parentRuntimeId = '33333333-3333-4333-8333-333333333333'; break;
+        case 'childRuntime': data.snapshot.agents[0].runtimeId = '33333333-3333-4333-8333-333333333333'; break;
+        case 'closeCapability': data.snapshot.agents[0].capabilities.close = false; break;
+        case 'disconnected': data.snapshot.connected = false; break;
+        case 'unsupported': data.snapshot.supported = false; break;
+        case 'readFailure': data.failRead = true; break;
+        case 'unknown': data.snapshot.mutationState = 'unknown'; break;
+        case 'removedAgent': data.snapshot.agents.shift(); break;
+        case 'sessionGeneration': state.subagentManager.updateSessions([{ ...data.session, generation: data.session.generation + 1 }]); break;
+      }
+    }, change);
+    if (change !== 'sessionGeneration') await refresh(page);
+    await expect(page.locator('.subagent-confirm')).toBeHidden();
+    await page.locator('.subagent-confirm-end').evaluate(button => button.dispatchEvent(new MouseEvent('click', { bubbles: true })));
+    expect(await mutations(page)).toEqual([]);
+    await page.evaluate(() => {
+      const data = (window as any).subagentFixture;
+      data.failRead = false; data.snapshot = data.originalSnapshot; data.snapshot.mutationState = 'clear';
+    });
+    if (change !== 'sessionGeneration') {
+      await refresh(page);
+      await expect(page.locator('.subagent-confirm')).toBeHidden();
+      expect(await mutations(page)).toEqual([]);
+    }
+  });
+}
+
 test('확정 미적용 응답은 초안을 보존하고 clear 목록 뒤 같은 세션의 새 요청을 허용한다', async ({ page }) => {
   await fixture(page);
   await page.evaluate(() => { (window as any).subagentFixture.reply = 'notApplied'; });

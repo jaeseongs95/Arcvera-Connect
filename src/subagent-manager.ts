@@ -131,18 +131,23 @@ export function createSubagentManager(host: Host) {
     return track(version, async () => {
       if (!live(version)) return;
       try {
+        const confirmedAgent = confirming && fresh ? currentAgent() : undefined;
+        const confirmedParentRuntimeId = parentRuntimeId;
         const value = await rpc<List>(session, { type: 'list', cursor: targetCursor }); if (!live(version)) return;
         validate(value); supported = value.supported; connected = value.connected; fresh = supported && connected;
-        if (!fresh) remoteUnknown = false;
+        if (!fresh) { remoteUnknown = false; confirming = false; }
         if (fresh) {
           if (value.mutationState === 'unknown') remoteUnknown = true;
           else if (value.mutationState === 'clear') remoteUnknown = false;
           parentRuntimeId = value.parentRuntimeId ?? undefined;
           agents = value.agents.slice(0, LIMIT).filter(agent => agent.parentThreadId === session.threadId).map(agent => ({ id: agent.id, parentThreadId: agent.parentThreadId, runtimeId: agent.runtimeId, nickname: agent.nickname, role: agent.role, status: agent.status, model: agent.model, effort: agent.effort, activeTurnId: agent.activeTurnId, capabilities: { send: agent.capabilities.send, interrupt: agent.capabilities.interrupt, close: agent.capabilities.close, resume: agent.capabilities.resume } }));
-          cursor = targetCursor; page = targetPage; nextCursor = value.nextCursor || null; overflow = value.agents.length > LIMIT; knownList = true; confirming = false;
+          cursor = targetCursor; page = targetPage; nextCursor = value.nextCursor || null; overflow = value.agents.length > LIMIT; knownList = true;
           if (!agents.some(agent => agent.id === agentId)) agentId = agents[0]?.id;
           const pending = unresolved.get(key(session));
           if (pending && value.parentRuntimeId === pending.expectedParentRuntimeId && value.mutationState === 'clear' && value.reconciledRequestId === pending.requestId) unresolved.delete(key(session));
+          const agent = currentAgent();
+          confirming = confirming && !!confirmedAgent && !!agent && confirmedAgent.id === agent.id && confirmedParentRuntimeId === parentRuntimeId
+            && confirmedAgent.runtimeId === agent.runtimeId && agent.capabilities.close && !uncertain() && !remoteUnknown;
         }
         $('.subagent-error').hidden = true;
         if (!supported) status('연결된 서버에서 이 기능을 지원하지 않습니다. 호환 CLI·서버로 업데이트한 뒤 세션을 다시 연결하세요.', 'The connected server does not support this feature. Update to a compatible CLI and server, then reconnect the session.');
@@ -150,7 +155,7 @@ export function createSubagentManager(host: Host) {
         else status('하위 에이전트 목록을 확인했습니다.', 'Subagent list confirmed.');
         render();
       } catch {
-        if (live(version)) { fresh = false; remoteUnknown = false; error('목록을 불러오지 못했습니다. 연결을 확인하고 새로고침하세요. 마지막 목록과 초안은 보존합니다.', 'Could not load subagents. Check the connection and refresh. The last list and draft are preserved.'); controls(); }
+        if (live(version)) { fresh = false; remoteUnknown = false; confirming = false; error('목록을 불러오지 못했습니다. 연결을 확인하고 새로고침하세요. 마지막 목록과 초안은 보존합니다.', 'Could not load subagents. Check the connection and refresh. The last list and draft are preserved.'); controls(); }
       }
     }, true);
   }
