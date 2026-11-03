@@ -280,6 +280,9 @@ class UsageFixture {
    Console.Write("Usage: fixture app-server [OPTIONS] [COMMAND]\n\n" + (mode == "legacy" ? "Commands:\n  help  Print help\n\n" : "Commands:\n  daemon  Manage daemon\n  proxy  Relay\n\n") + "Options:\n  -h, --help\n          Print help\n");
    return 0;
   }
+  if (args.Length == 4 && args[0] == "app-server" && args[1] == "daemon" && args[2] == "start" && args[3] == "--help") {
+   Console.Write("Usage: fixture app-server daemon start [OPTIONS]\n\nOptions:\n      --existing-installation\n          Preserve existing installation\n  -h, --help\n          Print help\n"); return 0;
+  }
   if (args.Length == 3 && args[0] == "app-server" && args[1] == "daemon" && args[2] == "version") {
    if (mode == "version-stall") Thread.Sleep(30000);
    Console.Error.Write("fixture shared server is unavailable"); return 23;
@@ -304,9 +307,9 @@ class UsageFixture {
             let timeout = if mode.ends_with("stall") { Duration::from_millis(500) } else { Duration::from_secs(5) };
             let error = read_existing(&exe, &root, started + timeout).unwrap_err();
             let calls = fs::read_to_string(root.join("calls")).unwrap();
-            let expected = if mode == "legacy" || mode == "help-stall" { "app-server --help\n" } else { "app-server --help\napp-server daemon version\n" };
+            let expected = if mode == "legacy" || mode == "help-stall" { "app-server --help\n" } else { "app-server --help\napp-server daemon start --help\napp-server daemon version\n" };
             assert_eq!(calls, expected, "{mode}: 새 backend·proxy fallback을 실행하면 안 된다");
-            assert!(!calls.contains("--listen") && !calls.contains("daemon start"));
+            assert!(!calls.contains("--listen") && !calls.lines().any(|line| line.starts_with("app-server daemon start") && line != "app-server daemon start --help"));
             if mode == "legacy" { assert!(error.contains("기존 공유 연결"), "{error}"); }
             else if mode == "offline" { assert!(error.contains("23"), "{error}"); }
             else {
