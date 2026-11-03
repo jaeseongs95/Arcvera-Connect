@@ -26,9 +26,9 @@ fn startup_commands_case(replies: Vec<Result<Vec<u8>, String>>, started: Result<
 #[test]
 fn startup_reuses_running_server_without_install_or_start_and_keeps_legacy_path() {
     let socket = env::current_dir().unwrap().join("startup-fixture.sock").to_str().unwrap().to_owned();
-    let (result, calls) = startup_commands_case(vec![Ok(startup_help()), Ok(startup_status("running", &socket))], Err("시작 금지".into()));
+    let (result, calls) = startup_commands_case(vec![Ok(startup_help()), Ok(startup_start_help()), Ok(startup_status("running", &socket))], Err("시작 금지".into()));
     assert_eq!(result.unwrap().unwrap()["status"], "running");
-    assert_eq!(calls, ["app-server --help", "app-server daemon version"]);
+    assert_eq!(calls, ["app-server --help", "app-server daemon start --help", "app-server daemon version"]);
     let legacy = b"Usage: fixture app-server [OPTIONS]\n\nOptions:\n  -h, --help\n          Print help\n".to_vec();
     let (result, calls) = startup_commands_case(vec![Ok(legacy)], Err("시작 금지".into()));
     assert!(result.unwrap().is_none());
@@ -42,34 +42,39 @@ fn startup_reuses_different_server_version_without_version_equality_gate() {
     let socket = env::current_dir().unwrap().join("startup-fixture.sock");
     let running = json!({"status":"running","socketPath":socket,
         "cliVersion":"0.0.0-r35","managedCodexVersion":"0.0.0-r34","appServerVersion":"0.0.0-r33"});
-    let (result, calls) = startup_commands_case(vec![Ok(startup_help()), Ok(serde_json::to_vec(&running).unwrap())], Err("시작 금지".into()));
+    let (result, calls) = startup_commands_case(vec![Ok(startup_help()), Ok(startup_start_help()), Ok(serde_json::to_vec(&running).unwrap())], Err("시작 금지".into()));
     assert_eq!(result.unwrap().unwrap(), running);
-    assert_eq!(calls, ["app-server --help", "app-server daemon version"]);
+    assert_eq!(calls, ["app-server --help", "app-server daemon start --help", "app-server daemon version"]);
 }
 #[test]
 fn startup_starts_installed_server_once_then_verifies_ready_for_both_start_results() {
     let socket = env::current_dir().unwrap().join("startup-fixture.sock").to_str().unwrap().to_owned();
     for status in ["started", "alreadyRunning"] {
         let (result, calls) = startup_commands_case(
-            vec![Ok(startup_help()), Err("연결 없음".into()), Ok(startup_start_help()),
+            vec![Ok(startup_help()), Ok(startup_start_help()), Err("연결 없음".into()),
                 Ok(startup_installation("stopped", json!("existing-version"), Value::Null)), Ok(startup_status("running", &socket))],
             Ok(startup_status(status, &socket)),
         );
         assert!(result.unwrap().is_some());
-        assert_eq!(calls, ["app-server --help", "app-server daemon version", "app-server daemon start --help", "app-server daemon status --json", "start --existing-installation", "app-server daemon version"]);
+        assert_eq!(calls, ["app-server --help", "app-server daemon start --help", "app-server daemon version", "app-server daemon status --json", "start --existing-installation", "app-server daemon version"]);
     }
 }
 #[test]
-fn startup_uses_default_start_when_preserving_option_is_not_declared() {
-    let socket = env::current_dir().unwrap().join("startup-fixture.sock").to_str().unwrap().to_owned();
+fn startup_uses_existing_embedded_path_when_preserving_option_is_not_declared() {
     for help in [
         b"Usage: fixture app-server daemon start [OPTIONS]\n\nOptions:\n  -h, --help\n          Use --existing-installation if available\n".to_vec(),
         b"Usage: fixture app-server daemon start [OPTIONS]\n\nOptions:\n      --existing-installation-extra\n  -h, --help\n          Print help\n".to_vec(),
     ] {
-        let (result, calls) = startup_commands_case(vec![Ok(startup_help()), Err("연결 없음".into()), Ok(help),
-            Ok(startup_status("running", &socket))], Ok(startup_status("started", &socket)));
-        assert!(result.unwrap().is_some());
-        assert_eq!(calls, ["app-server --help", "app-server daemon version", "app-server daemon start --help", "start", "app-server daemon version"]);
+        let mut replies = std::collections::VecDeque::from([Ok(startup_help()), Ok(help)]);
+        let mut calls = Vec::new();
+        let result = prepare_runtime_commands(
+            |args| { calls.push(args.join(" ")); replies.pop_front().expect("version·상태 조회 금지") },
+            |_| panic!("보존 미지원 CLI의 daemon start 금지"),
+            |_| panic!("보존 미지원 CLI의 metadata 조회 금지"),
+        );
+        assert!(result.unwrap().is_none());
+        assert!(replies.is_empty());
+        assert_eq!(calls, ["app-server --help", "app-server daemon start --help"]);
     }
 }
 #[test]
@@ -82,10 +87,10 @@ fn startup_confirmed_missing_package_uses_default_start() {
         let name = if cfg!(windows) { "codex.exe" } else { "codex" };
         let passive = json!({"status":"stopped","managedCodexVersion":null,"appServerVersion":null,
             "socketPath":socket,"managedCodexPath":home.join(relative).join(name)});
-        let (result, calls) = startup_commands_case(vec![Ok(startup_help()), Err("연결 없음".into()), Ok(startup_start_help()),
+        let (result, calls) = startup_commands_case(vec![Ok(startup_help()), Ok(startup_start_help()), Err("연결 없음".into()),
             Ok(serde_json::to_vec(&passive).unwrap()), Ok(startup_status("running", &socket))], Ok(startup_status("started", &socket)));
         assert!(result.unwrap().is_some());
-        assert_eq!(calls, ["app-server --help", "app-server daemon version", "app-server daemon start --help", "app-server daemon status --json", "start", "app-server daemon version"]);
+        assert_eq!(calls, ["app-server --help", "app-server daemon start --help", "app-server daemon version", "app-server daemon status --json", "start", "app-server daemon version"]);
     }
     fs::remove_dir(&home).unwrap();
 }
@@ -115,7 +120,7 @@ fn startup_preserves_existing_selection_recovery_and_installation_markers() {
         let name = if cfg!(windows) { "codex.exe" } else { "codex" };
         let passive = json!({"status":"stopped","managedCodexVersion":null,"appServerVersion":null,
             "socketPath":socket,"managedCodexPath":home.join("packages/app-server-daemon/current/bin").join(name)});
-        let (result, calls) = startup_commands_case(vec![Ok(startup_help()), Err("연결 없음".into()), Ok(startup_start_help()),
+        let (result, calls) = startup_commands_case(vec![Ok(startup_help()), Ok(startup_start_help()), Err("연결 없음".into()),
             Ok(serde_json::to_vec(&passive).unwrap())], Err("선택한 CLI의 설치 오류 원문".into()));
         assert!(result.unwrap_err().contains("선택한 CLI의 설치 오류 원문"));
         assert_eq!(calls.last().unwrap(), "start --existing-installation");
@@ -131,8 +136,8 @@ fn startup_metadata_observation_failure_keeps_preserving_start_and_cli_error() {
     let passive = json!({"status":"stopped","managedCodexVersion":null,"appServerVersion":null,
         "socketPath":home.join("app-server-control/app-server-control.sock"),
         "managedCodexPath":home.join("packages/app-server-daemon/current/bin").join(name)});
-    let mut replies = std::collections::VecDeque::from([Ok(startup_help()), Err("연결 없음".into()),
-        Ok(startup_start_help()), Ok(serde_json::to_vec(&passive).unwrap())]);
+    let mut replies = std::collections::VecDeque::from([Ok(startup_help()), Ok(startup_start_help()),
+        Err("연결 없음".into()), Ok(serde_json::to_vec(&passive).unwrap())]);
     let mut observations = 0;
     let result = prepare_runtime_commands(
         |_| replies.pop_front().expect("추가 조회 금지"),
@@ -167,7 +172,7 @@ fn startup_preserves_installation_when_status_query_is_unavailable_or_incomplete
         Ok(startup_installation("unknown", Value::Null, Value::Null)),
         Ok(serde_json::to_vec(&json!({"status":"unknown","managedCodexVersion":null,"appServerVersion":null,
             "reason":"selectedVersionObservationFailed: Access denied"})).unwrap())] {
-        let (result, calls) = startup_commands_case(vec![Ok(startup_help()), Err("연결 없음".into()), Ok(startup_start_help()), passive,
+        let (result, calls) = startup_commands_case(vec![Ok(startup_help()), Ok(startup_start_help()), Err("연결 없음".into()), passive,
             Ok(startup_status("running", &socket))], Ok(startup_status("started", &socket)));
         assert!(result.unwrap().is_some());
         assert!(calls.iter().any(|call| call == "start --existing-installation"));
@@ -175,30 +180,48 @@ fn startup_preserves_installation_when_status_query_is_unavailable_or_incomplete
 }
 #[test]
 fn startup_rejects_malformed_start_help_and_passive_status_without_starting() {
-    let (result, calls) = startup_commands_case(vec![Ok(startup_help()), Err("연결 없음".into()), Ok(b"invalid help".to_vec())], Err("시작 금지".into()));
-    assert!(result.is_err());
-    assert_eq!(calls.len(), 3);
+    for help in [Err("start help: Access denied".into()), Ok(b"invalid help".to_vec()), Ok(vec![0xff])] {
+        let execution_error = help.as_ref().err().cloned();
+        let (result, calls) = startup_commands_case(vec![Ok(startup_help()), help], Err("시작 금지".into()));
+        let error = result.unwrap_err();
+        if let Some(original) = execution_error { assert!(error.contains(&original)); }
+        assert_eq!(calls, ["app-server --help", "app-server daemon start --help"]);
+    }
     for passive in [b"invalid json".to_vec(), br#"{"status":false}"#.to_vec(),
         startup_installation("stopped", json!(42), Value::Null), startup_installation("unknown", Value::Null, json!(false))] {
-        let (result, calls) = startup_commands_case(vec![Ok(startup_help()), Err("연결 없음".into()), Ok(startup_start_help()), Ok(passive)], Err("시작 금지".into()));
+        let (result, calls) = startup_commands_case(vec![Ok(startup_help()), Ok(startup_start_help()), Err("연결 없음".into()), Ok(passive)], Err("시작 금지".into()));
         assert!(result.is_err());
         assert_eq!(calls.len(), 4);
     }
 }
 #[test]
+fn shared_management_selection_preserves_app_server_help_execution_and_protocol_errors() {
+    for reply in [Err("app-server help: Access denied".into()), Ok(b"invalid help".to_vec()), Ok(vec![0xff])] {
+        let execution_error = reply.as_ref().err().cloned();
+        let mut reply = Some(reply);
+        let mut calls = Vec::new();
+        let error = supports_shared_management(|args| {
+            calls.push(args.join(" "));
+            reply.take().expect("도움말 오류 뒤 추가 조회 금지")
+        }).unwrap_err();
+        if let Some(original) = execution_error { assert!(error.contains(&original)); }
+        assert_eq!(calls, ["app-server --help"]);
+    }
+}
+#[test]
 fn startup_never_retries_failed_start_and_rejects_unverified_readiness() {
     let socket = env::current_dir().unwrap().join("startup-fixture.sock").to_str().unwrap().to_owned();
-    let (result, calls) = startup_commands_case(vec![Ok(startup_help()), Err("연결 없음".into()), Ok(startup_start_help()), Err("조회 미지원".into())], Err("실행 거절".into()));
+    let (result, calls) = startup_commands_case(vec![Ok(startup_help()), Ok(startup_start_help()), Err("연결 없음".into()), Err("조회 미지원".into())], Err("실행 거절".into()));
     assert!(result.unwrap_err().contains("실행 거절"));
     assert_eq!(calls.iter().filter(|call| call.as_str() == "start --existing-installation").count(), 1);
     for ready in [Err("준비 시간 초과".into()), Ok(startup_status("notRunning", &socket)), Ok(startup_status("running", &(socket.clone()+"-other")))] {
-        let (result, _) = startup_commands_case(vec![Ok(startup_help()), Err("연결 없음".into()), Ok(startup_start_help()), Err("조회 미지원".into()), ready], Ok(startup_status("started", &socket)));
+        let (result, _) = startup_commands_case(vec![Ok(startup_help()), Ok(startup_start_help()), Err("연결 없음".into()), Err("조회 미지원".into()), ready], Ok(startup_status("started", &socket)));
         assert!(result.is_err());
     }
     for reply in [b"bad json".to_vec(), startup_status("stopped", &socket), startup_status("running", "relative")] {
-        let (result, calls) = startup_commands_case(vec![Ok(startup_help()), Ok(reply)], Err("시작 금지".into()));
+        let (result, calls) = startup_commands_case(vec![Ok(startup_help()), Ok(startup_start_help()), Ok(reply)], Err("시작 금지".into()));
         assert!(result.is_err());
-        assert_eq!(calls.len(), 2, "성공 코드의 잘못된 상태를 시작 허가로 바꾸면 안 된다");
+        assert_eq!(calls.len(), 3, "성공 코드의 잘못된 상태를 시작 허가로 바꾸면 안 된다");
     }
 }
 #[test]

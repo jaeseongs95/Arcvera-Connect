@@ -36,8 +36,7 @@ fn prepare_runtime_commands(
     start: impl FnOnce(bool) -> Result<Vec<u8>, String>,
     mut metadata: impl FnMut(&Path) -> std::io::Result<fs::Metadata>,
 ) -> Result<Option<Value>, String> {
-    let help = query(&["app-server", "--help"])?;
-    if !supports_shared(&help)? { return Ok(None); }
+    if !supports_shared_management(&mut query)? { return Ok(None); }
     let version = ["app-server", "daemon", "version"];
     match query(&version) {
         Ok(bytes) => {
@@ -45,29 +44,24 @@ fn prepare_runtime_commands(
             lifecycle_socket(&value)?;
             Ok(Some(value))
         }
-        Err(probe) => {
-            let help = query(&["app-server", "daemon", "start", "--help"])
-                .map_err(|error| format!("공유 서버 시작 지원을 확인하지 못했습니다: {error}; 실행 상태 확인: {probe}"))?;
-            let mut preserve = help_supports_option(&help, "--existing-installation")
-                .map_err(|error| format!("공유 서버 시작 도움말을 확인하지 못했습니다: {error}"))?;
-            if preserve {
-                // 명시 미설치만 CLI의 기본 시작에 맡긴다. 조회 실패·불확실한 설치는
-                // 보존 옵션을 유지하며 버전이나 오류 문구로 설치 상태를 추정하지 않는다.
-                if let Ok(bytes) = query(&["app-server", "daemon", "status", "--json"]) {
-                    let value = lifecycle_value(&bytes).map_err(|error| format!("공유 서버 상태 조회 실패: {error}"))?;
-                    if !matches!(value["status"].as_str(), Some("running" | "stopped" | "unknown")) {
-                        return Err("공유 서버 상태 조회의 실행 상태 형식이 올바르지 않습니다.".into());
-                    }
-                    for key in ["managedCodexVersion", "appServerVersion"] {
-                        if value.get(key).is_some_and(|v| !v.is_null() && !v.as_str().is_some_and(|s| !s.is_empty())) {
-                            return Err(format!("공유 서버 상태 조회의 {key} 형식이 올바르지 않습니다."));
-                        }
-                    }
-                    preserve = !(value["status"] == "stopped"
-                        && value.get("managedCodexVersion") == Some(&Value::Null)
-                        && value.get("appServerVersion") == Some(&Value::Null)
-                        && first_installation(&value, &mut metadata));
+        Err(_) => {
+            let mut preserve = true;
+            // 명시 미설치만 CLI의 기본 시작에 맡긴다. 조회 실패·불확실한 설치는
+            // 보존 옵션을 유지하며 버전이나 오류 문구로 설치 상태를 추정하지 않는다.
+            if let Ok(bytes) = query(&["app-server", "daemon", "status", "--json"]) {
+                let value = lifecycle_value(&bytes).map_err(|error| format!("공유 서버 상태 조회 실패: {error}"))?;
+                if !matches!(value["status"].as_str(), Some("running" | "stopped" | "unknown")) {
+                    return Err("공유 서버 상태 조회의 실행 상태 형식이 올바르지 않습니다.".into());
                 }
+                for key in ["managedCodexVersion", "appServerVersion"] {
+                    if value.get(key).is_some_and(|v| !v.is_null() && !v.as_str().is_some_and(|s| !s.is_empty())) {
+                        return Err(format!("공유 서버 상태 조회의 {key} 형식이 올바르지 않습니다."));
+                    }
+                }
+                preserve = !(value["status"] == "stopped"
+                    && value.get("managedCodexVersion") == Some(&Value::Null)
+                    && value.get("appServerVersion") == Some(&Value::Null)
+                    && first_installation(&value, &mut metadata));
             }
             let started = lifecycle_value(&start(preserve).map_err(|error| format!("공유 서버 시작 실패: {error}"))?)?;
             if !matches!(started["status"].as_str(), Some("started" | "alreadyRunning")) {
@@ -84,6 +78,15 @@ fn prepare_runtime_commands(
             Ok(Some(ready))
         }
     }
+}
+// 서버 관리의 보존 기능이 명시된 CLI만 공유 연결을 선택한다. 정상적인 미지원
+// 선언은 기존 개별 서버 경로를 쓰고, 실행·도움말 오류는 대체 경로로 숨기지 않는다.
+fn supports_shared_management(mut query: impl FnMut(&[&str]) -> Result<Vec<u8>, String>) -> Result<bool, String> {
+    if !supports_shared(&query(&["app-server", "--help"])?)? { return Ok(false); }
+    let help = query(&["app-server", "daemon", "start", "--help"])
+        .map_err(|error| format!("공유 서버 시작 지원을 확인하지 못했습니다: {error}"))?;
+    help_supports_option(&help, "--existing-installation")
+        .map_err(|error| format!("공유 서버 시작 도움말을 확인하지 못했습니다: {error}"))
 }
 fn first_installation(value: &Value, mut metadata: impl FnMut(&Path) -> std::io::Result<fs::Metadata>) -> bool {
     let path = |key| value.get(key).and_then(Value::as_str).filter(|text| !text.chars().any(char::is_control))
@@ -139,11 +142,11 @@ impl SharedEndpoint {
     pub(super) fn existing(exe: &OsString, cwd: &Path, cancelled: Option<&Arc<AtomicBool>>) -> Result<Option<Self>, String> {
         // 정상 도움말에서 명시 미지원이 확인된 구형 CLI만 개별 서버를 사용한다.
         // 실행·권한·프로토콜 오류를 미지원으로 삼켜 다른 서버로 대체하지 않는다.
-        let help_args = ["app-server", "--help"].map(str::to_owned);
         let deadline = Instant::now() + HELP_TIMEOUT;
-        let help = extensions::command_stdout_until(exe, cwd, &help_args, deadline, cancelled)
-            .map_err(|e| format!("Codex 공유 연결 지원을 확인할 수 없습니다: {e}"))?;
-        if !supports_shared(&help)? { return Ok(None); }
+        if !supports_shared_management(|args| {
+            extensions::command_stdout_until(exe, cwd, &args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>(), deadline, cancelled)
+                .map_err(|e| format!("Codex 공유 연결 지원을 확인할 수 없습니다: {e}"))
+        })? { return Ok(None); }
         let args = ["app-server", "daemon", "version"].map(str::to_owned);
         let output = extensions::command_stdout_until(exe, cwd, &args, deadline, cancelled)
             .map_err(|e| format!("기존 공유 Codex 서버에 연결할 수 없습니다. Codex에서 공유 서버의 실행 상태와 권한을 확인한 뒤 다시 시도하세요. 서버를 자동으로 설치하거나 시작하지 않았습니다. 원인: {e}"))?;

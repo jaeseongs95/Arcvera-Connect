@@ -65,6 +65,9 @@ class StartupFixture {
    if (mode == "supported" || mode == "ko-supported") Console.Write("      --no-remote-control\n          Disable automatic remote-control startup\n");
    return 0;
   }
+  if (args.Length == 4 && args[0] == "app-server" && args[1] == "daemon" && args[2] == "start" && args[3] == "--help") {
+   Console.Write("Usage: fixture app-server daemon start [OPTIONS]\n\nOptions:\n      --existing-installation\n          Preserve installation\n  -h, --help\n          Print help\n"); return 0;
+  }
   File.WriteAllText(Path.Combine(root, "server.args"), String.Join("\n", args));
   File.WriteAllText(Path.Combine(root, "server.pid"), Process.GetCurrentProcess().Id.ToString());
   if (mode == "proxy-write-blocked") {
