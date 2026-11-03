@@ -930,10 +930,14 @@ impl Engine {
             && report.cli_version == report.selected_server_version
             && report.running_version.as_deref().is_none_or(|version| version == report.cli_version);
         if !matches!(report.state.as_str(), "matched" | "embedded") && !can_start_selected { return Err(Self::pair_error(&report)); }
+        let expected_state = if report.state == "embedded" { "embedded" } else { "matched" };
+        let expected_cli_version = report.cli_version;
+        let expected_server_version = report.selected_server_version;
         prepare()?;
         // A different client may replace the shared endpoint during preparation.
         let report = inspect()?;
-        if !matches!(report.state.as_str(), "matched" | "embedded") { return Err(Self::pair_error(&report)); }
+        if report.state != expected_state || report.cli_version != expected_cli_version
+            || report.selected_server_version != expected_server_version { return Err(Self::pair_error(&report)); }
         Ok(report)
     }
 
@@ -1341,7 +1345,7 @@ mod runtime_preparation_tests {
     fn unconfirmed_preparation_never_retries_and_rejects_unverified_post_start_status() {
         assert_eq!(Engine::prepare_pair_with(transition_pair("unconfirmed"), || Err("시작 실패".into()),
             || panic!("실패한 시작 뒤 재조회함")).unwrap_err(), "시작 실패");
-        for state in ["unconfirmed", "unavailable", "stopped", "mismatch"] {
+        for state in ["unconfirmed", "unavailable", "stopped", "mismatch", "embedded"] {
             let preparations = std::cell::Cell::new(0);
             let inspections = std::cell::Cell::new(0);
             let result = Engine::prepare_pair_with(transition_pair("unconfirmed"), || {
@@ -1354,6 +1358,13 @@ mod runtime_preparation_tests {
             assert!(result.is_err(), "실제 버전이 확인되지 않은 준비를 성공 처리함: {state}");
             assert_eq!((preparations.get(), inspections.get()), (1, 1));
         }
+        let mut changed = transition_pair("matched");
+        changed.cli_version = "0.166.0+native-r35.20261103".into();
+        changed.selected_server_version = changed.cli_version.clone();
+        changed.managed_version = Some(changed.cli_version.clone());
+        changed.running_version = Some(changed.cli_version.clone());
+        assert!(Engine::prepare_pair_with(transition_pair("unconfirmed"), || Ok(()), || Ok(changed)).is_err(),
+            "준비 중 전체 버전이 바뀐 서버로 복원함");
     }
 
     fn finish_transition_fixture(reply: codex::RuntimeTransitionReply, observations: Vec<Result<codex::RuntimePairStatus, String>>,
