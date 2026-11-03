@@ -72,9 +72,9 @@ fn startup_uses_default_start_when_preserving_option_is_not_declared() {
     }
 }
 #[test]
-fn startup_missing_package_uses_default_start_even_when_passive_state_is_unknown() {
+fn startup_confirmed_missing_package_uses_default_start() {
     let socket = env::current_dir().unwrap().join("startup-fixture.sock").to_str().unwrap().to_owned();
-    for state in ["stopped", "unknown"] {
+    for state in ["stopped"] {
         let (result, calls) = startup_commands_case(vec![Ok(startup_help()), Err("연결 없음".into()), Ok(startup_start_help()),
             Ok(startup_installation(state, Value::Null, Value::Null)), Ok(startup_status("running", &socket))], Ok(startup_status("started", &socket)));
         assert!(result.unwrap().is_some());
@@ -86,7 +86,10 @@ fn startup_preserves_installation_when_status_query_is_unavailable_or_incomplete
     let socket = env::current_dir().unwrap().join("startup-fixture.sock").to_str().unwrap().to_owned();
     for passive in [Err("미지원 명령".into()), Ok(br#"{"status":"stopped"}"#.to_vec()),
         Ok(startup_installation("unknown", json!("installed"), Value::Null)),
-        Ok(startup_installation("unknown", Value::Null, json!("running-version")))] {
+        Ok(startup_installation("unknown", Value::Null, json!("running-version"))),
+        Ok(startup_installation("unknown", Value::Null, Value::Null)),
+        Ok(serde_json::to_vec(&json!({"status":"unknown","managedCodexVersion":null,"appServerVersion":null,
+            "reason":"selectedVersionObservationFailed: Access denied"})).unwrap())] {
         let (result, calls) = startup_commands_case(vec![Ok(startup_help()), Err("연결 없음".into()), Ok(startup_start_help()), passive,
             Ok(startup_status("running", &socket))], Ok(startup_status("started", &socket)));
         assert!(result.unwrap().is_some());

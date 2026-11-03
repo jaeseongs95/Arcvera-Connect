@@ -61,7 +61,8 @@ fn prepare_runtime_commands(
                             return Err(format!("공유 서버 상태 조회의 {key} 형식이 올바르지 않습니다."));
                         }
                     }
-                    preserve = !(value.get("managedCodexVersion") == Some(&Value::Null)
+                    preserve = !(value["status"] == "stopped"
+                        && value.get("managedCodexVersion") == Some(&Value::Null)
                         && value.get("appServerVersion") == Some(&Value::Null));
                 }
             }
