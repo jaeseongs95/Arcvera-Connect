@@ -3,8 +3,8 @@ use super::*;
 
 #[test]
 fn startup_capability_requires_an_exact_declared_option_in_recognized_help() {
-    for prefix in ["Usage:", "사용법:"] {
-        let normal = format!("Run the server\n\n{prefix} alternate-name app-server [OPTIONS] [COMMAND]\n\nOptions:\n  -h, --help\n          Print help\n      --listen <URI>\n          Server listener\n");
+    for (prefix, options) in [("Usage:", "Options:"), ("사용법:", "옵션:")] {
+        let normal = format!("Run the server\n\n{prefix} alternate-name app-server [OPTIONS] [COMMAND]\n\n{options}\n  -h, --help\n          Print help\n      --listen <URI>\n          Server listener\n");
         assert!(!help_supports_no_remote_control(normal.as_bytes()).unwrap(), "{prefix}");
         let supported = format!("{normal}      --no-remote-control\n          Disable automatic startup\n");
         assert!(help_supports_no_remote_control(supported.as_bytes()).unwrap(), "{prefix}");
@@ -15,9 +15,9 @@ fn startup_capability_requires_an_exact_declared_option_in_recognized_help() {
             "\nExamples:\n      --no-remote-control\n",
         ] { assert!(!help_supports_no_remote_control(format!("{normal}{suffix}").as_bytes()).unwrap(), "{prefix}: {suffix}"); }
         for malformed in [
-            format!("{prefix} alternate-name [OPTIONS]\nOptions:\n  -h, --help\n"),
-            format!("{prefix} alternate-name app-server-extra\nOptions:\n  -h, --help\n"),
-            format!("{prefix} alternate-name app-server\nOptions:\n      --no-remote-control\n"),
+            format!("{prefix} alternate-name [OPTIONS]\n{options}\n  -h, --help\n"),
+            format!("{prefix} alternate-name app-server-extra\n{options}\n  -h, --help\n"),
+            format!("{prefix} alternate-name app-server\n{options}\n      --no-remote-control\n"),
         ] { assert!(help_supports_no_remote_control(malformed.as_bytes()).is_err(), "{malformed}"); }
     }
     for malformed in ["", "--no-remote-control", "Example: alternate-name app-server\nOptions:\n  -h, --help\n"] {
@@ -34,6 +34,21 @@ fn enrollment_namespace_requires_a_declared_option_and_never_a_description() {
         assert!(!help_supports_option(format!("{base}{suffix}").as_bytes(), "--remote-control-client-name").unwrap());
     }
     assert!(help_supports_option(format!("{base}      --remote-control-client-name <NAME>\n          Enrollment namespace\n").as_bytes(), "--remote-control-client-name").unwrap());
+}
+
+#[test]
+fn startup_capabilities_accept_actual_r36_help_in_both_languages() {
+    for help in [
+        include_bytes!("../../tests/fixtures/opendiy-r36-app-server-help.ko.txt").as_slice(),
+        include_bytes!("../../tests/fixtures/opendiy-r36-app-server-help.en.txt").as_slice(),
+    ] {
+        assert!(help_supports_option(help, "--help").unwrap());
+        assert!(help_supports_option(help, "--no-remote-control").unwrap());
+        assert!(!help_supports_option(help, "--remote-control-client-name").unwrap());
+        assert!(shared::supports_shared(help).unwrap());
+        let crlf = std::str::from_utf8(help).unwrap().replace('\n', "\r\n");
+        assert!(help_supports_option(crlf.as_bytes(), "--no-remote-control").unwrap());
+    }
 }
 #[test]
 #[cfg(windows)]
@@ -61,7 +76,7 @@ class StartupFixture {
    if (mode == "overflow") { Console.Write(new string('x', 8 * 1024 * 1024 + 1024)); Console.Out.Flush(); Thread.Sleep(30000); return 0; }
    if (mode == "invalid-utf8") { Console.OpenStandardOutput().WriteByte(255); return 0; }
    if (mode == "malformed") { Console.Write("not a help document"); return 0; }
-   Console.Write((mode.StartsWith("ko-") ? "\uC0AC\uC6A9\uBC95:" : "Usage:") + " fixture app-server [OPTIONS] [COMMAND]\n\n" + (mode.StartsWith("shared-") ? "Commands:\n  daemon  Manage daemon\n  proxy  Relay\n\n" : "") + "Options:\n  -h, --help\n          Print help\n      --listen <URI>\n          Listener\n");
+    Console.Write((mode.StartsWith("ko-") ? "\uC0AC\uC6A9\uBC95:" : "Usage:") + " fixture app-server [OPTIONS] [COMMAND]\n\n" + (mode.StartsWith("shared-") ? "Commands:\n  daemon  Manage daemon\n  proxy  Relay\n\n" : "") + (mode.StartsWith("ko-") ? "\uC635\uC158:" : "Options:") + "\n  -h, --help\n          Print help\n      --listen <URI>\n          Listener\n");
    if (mode == "supported" || mode == "ko-supported") Console.Write("      --no-remote-control\n          Disable automatic remote-control startup\n");
    return 0;
   }

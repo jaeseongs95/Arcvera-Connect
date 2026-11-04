@@ -1,0 +1,48 @@
+codex-cli-app-server-daemon-update 
+데몬 패키지 업데이트(진행 중인 작업을 중단할 수 있음)
+
+사용법: codex app-server daemon update [OPTIONS]
+
+옵션:
+  -c, --config <key=value>
+          `~/.codex/config.toml`에서 읽을 설정값을 재정의합니다. 중첩 값은 점 경로(`foo.bar.baz`)를 사용합니다. `value` 부분은
+          TOML로 파싱하며 실패하면 원문 문자열을 리터럴로 사용합니다.
+          
+          예: - `-c model="o3"` - `-c 'sandbox_permissions=["disk-full-read-access"]'` - `-c
+          shell_environment_policy.inherit=all`
+
+      --from-cli
+          이 CLI 패키지 복사 및 고정
+          
+          가능한 값:
+            true
+            false
+
+      --enable <FEATURE>
+          기능 활성화(반복 가능). `-c features.<name>=true`와 동일
+
+  -y, --yes
+          대화형 확인 없이 데몬 패키지 교체 승인
+          
+          가능한 값:
+            true
+            false
+
+      --disable <FEATURE>
+          기능 비활성화(반복 가능). `-c features.<name>=false`와 동일
+
+      --no-force
+          강제 종료하지 않음. 중지가 확인되지 않으면 선택한 패키지를 유지하고 자동 재시도하지 않습니다
+          
+          가능한 값:
+            true
+            false
+
+      --desktop-cron-control <DESKTOP_CRON_CONTROL>
+          인증된 로컬 통로로 Desktop이 소유한 예약 제어를 켭니다
+          
+          가능한 값:
+            pipe-v1
+
+  -h, --help
+          도움말 표시(요약은 '-h')

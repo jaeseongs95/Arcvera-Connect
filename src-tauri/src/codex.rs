@@ -169,7 +169,7 @@ fn help_supports_option(bytes: &[u8], option: &str) -> Result<bool, String> {
     if !help.lines().any(|line| line.trim_start().strip_prefix("Usage:").or_else(|| line.trim_start().strip_prefix("사용법:")).is_some_and(|usage| usage.split_ascii_whitespace().any(|token| token == "app-server"))) {
         return Err("Codex returned unrecognized app-server help; startup capability is unknown".into());
     }
-    let options = help.lines().skip_while(|line| line.trim() != "Options:").skip(1)
+    let options = help.lines().skip_while(|line| !matches!(line.trim(), "Options:" | "옵션:")).skip(1)
         .take_while(|line| line.is_empty() || line.starts_with(char::is_whitespace));
     // Clap의 실제 long-option 열은 --help 선언에서 구한다. 더 들여쓴
     // 설명문이나 다른 섹션에 적힌 이름을 지원 옵션으로 오인하지 않는다.

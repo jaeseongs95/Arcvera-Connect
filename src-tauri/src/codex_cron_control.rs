@@ -27,7 +27,7 @@ fn help_supports_control(bytes: &[u8]) -> Result<bool, String> {
     if !help.lines().any(|line| line.trim_start().starts_with("Usage:") || line.trim_start().starts_with("사용법:")) {
         return Err("예약 제어의 전역 도움말 형식을 확인할 수 없습니다.".into());
     }
-    let options: Vec<_> = help.lines().skip_while(|line| line.trim() != "Options:").skip(1)
+    let options: Vec<_> = help.lines().skip_while(|line| !matches!(line.trim(), "Options:" | "옵션:")).skip(1)
         .take_while(|line| line.is_empty() || line.starts_with(char::is_whitespace)).collect();
     let column = options.iter().filter_map(|line| {
         if !line.trim_start().starts_with('-') { return None; }
@@ -42,10 +42,14 @@ fn help_supports_control(bytes: &[u8]) -> Result<bool, String> {
     let item = options[index..].iter().enumerate().take_while(|(offset,line)| *offset == 0
         || !(line.trim_start().starts_with('-') && line.get(column..).is_some_and(|tail| tail.starts_with("--"))))
         .map(|(_,line)| *line).collect::<Vec<_>>().join("\n");
-    let Some(values) = item.split("[possible values:").nth(1).and_then(|tail| tail.split(']').next()) else {
-        return Err("예약 제어 옵션의 정확한 허용 값을 확인할 수 없습니다.".into());
-    };
-    Ok(values.split(',').map(str::trim).eq(["pipe-v1"]))
+    if let Some(values) = item.split("[possible values:").nth(1).and_then(|tail| tail.split(']').next()) {
+        return Ok(values.split(',').map(str::trim).eq(["pipe-v1"]));
+    }
+    let mut lines = item.lines();
+    if lines.any(|line| line.trim() == "가능한 값:") {
+        return Ok(lines.map(str::trim).filter(|line| !line.is_empty()).eq(["pipe-v1"]));
+    }
+    Err("예약 제어 옵션의 정확한 허용 값을 확인할 수 없습니다.".into())
 }
 
 impl CronPreparation {
@@ -384,6 +388,15 @@ Options:
         }
         assert!(help_supports_control(help("      --desktop-cron-control <MODE>\n          설명 pipe-v1").as_bytes()).is_err());
         assert!(help_supports_control(b"failed").is_err());
+    }
+    #[test]
+    fn cron_control_accepts_actual_korean_help_without_relaxing_values() {
+        let help = include_str!("../../tests/fixtures/opendiy-r36-global-help.ko.txt");
+        assert!(help_supports_control(help.as_bytes()).unwrap());
+        assert!(help_supports_control(help.replace('\n', "\r\n").as_bytes()).unwrap());
+        assert!(!help_supports_control(help.replace("pipe-v1", "pipe-v10").as_bytes()).unwrap());
+        assert!(!help_supports_control(help.replace("--desktop-cron-control", "--desktop-cron-control-extra").as_bytes()).unwrap());
+        assert!(help_supports_control(help.replace("가능한 값:", "설명:").as_bytes()).is_err());
     }
     fn fixture() -> CronConnection {
         tauri::async_runtime::block_on(async {

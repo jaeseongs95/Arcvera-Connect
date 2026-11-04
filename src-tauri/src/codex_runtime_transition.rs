@@ -126,7 +126,7 @@ fn supports_safe_update(help: &[u8]) -> Result<bool, String> {
     let from_cli = help_supports_option(help, "--from-cli")?;
     let no_force = help_supports_option(help, "--no-force")?;
     let text = std::str::from_utf8(help).map_err(|_| "전환 도움말이 올바른 UTF-8이 아닙니다.")?;
-    let options = text.lines().skip_while(|line| line.trim() != "Options:").skip(1)
+    let options = text.lines().skip_while(|line| !matches!(line.trim(), "Options:" | "옵션:")).skip(1)
         .take_while(|line| line.is_empty() || line.starts_with(char::is_whitespace));
     let short_column = options.clone().filter(|line| line.trim_start().starts_with('-'))
         .map(|line| line.len() - line.trim_start().len()).min();
@@ -394,6 +394,15 @@ mod tests {
         assert!(!supports_safe_update(&help_without("  -y, --yes\n")).unwrap());
         let long_only = String::from_utf8(help()).unwrap().replace("  -y, --yes\n", "      --yes\n          description -y\n");
         assert!(!supports_safe_update(long_only.as_bytes()).unwrap());
+    }
+
+    #[test]
+    fn safe_update_accepts_actual_korean_help_with_exact_guards() {
+        let help = include_str!("../../tests/fixtures/opendiy-r36-update-help.ko.txt");
+        assert!(supports_safe_update(help.as_bytes()).unwrap());
+        assert!(supports_safe_update(help.replace('\n', "\r\n").as_bytes()).unwrap());
+        assert!(!supports_safe_update(help.replace("--no-force", "--no-force-other").as_bytes()).unwrap());
+        assert!(!supports_safe_update(help.replace("  -y, --yes", "      --yes").as_bytes()).unwrap());
     }
 
     #[test]
