@@ -281,11 +281,15 @@ class UsageFixture {
    return 0;
   }
   if (args.Length == 4 && args[0] == "app-server" && args[1] == "daemon" && args[2] == "start" && args[3] == "--help") {
-   Console.Write("Usage: fixture app-server daemon start [OPTIONS]\n\nOptions:\n      --existing-installation\n          Preserve existing installation\n  -h, --help\n          Print help\n"); return 0;
+   Console.Write("Usage: fixture app-server daemon start [OPTIONS]\n\nOptions:\n      --existing-installation\n          Preserve existing installation\n" + (mode == "guarded-offline" ? "      --first-installation\n          Guard first installation\n" : "") + "  -h, --help\n          Print help\n"); return 0;
   }
   if (args.Length == 3 && args[0] == "app-server" && args[1] == "daemon" && args[2] == "version") {
    if (mode == "version-stall") Thread.Sleep(30000);
    Console.Error.Write("fixture shared server is unavailable"); return 23;
+  }
+  if (args.Length == 4 && args[0] == "app-server" && args[1] == "daemon" && args[2] == "status" && args[3] == "--json") {
+   if (mode == "status-stall") Thread.Sleep(30000);
+   Console.Write("{\"status\":\"unknown\"}"); return 0;
   }
   return 99;
  }
@@ -299,7 +303,7 @@ class UsageFixture {
             .chain([compile.to_string_lossy().into_owned(), "-SourcePath".into(), source.to_string_lossy().into_owned(), "-DestinationPath".into(), fixture.to_string_lossy().into_owned()]).collect();
         extensions::command_stdout(&powershell, &root, &compile_args, Duration::from_secs(30)).unwrap();
         let exe = fixture.into_os_string();
-        for mode in ["legacy", "offline", "help-stall", "version-stall"] {
+        for mode in ["legacy", "offline", "guarded-offline", "help-stall", "version-stall", "status-stall"] {
             fs::write(root.join("mode"), mode).unwrap();
             fs::write(root.join("calls"), "").unwrap();
             fs::write(root.join("pids"), "").unwrap();
@@ -307,11 +311,13 @@ class UsageFixture {
             let timeout = if mode.ends_with("stall") { Duration::from_millis(500) } else { Duration::from_secs(5) };
             let error = read_existing(&exe, &root, started + timeout).unwrap_err();
             let calls = fs::read_to_string(root.join("calls")).unwrap();
-            let expected = if mode == "legacy" || mode == "help-stall" { "app-server --help\n" } else { "app-server --help\napp-server daemon start --help\napp-server daemon version\n" };
+            let expected = if mode == "legacy" || mode == "help-stall" { "app-server --help\n" }
+                else if mode == "offline" || mode == "status-stall" { "app-server --help\napp-server daemon start --help\napp-server daemon version\napp-server daemon status --json\n" }
+                else { "app-server --help\napp-server daemon start --help\napp-server daemon version\n" };
             assert_eq!(calls, expected, "{mode}: 새 backend·proxy fallback을 실행하면 안 된다");
             assert!(!calls.contains("--listen") && !calls.lines().any(|line| line.starts_with("app-server daemon start") && line != "app-server daemon start --help"));
             if mode == "legacy" { assert!(error.contains("기존 공유 연결"), "{error}"); }
-            else if mode == "offline" { assert!(error.contains("23"), "{error}"); }
+            else if mode == "offline" || mode == "guarded-offline" { assert!(error.contains("23"), "{error}"); }
             else {
                 assert!(error.contains("cancelled"), "{mode}: {error}");
                 assert!(started.elapsed() < Duration::from_secs(3), "전체 기한은 discovery부터 적용되어야 한다");
