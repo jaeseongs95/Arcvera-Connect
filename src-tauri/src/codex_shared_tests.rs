@@ -62,8 +62,8 @@ fn startup_starts_installed_server_once_then_verifies_ready_for_both_start_resul
 #[test]
 fn startup_rejects_missing_preserving_option_without_embedded_fallback() {
     for help in [
-        b"Usage: fixture app-server daemon start [OPTIONS]\n\nOptions:\n  -h, --help\n          Use --existing-installation if available\n".to_vec(),
-        b"Usage: fixture app-server daemon start [OPTIONS]\n\nOptions:\n      --existing-installation-extra\n  -h, --help\n          Print help\n".to_vec(),
+        b"Usage: fixture app-server daemon start [OPTIONS]\n\nOptions:\n      --first-installation\n          Guard first installation\n  -h, --help\n          Use --existing-installation if available\n".to_vec(),
+        b"Usage: fixture app-server daemon start [OPTIONS]\n\nOptions:\n      --first-installation\n          Guard first installation\n      --existing-installation-extra\n  -h, --help\n          Print help\n".to_vec(),
     ] {
         let mut replies = std::collections::VecDeque::from([Ok(startup_help()), Ok(help)]);
         let mut calls = Vec::new();
@@ -432,4 +432,17 @@ fn compatibility_reuses_only_live_same_executable_and_socket_declarations_withou
     let mut replaced = control.clone(); replaced.endpoint.stamp.modified = Some(SystemTime::UNIX_EPOCH);
     assert!(replaced.observed_capabilities(&exe).unwrap().is_none());
     fs::remove_file(&socket).unwrap(); fs::remove_dir(&directory).unwrap();
+}
+
+#[test]
+fn official_0166_real_help_selects_individual_server_without_daemon_queries() {
+    let app_help = include_bytes!("../../tests/fixtures/official-0.166.0-app-server-help.txt").to_vec();
+    let start_help = include_bytes!("../../tests/fixtures/official-0.166.0-daemon-start-help.txt").to_vec();
+    assert!(supports_shared(&app_help).unwrap(), "official CLI also declares daemon and proxy");
+    let (result, calls) = startup_commands_case(vec![Ok(app_help.clone()), Ok(start_help.clone())], Err("must not start daemon".into()));
+    assert!(result.unwrap().is_none());
+    assert_eq!(calls, ["app-server --help", "app-server daemon start --help"]);
+    let mut replies = std::collections::VecDeque::from([Ok(app_help), Ok(start_help)]);
+    assert!(existing_runtime_commands(|_| replies.pop_front().expect("no version or status query")).unwrap().is_none());
+    assert!(replies.is_empty());
 }

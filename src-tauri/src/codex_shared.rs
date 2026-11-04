@@ -23,7 +23,7 @@ pub(super) fn prepare_runtime(exe: &OsString, cwd: &Path, cancelled: &Arc<Atomic
         |mode| extensions::start_daemon_stdout_until(exe, cwd, mode, deadline, Some(cancelled)),
         |path| fs::symlink_metadata(path),
     )?;
-    let Some(value) = value else { return Ok(()); }; // 공유 명령이 없는 공식 CLI는 개별 서버 경로 사용.
+    let Some(value) = value else { return Ok(()); }; // 공유 lifecycle을 위임하지 않는 공식 CLI는 개별 서버 경로 사용.
     check_cancelled(Some(cancelled))?;
     let socket = lifecycle_socket(&value)?;
     let endpoint = SharedEndpoint { exe: exe.clone(), stamp: socket_stamp(&socket)?, socket };
@@ -88,19 +88,21 @@ fn prepare_runtime_commands(
         }
     }
 }
-// 공식 CLI는 공유 명령이 없어 개별 서버를 사용한다. 공유 명령이 있는
-// OpenDIY CLI에는 R36의 두 보호 옵션을 요구하며 구형 개별 서버로 우회하지 않는다.
+// 공유 lifecycle은 두 보호 옵션을 모두 선언한 구현에만 맡긴다. 공식 CLI도
+// daemon 명령이 있지만 두 옵션이 없으므로 기존 개별 서버 adapter를 사용한다.
 fn supports_shared_management(mut query: impl FnMut(&[&str]) -> Result<Vec<u8>, String>) -> Result<bool, String> {
     if !supports_shared(&query(&["app-server", "--help"])?)? { return Ok(false); }
     let help = query(&["app-server", "daemon", "start", "--help"])
         .map_err(|error| format!("공유 서버 시작 지원을 확인하지 못했습니다: {error}"))?;
-    for option in ["--existing-installation", "--first-installation"] {
-        if !help_supports_option(&help, option)
-            .map_err(|error| format!("공유 서버 시작 도움말을 확인하지 못했습니다: {error}"))? {
-            return Err(format!("선택한 OpenDIY CLI에 {option} 지원이 없습니다. Desktop 1.1.0은 R36 이상을 지원합니다."));
-        }
+    let supported = ["--existing-installation", "--first-installation"].map(|option|
+        help_supports_option(&help, option)
+            .map_err(|error| format!("공유 서버 시작 도움말을 확인하지 못했습니다: {error}")));
+    match (supported[0].clone()?, supported[1].clone()?) {
+        (true, true) => Ok(true),
+        (false, false) => Ok(false),
+        (existing, _) => Err(format!("선택한 OpenDIY CLI에 {} 지원이 없습니다. Desktop 1.1.0은 R36 이상을 지원합니다.",
+            if existing { "--first-installation" } else { "--existing-installation" })),
     }
-    Ok(true)
 }
 // 조회는 서버를 설치하거나 시작하지 않으며 실패를 다른 adapter로 대체하지 않는다.
 fn existing_runtime_commands(
@@ -165,7 +167,7 @@ fn socket_stamp(path: &Path) -> Result<SocketStamp, String> {
 }
 impl SharedEndpoint {
     pub(super) fn existing(exe: &OsString, cwd: &Path, cancelled: Option<&Arc<AtomicBool>>) -> Result<Option<Self>, String> {
-        // 정상 도움말에서 공유 명령 부재가 확인된 공식 CLI는 개별 서버를 사용한다.
+        // 공식 CLI의 개별 서버 경로와 두 보호 옵션을 갖춘 공유 경로를 구분한다.
         // 실행·권한·프로토콜 오류를 미지원으로 삼켜 다른 서버로 대체하지 않는다.
         let deadline = Instant::now() + HELP_TIMEOUT;
         let Some(value) = existing_runtime_commands(|args| {
