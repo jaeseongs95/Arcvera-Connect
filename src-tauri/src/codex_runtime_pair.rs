@@ -62,7 +62,7 @@ fn checkpoint(cancelled: &Arc<AtomicBool>, deadline: Instant) -> Result<(), Stri
     Ok(())
 }
 
-fn supports_passive_status(bytes: &[u8]) -> Result<bool, String> {
+fn require_passive_status(bytes: &[u8]) -> Result<(), String> {
     let help = std::str::from_utf8(bytes).map_err(|_| "공유 서버 명령 안내가 올바른 UTF-8이 아닙니다.")?;
     if !help.lines().any(|line| line.trim_start().strip_prefix("Usage:")
         .or_else(|| line.trim_start().strip_prefix("사용법:")).is_some_and(|usage| {
@@ -79,13 +79,13 @@ fn supports_passive_status(bytes: &[u8]) -> Result<bool, String> {
     let column = rows.iter().map(|line| line.len() - line.trim_start().len()).min();
     let declares = |name| rows.iter().any(|line| Some(line.len() - line.trim_start().len()) == column
         && line.split_ascii_whitespace().next() == Some(name));
-    if declares("status") { Ok(true) } else if declares("version") { Ok(false) }
+    if declares("status") { Ok(()) }
     else { Err("안전하게 조회할 수 있는 공유 서버 상태 명령이 없습니다.".into()) }
 }
 
 // CONC-CANCEL-004: 각 조회 전후와 최종 반환 전에 취소를 확인한다. 모든 조회가
 // 같은 deadline을 쓰며, 오류·취소·시간 초과에서 시작/설치/업데이트로 전이하지 않는다.
-// 시험 계획: R32/R28·suffix drift·프로토콜 오류는 주입형 unit 경계로 검사한다.
+// 시험 계획: 상태 명령 부재·기존 설치 불일치·suffix drift·프로토콜 오류는 주입형 unit 경계로 검사한다.
 // 실제 프로세스 수명 정리는 기존 command_stdout_until의 소유권 경계를 재사용한다.
 fn inspect_commands(
     exe: &OsString, server: &OsString, kind: &str, cancelled: &Arc<AtomicBool>, deadline: Instant,
@@ -122,23 +122,21 @@ fn inspect_commands(
                 report.message = Some("선택한 CLI는 공유 서버를 지원하지 않아 CLI에 내장된 개별 서버를 사용합니다.".into());
                 return Ok(());
             }
-            let passive_status = supports_passive_status(&run(exe, &["app-server", "daemon", "--help"])?)?;
-            let bytes = if passive_status { run(exe, &["app-server", "daemon", "status", "--json"])? }
-                else { run(exe, &["app-server", "daemon", "version"])? };
+            require_passive_status(&run(exe, &["app-server", "daemon", "--help"])?)?;
+            let bytes = run(exe, &["app-server", "daemon", "status", "--json"])?;
             let value: Value = serde_json::from_slice(&bytes)
                 .map_err(|_| "공유 서버 버전 응답이 올바른 JSON이 아닙니다.".to_owned())?;
             if !value.is_object() { return Err("공유 서버 버전 응답이 객체가 아닙니다.".into()); }
             let state = field(&value, "status", 64)?;
-            let stopped = state == "stopped" && passive_status;
-            let unconfirmed = state == "unknown" && passive_status;
+            let stopped = state == "stopped";
+            let unconfirmed = state == "unknown";
             match state {
                 "running" => {}
-                "stopped" if passive_status => {}
-                "unknown" if passive_status => {
+                "stopped" => {}
+                "unknown" => {
                     let reason = field(&value, "reason", 4096)?;
                     report.message = Some(format!("공유 서버의 상태를 확인하지 못했습니다: {reason}"));
                 }
-                // legacy version은 Running만 반환한다. 실패를 stopped로 추정하지 않는다.
                 _ => return Err("공유 서버의 실행 상태를 확인하지 못했습니다. 중지 상태로 추정하지 않았습니다.".into()),
             }
             let reported_cli = normalized_version(field(&value, "cliVersion", 256)?)?;
@@ -217,9 +215,9 @@ pub(super) fn inspect_until(exe: &OsString, server: &OsString, kind: &str, cance
 #[cfg(test)]
 mod tests {
     use super::*;
-    const R32: &str = "0.166.0+native-r32.20261101";
+    const R36: &str = "0.166.0+native-r36.20261103";
     const R28: &str = "0.165.0+native-r28.20261029";
-    const R33: &str = "0.166.0+native-r33.20261102";
+    const OFFICIAL: &str = "0.166.0";
 
     fn app_server_help(shared: bool) -> Vec<u8> {
         if shared {
@@ -235,11 +233,11 @@ mod tests {
 
     fn status(managed: &str, running: &str) -> Value {
         let root = env::temp_dir().join("runtime-pair-fixture");
-        json!({"status":"running", "cliVersion":R32, "managedCodexVersion":managed,
+        json!({"status":"running", "cliVersion":R36, "managedCodexVersion":managed,
             "appServerVersion":running, "managedCodexPath":root.join("codex.exe"), "socketPath":root.join("server.sock")})
     }
     fn inspect_fixture(cli: &str, server: &str, daemon: Result<Vec<u8>, String>) -> (Result<RuntimePairStatus, String>, Vec<String>) {
-        inspect_fixture_help(cli, server, Ok(daemon_help(false)), daemon)
+        inspect_fixture_help(cli, server, Ok(daemon_help(true)), daemon)
     }
     fn inspect_fixture_help(cli: &str, server: &str, help: Result<Vec<u8>, String>, daemon: Result<Vec<u8>, String>) -> (Result<RuntimePairStatus, String>, Vec<String>) {
         inspect_fixture_all_help(cli, server, Ok(app_server_help(true)), help, daemon)
@@ -256,7 +254,6 @@ mod tests {
                     ("server.exe", ["--version"]) => Ok(format!("codex-app-server {server}\r\n").into_bytes()),
                     ("cli.exe", ["app-server", "--help"]) => app_help.clone(),
                     ("cli.exe", ["app-server", "daemon", "--help"]) => help.clone(),
-                    ("cli.exe", ["app-server", "daemon", "version"]) => daemon.clone(),
                     ("cli.exe", ["app-server", "daemon", "status", "--json"]) => daemon.clone(),
                     _ => panic!("읽기 전용 버전 조회 이외 명령 금지: {args:?}"),
                 }
@@ -266,23 +263,23 @@ mod tests {
 
     #[test]
     fn exact_patch_suffix_match_is_required_at_all_three_boundaries() {
-        for (managed, running, expected) in [(R32, R32, "matched"), (R28, R28, "mismatch"),
-            (R32, R28, "mismatch"), (R28, R32, "mismatch"),
-            ("0.166.0+native-r31.20261101", R32, "mismatch"),
-            (R32, "0.166.0+native-r32.20261102", "mismatch")] {
-            let (report, calls) = inspect_fixture(R32, R32, Ok(serde_json::to_vec(&status(managed, running)).unwrap()));
+        for (managed, running, expected) in [(R36, R36, "matched"), (R28, R28, "mismatch"),
+            (R36, R28, "mismatch"), (R28, R36, "mismatch"),
+            ("0.166.0+native-r31.20261101", R36, "mismatch"),
+            (R36, "0.166.0+native-r36.20261104", "mismatch")] {
+            let (report, calls) = inspect_fixture(R36, R36, Ok(serde_json::to_vec(&status(managed, running)).unwrap()));
             let report = report.unwrap();
             assert_eq!(report.state, expected, "managed={managed}, running={running}");
-            assert_eq!(report.cli_version, R32);
+            assert_eq!(report.cli_version, R36);
             assert_eq!(report.managed_version.as_deref(), Some(managed));
             assert_eq!(report.running_version.as_deref(), Some(running));
-            assert_eq!(calls, ["cli.exe --version", "server.exe --version", "cli.exe app-server --help", "cli.exe app-server daemon --help", "cli.exe app-server daemon version"]);
+            assert_eq!(calls, ["cli.exe --version", "server.exe --version", "cli.exe app-server --help", "cli.exe app-server daemon --help", "cli.exe app-server daemon status --json"]);
         }
     }
 
     #[test]
     fn selected_server_mismatch_is_reported_without_daemon_mutation_or_probe() {
-        let (report, calls) = inspect_fixture(R32, R28, Err("조회하면 안 됨".into()));
+        let (report, calls) = inspect_fixture(R36, R28, Err("조회하면 안 됨".into()));
         let report = report.unwrap();
         assert_eq!(report.state, "mismatch");
         assert_eq!(report.selected_server_version, R28);
@@ -297,16 +294,16 @@ mod tests {
                 assert_eq!(exe, &OsString::from("cli.exe"));
                 calls.push(args.join(" "));
                 match args {
-                    ["--version"] => Ok(format!("codex-cli {R32}\n").into_bytes()),
+                    ["--version"] => Ok(format!("codex-cli {R36}\n").into_bytes()),
                     ["app-server", "--help"] => Ok(app_server_help(true)),
-                    ["app-server", "daemon", "--help"] => Ok(daemon_help(false)),
-                    ["app-server", "daemon", "version"] => Ok(serde_json::to_vec(&status(R32, R32)).unwrap()),
+                    ["app-server", "daemon", "--help"] => Ok(daemon_help(true)),
+                    ["app-server", "daemon", "status", "--json"] => Ok(serde_json::to_vec(&status(R36, R36)).unwrap()),
                     _ => panic!("변경 명령 금지"),
                 }
             }).unwrap();
         assert_eq!(report.state, "matched");
         assert_eq!(report.selected_server_executable, "cli.exe");
-        assert_eq!(calls, ["--version", "--version", "app-server --help", "app-server daemon --help", "app-server daemon version"]);
+        assert_eq!(calls, ["--version", "--version", "app-server --help", "app-server daemon --help", "app-server daemon status --json"]);
     }
 
     #[test]
@@ -314,12 +311,12 @@ mod tests {
         for response in [Err("fixture 조회 실패".into()), Ok(b"{partial".to_vec()), Ok(b"null".to_vec()),
             Ok(br#"{"status":"notRunning"}"#.to_vec()), Ok(br#"{"status":"started"}"#.to_vec()),
             Ok(br#"{"status":"unknown"}"#.to_vec())] {
-            let (report, calls) = inspect_fixture(R32, R32, response);
+            let (report, calls) = inspect_fixture(R36, R36, response);
             let report = report.unwrap();
             assert_eq!(report.state, "unavailable");
             assert!(report.message.is_some());
             assert_eq!(calls.len(), 5);
-            assert_eq!(calls.last().unwrap(), "cli.exe app-server daemon version");
+            assert_eq!(calls.last().unwrap(), "cli.exe app-server daemon status --json");
         }
     }
 
@@ -327,26 +324,26 @@ mod tests {
     fn daemon_versions_and_paths_are_required_and_bounded() {
         for key in ["cliVersion", "managedCodexVersion", "appServerVersion", "managedCodexPath", "socketPath", "status"] {
             for invalid in [Value::Null, json!(42), json!(""), json!("not-a-version"), json!("bad\nresponse"), json!("\u{1b}[32mvalue")] {
-                let mut value = status(R32, R32); value[key] = invalid;
-                let (report, _) = inspect_fixture(R32, R32, Ok(serde_json::to_vec(&value).unwrap()));
+                let mut value = status(R36, R36); value[key] = invalid;
+                let (report, _) = inspect_fixture(R36, R36, Ok(serde_json::to_vec(&value).unwrap()));
                 assert_eq!(report.unwrap().state, "unavailable", "field={key}");
             }
-            let mut value = status(R32, R32); value.as_object_mut().unwrap().remove(key);
-            assert_eq!(inspect_fixture(R32, R32, Ok(serde_json::to_vec(&value).unwrap())).0.unwrap().state, "unavailable");
+            let mut value = status(R36, R36); value.as_object_mut().unwrap().remove(key);
+            assert_eq!(inspect_fixture(R36, R36, Ok(serde_json::to_vec(&value).unwrap())).0.unwrap().state, "unavailable");
         }
         for key in ["managedCodexPath", "socketPath"] {
-            let mut value = status(R32, R32); value[key] = json!("relative/path");
-            assert_eq!(inspect_fixture(R32, R32, Ok(serde_json::to_vec(&value).unwrap())).0.unwrap().state, "unavailable");
+            let mut value = status(R36, R36); value[key] = json!("relative/path");
+            assert_eq!(inspect_fixture(R36, R36, Ok(serde_json::to_vec(&value).unwrap())).0.unwrap().state, "unavailable");
         }
-        let mut value = status(R32, R32); value["cliVersion"] = json!(R28);
-        let report = inspect_fixture(R32, R32, Ok(serde_json::to_vec(&value).unwrap())).0.unwrap();
+        let mut value = status(R36, R36); value["cliVersion"] = json!(R28);
+        let report = inspect_fixture(R36, R36, Ok(serde_json::to_vec(&value).unwrap())).0.unwrap();
         assert_eq!(report.state, "unavailable");
         assert!(report.message.unwrap().contains("CLI 버전"));
     }
 
     #[test]
     fn versions_reject_unknown_prefixes_partial_versions_and_control_characters() {
-        for valid in [R32, "codex-cli 0.166.0+native-r32.20261101", "codex-app-server 1.2.3-alpha.1+build.005"] {
+        for valid in [R36, "codex-cli 0.166.0+native-r36.20261103", "codex-app-server 1.2.3-alpha.1+build.005"] {
             assert!(normalized_version(valid).is_ok(), "{valid}");
         }
         for invalid in ["", "1", "1.2", "01.2.3", "1.2.3.4", "v1.2.3", "other 1.2.3", "codex-cli codex-cli 1.2.3",
@@ -369,10 +366,10 @@ mod tests {
                 &cancelled, Instant::now() + Duration::from_secs(20), |_, args, _| {
                     calls += 1;
                     if calls == cancel_at { cancelled.store(true, Ordering::Release); }
-                    if args == ["--version"] { Ok(R32.as_bytes().to_vec()) }
+                    if args == ["--version"] { Ok(R36.as_bytes().to_vec()) }
                     else if args == ["app-server", "--help"] { Ok(app_server_help(true)) }
-                    else if args == ["app-server", "daemon", "--help"] { Ok(daemon_help(false)) }
-                    else { Ok(serde_json::to_vec(&status(R32, R32)).unwrap()) }
+                    else if args == ["app-server", "daemon", "--help"] { Ok(daemon_help(true)) }
+                    else { Ok(serde_json::to_vec(&status(R36, R36)).unwrap()) }
                 });
             assert!(report.is_err(), "cancel_at={cancel_at}");
             assert_eq!(calls, cancel_at);
@@ -391,7 +388,7 @@ mod tests {
             assert!(inspect_commands(&OsString::from("cli"), &OsString::from("server"), "standalone", &cancelled,
                 Instant::now() + Duration::from_secs(20), |_, _, _| {
                     calls += 1;
-                    if calls == fail_at { Err("fixture 실행 파일 조회 실패".into()) } else { Ok(R32.as_bytes().to_vec()) }
+                    if calls == fail_at { Err("fixture 실행 파일 조회 실패".into()) } else { Ok(R36.as_bytes().to_vec()) }
                 }).is_err());
             assert_eq!(calls, fail_at);
         }
@@ -399,13 +396,13 @@ mod tests {
 
     #[test]
     fn passive_status_distinguishes_running_stopped_and_unknown_without_inference() {
-        for (state, managed, running, expected) in [("running", R33, Some(R33), "matched"),
-            ("running", R28, Some(R28), "mismatch"), ("stopped", R33, None, "stopped"),
-            ("stopped", R28, None, "stopped"), ("unknown", R33, None, "unavailable")] {
-            let mut value = status(managed, R33);
-            value["status"] = json!(state); value["cliVersion"] = json!(R33);
+        for (state, managed, running, expected) in [("running", R36, Some(R36), "matched"),
+            ("running", R28, Some(R28), "mismatch"), ("stopped", R36, None, "stopped"),
+            ("stopped", R28, None, "stopped"), ("unknown", R36, None, "unavailable")] {
+            let mut value = status(managed, R36);
+            value["status"] = json!(state); value["cliVersion"] = json!(R36);
             value["appServerVersion"] = json!(running); value["reason"] = Value::Null;
-            let (report, calls) = inspect_fixture_help(R33, R33, Ok(daemon_help(true)), Ok(serde_json::to_vec(&value).unwrap()));
+            let (report, calls) = inspect_fixture_help(R36, R36, Ok(daemon_help(true)), Ok(serde_json::to_vec(&value).unwrap()));
             let report = report.unwrap();
             assert_eq!(report.state, expected, "state={state}, managed={managed}");
             if state == "stopped" {
@@ -419,8 +416,8 @@ mod tests {
     }
 
     fn unconfirmed_status(managed: &str, running: Option<&str>) -> Value {
-        let mut value = status(managed, R33);
-        value["status"] = json!("unknown"); value["cliVersion"] = json!(R33);
+        let mut value = status(managed, R36);
+        value["status"] = json!("unknown"); value["cliVersion"] = json!(R36);
         value["appServerVersion"] = json!(running);
         value["reason"] = json!("socketProbeFailed: failed to connect: os error 10061");
         value
@@ -428,9 +425,9 @@ mod tests {
 
     #[test]
     fn passive_unknown_preserves_verified_metadata_without_inferring_stopped_or_starting() {
-        for (managed, running) in [(R33, None), (R28, None), (R33, Some(R33)), (R33, Some(R28))] {
+        for (managed, running) in [(R36, None), (R28, None), (R36, Some(R36)), (R36, Some(R28))] {
             let value = unconfirmed_status(managed, running);
-            let (report, calls) = inspect_fixture_help(R33, R33, Ok(daemon_help(true)),
+            let (report, calls) = inspect_fixture_help(R36, R36, Ok(daemon_help(true)),
                 Ok(serde_json::to_vec(&value).unwrap()));
             let report = report.unwrap();
             assert_eq!(report.state, "unconfirmed");
@@ -440,14 +437,14 @@ mod tests {
             assert_eq!(report.socket_path.as_deref(), value["socketPath"].as_str());
             let message = report.message.unwrap();
             assert!(message.contains(value["reason"].as_str().unwrap()));
-            assert_eq!(message.contains("서버 전환 확인이 필요합니다"), managed != R33 || running.is_some_and(|version| version != R33));
+            assert_eq!(message.contains("서버 전환 확인이 필요합니다"), managed != R36 || running.is_some_and(|version| version != R36));
             assert_eq!(calls, ["cli.exe --version", "server.exe --version", "cli.exe app-server --help",
                 "cli.exe app-server daemon --help", "cli.exe app-server daemon status --json"]);
         }
         // 오류 문자열을 분류하지 않는다. 다른 사유도 동일한 엄격한 메타데이터 검사를 받는다.
-        let mut value = unconfirmed_status(R33, None);
+        let mut value = unconfirmed_status(R36, None);
         value["reason"] = json!("processStarting");
-        let report = inspect_fixture_help(R33, R33, Ok(daemon_help(true)),
+        let report = inspect_fixture_help(R36, R36, Ok(daemon_help(true)),
             Ok(serde_json::to_vec(&value).unwrap())).0.unwrap();
         assert_eq!(report.state, "unconfirmed");
         assert!(report.message.unwrap().contains("processStarting"));
@@ -455,7 +452,7 @@ mod tests {
 
     #[test]
     fn passive_unknown_requires_complete_consistent_metadata_and_explicit_null_running_version() {
-        let base = unconfirmed_status(R33, None);
+        let base = unconfirmed_status(R36, None);
         let mut invalid_values = Vec::new();
         for key in ["status", "cliVersion", "managedCodexVersion", "managedCodexPath", "socketPath", "reason"] {
             for invalid in [Value::Null, json!(42), json!(""), json!("bad\nresponse"), json!("\u{1b}[32mvalue")] {
@@ -475,7 +472,7 @@ mod tests {
             invalid_values.push((key, value));
         }
         for (key, value) in invalid_values {
-            let (report, calls) = inspect_fixture_help(R33, R33, Ok(daemon_help(true)),
+            let (report, calls) = inspect_fixture_help(R36, R36, Ok(daemon_help(true)),
                 Ok(serde_json::to_vec(&value).unwrap()));
             let report = report.unwrap();
             assert_eq!(report.state, "unavailable", "field={key}, value={value}");
@@ -485,8 +482,6 @@ mod tests {
             assert_eq!(calls.len(), 5);
             assert_eq!(calls.last().unwrap(), "cli.exe app-server daemon status --json");
         }
-        assert_eq!(inspect_fixture(R33, R33, Ok(serde_json::to_vec(&base).unwrap())).0.unwrap().state,
-            "unavailable", "legacy version에는 unknown 메타데이터 계약이 없다");
     }
 
     #[test]
@@ -499,12 +494,12 @@ mod tests {
                 calls += 1;
                 assert_eq!(received, deadline);
                 match args {
-                    ["--version"] => Ok(R33.as_bytes().to_vec()),
+                    ["--version"] => Ok(R36.as_bytes().to_vec()),
                     ["app-server", "--help"] => Ok(app_server_help(true)),
                     ["app-server", "daemon", "--help"] => Ok(daemon_help(true)),
                     ["app-server", "daemon", "status", "--json"] => {
                         cancelled.store(true, Ordering::Release);
-                        Ok(serde_json::to_vec(&unconfirmed_status(R33, None)).unwrap())
+                        Ok(serde_json::to_vec(&unconfirmed_status(R36, None)).unwrap())
                     }
                     _ => panic!("읽기 전용 조회 이외 명령 금지"),
                 }
@@ -515,34 +510,34 @@ mod tests {
 
     #[test]
     fn stopped_requires_explicit_version_fields_matching_cli_probe_and_absolute_paths() {
-        let mut base = status(R33, R33);
-        base["status"] = json!("stopped"); base["cliVersion"] = json!(R33); base["appServerVersion"] = Value::Null;
-        for managed in [json!(R33), Value::Null] {
+        let mut base = status(R36, R36);
+        base["status"] = json!("stopped"); base["cliVersion"] = json!(R36); base["appServerVersion"] = Value::Null;
+        for managed in [json!(R36), Value::Null] {
             base["managedCodexVersion"] = managed;
             for (key, invalid) in [("managedCodexVersion", json!(42)), ("managedCodexVersion", json!("")),
                 ("managedCodexVersion", json!("not-a-version")), ("managedCodexPath", Value::Null),
                 ("managedCodexPath", json!("relative/codex.exe")), ("socketPath", Value::Null),
-                ("socketPath", json!("relative/server.sock")), ("cliVersion", json!(R32)),
-                ("appServerVersion", json!(R33)), ("appServerVersion", json!(false))] {
+                ("socketPath", json!("relative/server.sock")), ("cliVersion", json!(R28)),
+                ("appServerVersion", json!(R36)), ("appServerVersion", json!(false))] {
                 let mut value = base.clone(); value[key] = invalid;
-                let report = inspect_fixture_help(R33, R33, Ok(daemon_help(true)), Ok(serde_json::to_vec(&value).unwrap())).0.unwrap();
+                let report = inspect_fixture_help(R36, R36, Ok(daemon_help(true)), Ok(serde_json::to_vec(&value).unwrap())).0.unwrap();
                 assert_eq!(report.state, "unavailable", "field={key}");
             }
             for key in ["managedCodexVersion", "appServerVersion", "managedCodexPath", "socketPath", "cliVersion"] {
                 let mut value = base.clone(); value.as_object_mut().unwrap().remove(key);
-                assert_eq!(inspect_fixture_help(R33, R33, Ok(daemon_help(true)), Ok(serde_json::to_vec(&value).unwrap())).0.unwrap().state, "unavailable", "missing={key}");
+                assert_eq!(inspect_fixture_help(R36, R36, Ok(daemon_help(true)), Ok(serde_json::to_vec(&value).unwrap())).0.unwrap().state, "unavailable", "missing={key}");
             }
         }
     }
 
     #[test]
     fn passive_stopped_with_explicit_null_versions_reports_uninstalled_without_mutation() {
-        let mut value = status(R33, R33);
-        value["status"] = json!("stopped"); value["cliVersion"] = json!(R33);
+        let mut value = status(R36, R36);
+        value["status"] = json!("stopped"); value["cliVersion"] = json!(R36);
         value["managedCodexVersion"] = Value::Null; value["appServerVersion"] = Value::Null;
         value["reason"] = Value::Null;
         let bytes = serde_json::to_vec(&value).unwrap();
-        let (report, calls) = inspect_fixture_help(R33, R33, Ok(daemon_help(true)), Ok(bytes.clone()));
+        let (report, calls) = inspect_fixture_help(R36, R36, Ok(daemon_help(true)), Ok(bytes));
         let report = report.unwrap();
         assert_eq!(report.state, "stopped");
         assert!(report.managed_version.is_none() && report.running_version.is_none());
@@ -551,47 +546,45 @@ mod tests {
         assert!(report.message.unwrap().contains("미설치"));
         assert_eq!(calls, ["cli.exe --version", "server.exe --version", "cli.exe app-server --help",
             "cli.exe app-server daemon --help", "cli.exe app-server daemon status --json"]);
-        // Legacy version has no passive stopped contract, even with explicit nulls.
-        assert_eq!(inspect_fixture(R33, R33, Ok(bytes)).0.unwrap().state, "unavailable");
     }
 
     #[test]
     fn passive_running_requires_present_non_null_versions() {
         for key in ["managedCodexVersion", "appServerVersion"] {
             for invalid in [Value::Null, json!(false), json!("not-a-version")] {
-                let mut value = status(R33, R33); value["cliVersion"] = json!(R33); value[key] = invalid;
-                assert_eq!(inspect_fixture_help(R33, R33, Ok(daemon_help(true)),
+                let mut value = status(R36, R36); value["cliVersion"] = json!(R36); value[key] = invalid;
+                assert_eq!(inspect_fixture_help(R36, R36, Ok(daemon_help(true)),
                     Ok(serde_json::to_vec(&value).unwrap())).0.unwrap().state, "unavailable", "field={key}");
             }
-            let mut value = status(R33, R33); value["cliVersion"] = json!(R33);
+            let mut value = status(R36, R36); value["cliVersion"] = json!(R36);
             value.as_object_mut().unwrap().remove(key);
-            assert_eq!(inspect_fixture_help(R33, R33, Ok(daemon_help(true)),
+            assert_eq!(inspect_fixture_help(R36, R36, Ok(daemon_help(true)),
                 Ok(serde_json::to_vec(&value).unwrap())).0.unwrap().state, "unavailable", "missing={key}");
         }
     }
 
     #[test]
-    fn help_failure_is_not_legacy_and_status_is_an_exact_command_declaration() {
+    fn help_failure_is_unavailable_and_status_is_an_exact_command_declaration() {
         for help in [Err("fixture help 실패".into()), Ok(b"unrecognized".to_vec()),
             Ok(b"Usage: codex app-server daemon [OPTIONS] <COMMAND>\n\nOptions:\n  -h, --help\n".to_vec())] {
-            let (report, calls) = inspect_fixture_help(R33, R33, help, Err("다른 명령을 조회하면 안 됨".into()));
+            let (report, calls) = inspect_fixture_help(R36, R36, help, Err("다른 명령을 조회하면 안 됨".into()));
             assert_eq!(report.unwrap().state, "unavailable");
             assert_eq!(calls.len(), 4);
         }
         let korean = String::from_utf8(daemon_help(true)).unwrap().replace("Commands:", "명령어:");
-        assert!(supports_passive_status(korean.as_bytes()).unwrap());
+        assert!(require_passive_status(korean.as_bytes()).is_ok());
         let description = String::from_utf8(daemon_help(false)).unwrap().replace("  version  Read version", "  version  Read version\n      status is mentioned only here\n  status-extra Other");
-        assert!(!supports_passive_status(description.as_bytes()).unwrap());
-        let mut unknown = status(R33, R33);
+        assert!(require_passive_status(description.as_bytes()).is_err());
+        let mut unknown = status(R36, R36);
         unknown["status"] = json!("unknown"); unknown["managedCodexVersion"] = Value::Null;
         unknown["appServerVersion"] = Value::Null; unknown["reason"] = json!("starting record remains");
-        let (report, calls) = inspect_fixture_help(R33, R33, Ok(daemon_help(true)), Ok(serde_json::to_vec(&unknown).unwrap()));
+        let (report, calls) = inspect_fixture_help(R36, R36, Ok(daemon_help(true)), Ok(serde_json::to_vec(&unknown).unwrap()));
         let report = report.unwrap();
         assert_eq!(report.state, "unavailable"); assert!(report.managed_version.is_none() && report.running_version.is_none());
         assert!(report.message.unwrap().contains("starting record remains"));
         assert_eq!(calls.last().unwrap(), "cli.exe app-server daemon status --json");
         for response in [Err("fixture status 조회 실패".into()), Ok(b"{partial".to_vec())] {
-            let (report, calls) = inspect_fixture_help(R33, R33, Ok(daemon_help(true)), response);
+            let (report, calls) = inspect_fixture_help(R36, R36, Ok(daemon_help(true)), response);
             assert_eq!(report.unwrap().state, "unavailable");
             assert_eq!(calls.len(), 5);
             assert_eq!(calls.last().unwrap(), "cli.exe app-server daemon status --json");
@@ -599,13 +592,29 @@ mod tests {
     }
 
     #[test]
+    fn missing_passive_status_never_uses_legacy_version_or_queries_the_daemon() {
+        let description = String::from_utf8(daemon_help(false)).unwrap().replace("  version  Read version",
+            "  version  Read version\n      status is mentioned only here\n  status-extra Other");
+        for help in [daemon_help(false), description.into_bytes()] {
+            let (report, calls) = inspect_fixture_help(R36, R36, Ok(help), Err("daemon 조회 금지".into()));
+            let report = report.unwrap();
+            assert_eq!(report.state, "unavailable");
+            assert!(report.message.unwrap().contains("공유 서버 상태 명령이 없습니다"));
+            assert!(report.managed_cli_executable.is_none() && report.managed_version.is_none()
+                && report.running_version.is_none() && report.socket_path.is_none());
+            assert_eq!(calls, ["cli.exe --version", "server.exe --version", "cli.exe app-server --help",
+                "cli.exe app-server daemon --help"]);
+        }
+    }
+
+    #[test]
     fn explicitly_unsupported_shared_server_uses_embedded_without_daemon_queries() {
-        let (report, calls) = inspect_fixture_all_help(R32, R32, Ok(app_server_help(false)),
+        let (report, calls) = inspect_fixture_all_help(OFFICIAL, OFFICIAL, Ok(app_server_help(false)),
             Err("daemon 도움말 조회 금지".into()), Err("daemon 상태 조회 금지".into()));
         let report = report.unwrap();
         assert_eq!(report.state, "embedded");
-        assert_eq!(report.cli_version, R32);
-        assert_eq!(report.selected_server_version, R32);
+        assert_eq!(report.cli_version, OFFICIAL);
+        assert_eq!(report.selected_server_version, OFFICIAL);
         assert!(report.message.unwrap().contains("내장된 개별 서버"));
         assert!(report.managed_cli_executable.is_none() && report.managed_version.is_none()
             && report.running_version.is_none() && report.socket_path.is_none());
@@ -617,7 +626,7 @@ mod tests {
         for help in [Err("fixture app-server help 실패".into()), Ok(b"invalid help".to_vec()),
             Ok(b"Usage: codex app-server [OPTIONS] [COMMAND]\n\nOptions:\n  -h, --help\n".to_vec()),
             Ok(b"Usage: codex app-server [OPTIONS]\n".to_vec()), Ok(vec![0xff])] {
-            let (report, calls) = inspect_fixture_all_help(R32, R32, help,
+            let (report, calls) = inspect_fixture_all_help(R36, R36, help,
                 Err("daemon 조회 금지".into()), Err("daemon 조회 금지".into()));
             let report = report.unwrap();
             assert_eq!(report.state, "unavailable");

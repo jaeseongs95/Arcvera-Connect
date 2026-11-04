@@ -24,13 +24,13 @@ fn startup_commands_case(replies: Vec<Result<Vec<u8>, String>>, started: Result<
     (result, calls.into_inner())
 }
 #[test]
-fn startup_reuses_running_server_without_install_or_start_and_keeps_legacy_path() {
+fn startup_reuses_running_server_and_preserves_official_individual_path() {
     let socket = env::current_dir().unwrap().join("startup-fixture.sock").to_str().unwrap().to_owned();
     let (result, calls) = startup_commands_case(vec![Ok(startup_help()), Ok(startup_start_help()), Ok(startup_status("running", &socket))], Err("시작 금지".into()));
     assert_eq!(result.unwrap().unwrap()["status"], "running");
     assert_eq!(calls, ["app-server --help", "app-server daemon start --help", "app-server daemon version"]);
-    let legacy = b"Usage: fixture app-server [OPTIONS]\n\nOptions:\n  -h, --help\n          Print help\n".to_vec();
-    let (result, calls) = startup_commands_case(vec![Ok(legacy)], Err("시작 금지".into()));
+    let official = b"Usage: fixture app-server [OPTIONS]\n\nOptions:\n  -h, --help\n          Print help\n".to_vec();
+    let (result, calls) = startup_commands_case(vec![Ok(official)], Err("시작 금지".into()));
     assert!(result.unwrap().is_none());
     assert_eq!(calls, ["app-server --help"]);
     let (result, calls) = startup_commands_case(vec![Ok(b"invalid help".to_vec())], Err("시작 금지".into()));
@@ -60,7 +60,7 @@ fn startup_starts_installed_server_once_then_verifies_ready_for_both_start_resul
     }
 }
 #[test]
-fn startup_uses_existing_embedded_path_when_preserving_option_is_not_declared() {
+fn startup_rejects_missing_preserving_option_without_embedded_fallback() {
     for help in [
         b"Usage: fixture app-server daemon start [OPTIONS]\n\nOptions:\n  -h, --help\n          Use --existing-installation if available\n".to_vec(),
         b"Usage: fixture app-server daemon start [OPTIONS]\n\nOptions:\n      --existing-installation-extra\n  -h, --help\n          Print help\n".to_vec(),
@@ -72,7 +72,7 @@ fn startup_uses_existing_embedded_path_when_preserving_option_is_not_declared() 
             |_| panic!("보존 미지원 CLI의 daemon start 금지"),
             |_| panic!("보존 미지원 CLI의 metadata 조회 금지"),
         );
-        assert!(result.unwrap().is_none());
+        assert!(result.unwrap_err().contains("--existing-installation"));
         assert!(replies.is_empty());
         assert_eq!(calls, ["app-server --help", "app-server daemon start --help"]);
     }
@@ -95,33 +95,22 @@ fn startup_confirmed_missing_package_uses_locked_first_installation() {
     fs::remove_dir(&home).unwrap();
 }
 #[test]
-fn startup_first_option_requires_its_own_declaration_and_legacy_fresh_uses_individual_adapter() {
-    let home = env::current_dir().unwrap().join("target/startup-old-first-seam");
-    let name = if cfg!(windows) { "codex.exe" } else { "codex" };
-    let passive = serde_json::to_vec(&json!({"status":"stopped","managedCodexVersion":null,"appServerVersion":null,
-        "socketPath":home.join("app-server-control/app-server-control.sock"),
-        "managedCodexPath":home.join("packages/app-server-daemon/current/bin").join(name)})).unwrap();
+fn startup_requires_guarded_first_option_and_never_falls_back_to_an_individual_server() {
     for declaration in ["", "          Use --first-installation when available\n", "      --first-installation-extra\n"] {
         let help = format!("Usage: fixture app-server daemon start [OPTIONS]\n\nOptions:\n      --existing-installation\n          Preserve installation\n{declaration}  -h, --help\n          Print help\n").into_bytes();
-        let replies = || std::collections::VecDeque::from([Ok(startup_help()), Ok(help.clone()), Err("no daemon".into()), Ok(passive.clone())]);
+        let replies = || std::collections::VecDeque::from([Ok(startup_help()), Ok(help.clone())]);
         let mut startup = replies();
         assert!(prepare_runtime_commands(
-            |_| startup.pop_front().expect("no extra query"),
+            |_| startup.pop_front().expect("no version or status query"),
             |_| panic!("unguarded daemon start must never run"),
-            |_| Err(std::io::ErrorKind::NotFound.into()),
-        ).unwrap().is_none());
+            |_| panic!("unsupported CLI must not inspect installation state"),
+        ).unwrap_err().contains("--first-installation"));
         assert!(startup.is_empty());
         let mut discovery = replies();
         assert!(existing_runtime_commands(
-            |_| discovery.pop_front().expect("no extra query"),
-            |_| Err(std::io::ErrorKind::NotFound.into()),
-        ).unwrap().is_none(), "session discovery must select the same individual adapter");
+            |_| discovery.pop_front().expect("no version or status query"),
+        ).unwrap_err().contains("--first-installation"));
         assert!(discovery.is_empty());
-        // The same old CLI must still reuse a live server without a new first-start requirement.
-        let socket = home.join("app-server-control/app-server-control.sock");
-        let (result, calls) = startup_commands_case(vec![Ok(startup_help()), Ok(help),
-            Ok(startup_status("running", socket.to_str().unwrap()))], Err("no start".into()));
-        assert!(result.unwrap().is_some()); assert_eq!(calls.len(), 3);
     }
 }
 #[test]
@@ -155,38 +144,13 @@ fn startup_concurrent_installation_refusal_preserves_recovery_and_never_retries_
     fs::remove_dir_all(root).unwrap();
 }
 #[test]
-fn legacy_existing_discovery_preserves_live_servers_and_rejects_uncertain_installations() {
-    let home = env::current_dir().unwrap().join("target/startup-legacy-discovery");
-    let name = if cfg!(windows) { "codex.exe" } else { "codex" };
-    let socket = home.join("app-server-control/app-server-control.sock");
-    let passive = json!({"status":"stopped","managedCodexVersion":null,"appServerVersion":null,
-        "socketPath":socket,"managedCodexPath":home.join("packages/app-server-daemon/current/bin").join(name)});
-    let old_help = String::from_utf8(startup_start_help()).unwrap().replace("      --first-installation\n          Recheck pristine state under the operation lock\n", "").into_bytes();
-    let running = startup_status("running", socket.to_str().unwrap());
-    let mut replies = std::collections::VecDeque::from([Ok(startup_help()), Ok(old_help.clone()), Ok(running)]);
-    assert_eq!(existing_runtime_commands(
-        |_| replies.pop_front().expect("live daemon must not query status or start"),
-        |_| panic!("live daemon must not inspect installation markers"),
-    ).unwrap().unwrap()["status"], "running");
+fn existing_discovery_preserves_the_original_error_without_status_or_adapter_fallback() {
+    let mut replies = std::collections::VecDeque::from([Ok(startup_help()), Ok(startup_start_help()), Err("original connection failure".into())]);
+    let error = existing_runtime_commands(
+        |_| replies.pop_front().expect("no status query or fallback"),
+    ).unwrap_err();
+    assert!(error.contains("original connection failure"));
     assert!(replies.is_empty());
-    let mut unknown = passive.clone(); unknown["status"] = json!("unknown");
-    for (status, metadata_case) in [(Ok(serde_json::to_vec(&passive).unwrap()), 1),
-        (Ok(serde_json::to_vec(&passive).unwrap()), 2),
-        (Ok(serde_json::to_vec(&unknown).unwrap()), 0),
-        (Ok(br#"{"status":"stopped"}"#.to_vec()), 0),
-        (Err("status Access denied".into()), 0), (Ok(b"malformed".to_vec()), 0)] {
-        let mut replies = std::collections::VecDeque::from([Ok(startup_help()), Ok(old_help.clone()), Err("original connection failure".into()), status]);
-        let result = existing_runtime_commands(
-            |_| replies.pop_front().expect("no extra query or retry"),
-            |_| match metadata_case {
-                1 => fs::metadata(env::current_dir().unwrap()), // Existing marker.
-                2 => Err(std::io::ErrorKind::PermissionDenied.into()),
-                _ => panic!("uncertain status must not authorize metadata discovery"),
-            },
-        );
-        assert!(result.is_err(), "existing or uncertain installation must never silently select another adapter");
-        assert!(replies.is_empty());
-    }
 }
 #[test]
 fn startup_preserves_existing_selection_recovery_and_installation_markers() {

@@ -23,7 +23,7 @@ pub(super) fn prepare_runtime(exe: &OsString, cwd: &Path, cancelled: &Arc<Atomic
         |mode| extensions::start_daemon_stdout_until(exe, cwd, mode, deadline, Some(cancelled)),
         |path| fs::symlink_metadata(path),
     )?;
-    let Some(value) = value else { return Ok(()); }; // 명시 미지원 CLI의 기존 개별 서버 경로 유지.
+    let Some(value) = value else { return Ok(()); }; // 공유 명령이 없는 공식 CLI는 개별 서버 경로 사용.
     check_cancelled(Some(cancelled))?;
     let socket = lifecycle_socket(&value)?;
     let endpoint = SharedEndpoint { exe: exe.clone(), stamp: socket_stamp(&socket)?, socket };
@@ -44,7 +44,7 @@ fn prepare_runtime_commands(
     start: impl FnOnce(DaemonStart) -> Result<Vec<u8>, String>,
     mut metadata: impl FnMut(&Path) -> std::io::Result<fs::Metadata>,
 ) -> Result<Option<Value>, String> {
-    let Some(first_supported) = shared_start_options(&mut query)? else { return Ok(None); };
+    if !supports_shared_management(&mut query)? { return Ok(None); }
     let version = ["app-server", "daemon", "version"];
     match query(&version) {
         Ok(bytes) => {
@@ -71,9 +71,6 @@ fn prepare_runtime_commands(
                     && value.get("appServerVersion") == Some(&Value::Null)
                     && first_installation(&value, &mut metadata));
             }
-            // 최초 설치의 원자적 보호가 없는 CLI는 기본 개별 PTY를 사용한다.
-            // 이미 설치된 서버의 재사용·보존 시작 지원과는 독립적이다.
-            if !preserve && !first_supported { return Ok(None); }
             let mode = if preserve { DaemonStart::Existing } else { DaemonStart::First };
             let started = lifecycle_value(&start(mode).map_err(|error| format!("공유 서버 시작 실패: {error}"))?)?;
             if !matches!(started["status"].as_str(), Some("started" | "alreadyRunning")) {
@@ -91,47 +88,30 @@ fn prepare_runtime_commands(
         }
     }
 }
-// 서버 관리의 보존 기능이 명시된 CLI만 공유 연결을 선택한다. 정상적인 미지원
-// 선언은 기존 개별 서버 경로를 쓰고, 실행·도움말 오류는 대체 경로로 숨기지 않는다.
-#[cfg(test)]
+// 공식 CLI는 공유 명령이 없어 개별 서버를 사용한다. 공유 명령이 있는
+// OpenDIY CLI에는 R36의 두 보호 옵션을 요구하며 구형 개별 서버로 우회하지 않는다.
 fn supports_shared_management(mut query: impl FnMut(&[&str]) -> Result<Vec<u8>, String>) -> Result<bool, String> {
-    Ok(shared_start_options(&mut query)?.is_some())
-}
-fn shared_start_options(mut query: impl FnMut(&[&str]) -> Result<Vec<u8>, String>) -> Result<Option<bool>, String> {
-    if !supports_shared(&query(&["app-server", "--help"])?)? { return Ok(None); }
+    if !supports_shared(&query(&["app-server", "--help"])?)? { return Ok(false); }
     let help = query(&["app-server", "daemon", "start", "--help"])
         .map_err(|error| format!("공유 서버 시작 지원을 확인하지 못했습니다: {error}"))?;
-    if !help_supports_option(&help, "--existing-installation")
-        .map_err(|error| format!("공유 서버 시작 도움말을 확인하지 못했습니다: {error}"))? { return Ok(None); }
-    help_supports_option(&help, "--first-installation").map(Some)
-        .map_err(|error| format!("공유 서버 시작 도움말을 확인하지 못했습니다: {error}"))
-}
-// Discovery never starts or installs a server. Only an explicitly pristine
-// installation may use the individual adapter when guarded first-start is absent.
-fn existing_runtime_commands(
-    mut query: impl FnMut(&[&str]) -> Result<Vec<u8>, String>,
-    mut metadata: impl FnMut(&Path) -> std::io::Result<fs::Metadata>,
-) -> Result<Option<Value>, String> {
-    let Some(first_supported) = shared_start_options(&mut query)? else { return Ok(None); };
-    match query(&["app-server", "daemon", "version"]) {
-        Ok(bytes) => {
-            let value = lifecycle_value(&bytes)?;
-            lifecycle_socket(&value)?;
-            Ok(Some(value))
-        }
-        Err(error) => {
-            if !first_supported {
-                if let Ok(bytes) = query(&["app-server", "daemon", "status", "--json"]) {
-                    let value = lifecycle_value(&bytes)?;
-                    if value["status"] == "stopped"
-                        && value.get("managedCodexVersion") == Some(&Value::Null)
-                        && value.get("appServerVersion") == Some(&Value::Null)
-                        && first_installation(&value, &mut metadata) { return Ok(None); }
-                }
-            }
-            Err(format!("기존 공유 Codex 서버에 연결할 수 없습니다. Codex에서 공유 서버의 실행 상태와 권한을 확인한 뒤 다시 시도하세요. 서버를 자동으로 설치하거나 시작하지 않았습니다. 원인: {error}"))
+    for option in ["--existing-installation", "--first-installation"] {
+        if !help_supports_option(&help, option)
+            .map_err(|error| format!("공유 서버 시작 도움말을 확인하지 못했습니다: {error}"))? {
+            return Err(format!("선택한 OpenDIY CLI에 {option} 지원이 없습니다. Desktop 1.1.0은 R36 이상을 지원합니다."));
         }
     }
+    Ok(true)
+}
+// 조회는 서버를 설치하거나 시작하지 않으며 실패를 다른 adapter로 대체하지 않는다.
+fn existing_runtime_commands(
+    mut query: impl FnMut(&[&str]) -> Result<Vec<u8>, String>,
+) -> Result<Option<Value>, String> {
+    if !supports_shared_management(&mut query)? { return Ok(None); }
+    let bytes = query(&["app-server", "daemon", "version"]).map_err(|error|
+        format!("기존 공유 Codex 서버에 연결할 수 없습니다. Codex에서 공유 서버의 실행 상태와 권한을 확인한 뒤 다시 시도하세요. 서버를 자동으로 설치하거나 시작하지 않았습니다. 원인: {error}"))?;
+    let value = lifecycle_value(&bytes)?;
+    lifecycle_socket(&value)?;
+    Ok(Some(value))
 }
 fn first_installation(value: &Value, mut metadata: impl FnMut(&Path) -> std::io::Result<fs::Metadata>) -> bool {
     let path = |key| value.get(key).and_then(Value::as_str).filter(|text| !text.chars().any(char::is_control))
@@ -185,13 +165,13 @@ fn socket_stamp(path: &Path) -> Result<SocketStamp, String> {
 }
 impl SharedEndpoint {
     pub(super) fn existing(exe: &OsString, cwd: &Path, cancelled: Option<&Arc<AtomicBool>>) -> Result<Option<Self>, String> {
-        // 정상 도움말에서 명시 미지원이 확인된 구형 CLI만 개별 서버를 사용한다.
+        // 정상 도움말에서 공유 명령 부재가 확인된 공식 CLI는 개별 서버를 사용한다.
         // 실행·권한·프로토콜 오류를 미지원으로 삼켜 다른 서버로 대체하지 않는다.
         let deadline = Instant::now() + HELP_TIMEOUT;
         let Some(value) = existing_runtime_commands(|args| {
             extensions::command_stdout_until(exe, cwd, &args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>(), deadline, cancelled)
                 .map_err(|e| format!("Codex 공유 연결 지원을 확인할 수 없습니다: {e}"))
-        }, |path| fs::symlink_metadata(path))? else { return Ok(None); };
+        })? else { return Ok(None); };
         let socket = lifecycle_socket(&value)?;
         let stamp = socket_stamp(&socket)?;
         Ok(Some(Self { exe:exe.clone(), socket, stamp }))

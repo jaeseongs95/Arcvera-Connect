@@ -159,7 +159,9 @@ Start a new session to use changed extensions; running terminals are not restart
 
 ## Runtime combinations and verification status
 
-Version numbers alone do not guarantee compatibility. The selected CLI and an already running shared server may come from different builds. Check the actual server declarations together with the scope below.
+**Desktop 1.1.0 minimum supported runtime: OpenDIY Codex R36 CLI with its R36 app-server.** Earlier OpenDIY builds, including R28, are outside the support policy. Use the matching CLI/server package. Official Codex CLI **0.166.0** is supported separately for the basic terminal and session workflow; OpenDIY extensions are available only when the connected server explicitly declares them.
+
+Existing daemon data and running work are preserved. Selecting an executable does not authorize replacing or stopping another server. Version numbers alone do not establish feature support; the app checks actual declarations.
 
 In **Settings → Executable settings**, choose the CLI and app-server executable separately. Automatic server selection uses the CLI's sibling `codex-app-server.exe`, or the same CLI's built-in server when that sibling is absent. Changing this selection does not replace an existing shared server. Different version numbers alone do not block startup or restoration; connection failures explain their cause and recovery options. A first installation uses the selected CLI's preparation flow and does not automatically replace an existing server.
 
@@ -167,15 +169,7 @@ Structured conversation, subagent, scheduled-job and manual-compaction controls 
 
 **Check server versions → Align versions** reviews the complete package and requires confirmation that work in other Codex windows and on mobile has finished. The CLI must declare non-forcing update support; older CLIs cannot use this action. The managed server runs through its own managed CLI path, which can differ from the selected standalone server path. Only a confirmed successful transition and connection check resumes automatic restoration. An uncertain result blocks automatic reconnection and retry; inspect the server again before deliberately retrying. A submitted shutdown request cannot be canceled and may finish later. This does not promise that every updater process exits.
 
-| Desktop | Codex CLI | App server | Actual integration scope and limitations |
-| --- | --- | --- | --- |
-| v0.6.0 release candidate, [deba0725](https://github.com/jaeseongs95/opendiy-desktop/commit/deba0725ea7420e84e95ab569c9a3534e67fa2c1) | Released R30, `1cacc86` | Released R30 artifact: `86cf681`; identity with the server in the limited test is unconfirmed | Four native steps checked only the unsupported-subagent-management boundary (run `b807b535`). This is not a complete integration pass for the combination. |
-| Same v0.6.0 release candidate | R31 development candidate, `e8a1d84` | Same R31 development candidate; final package identity pending | Historical protocol comparison only. Final executable joint tests did not run; R31 is excluded from release and installation. |
-| Follow-up branch, [6929409](https://github.com/jaeseongs95/opendiy-desktop/commit/69294093d92ccdb859280009c5a2d340d54f0372) | Same R31 development candidate | Same R31 development candidate | Passed 70 affected browser tests, 296 CI browser tests, 238 Rust tests, a native PTY test and a separate code review. Joint tests with the actual CLI/server combination did not run. Producer inspection later confirmed that daemon version internally initializes a connection, so these tests do not establish the no-initialization boundary. |
-| Follow-up implementation, [2fefa895](https://github.com/jaeseongs95/opendiy-desktop/commit/2fefa895d2a2db9c3923bb79cf8dd19b8b4b11ca) | New R31 candidate reported by its maintainer, `1cd3bbff` | Final package handoff pending; executable identities and matching source unverified | [Desktop-only automated checks](https://github.com/jaeseongs95/opendiy-desktop/actions/runs/41270806309) passed 308 browser tests, 242 Rust tests and one native PTY test. These are not joint R31 tests. R31 is excluded from release and installation; final joint tests will use R32. |
-| Same follow-up implementation | R32 candidate before redesign reported by its maintainer, `2f42356a` | Not frozen for final distribution; no executable pairing | The earlier `b0d8fa11` entry is historical review context. Neither a fresh contract comparison nor joint tests have run with this new candidate; this is not a verified combination. |
-
-The table preserves earlier candidate checks. [Desktop v0.6.0](https://github.com/jaeseongs95/opendiy-desktop/releases/tag/v0.6.0) and [Codex R32](https://github.com/jaeseongs95/opendiy-codex/releases/tag/v0.166.0-r32.20261101) have since been released. Their installed-path joint checks passed 17 steps; compaction, child mutations and materialized history paging remained untested. R31 was excluded from release and installation. R32 does not support the new non-forcing transition action; a compatible CLI package is required. Updating a server is separate from choosing an executable and can affect other Codex clients.
+Historical release-combination checks remain in the Git history and do not define 1.1.0 support.
 
 ## Runtime compatibility and attachment storage
 
@@ -200,12 +194,11 @@ the installed daemon, then verifies its connection before restoring sessions. A
 failed start leaves saved sessions available for retry. Startup does not replace or
 stop the shared daemon. Changing its version is a separate, confirmed action in
 **Executable settings → Check server versions → Match versions**.
-Automatic startup requires the CLI's `app-server daemon start --existing-installation`
-option. With older CLIs, start the shared server before opening the app.
+OpenDIY startup uses R36's `--existing-installation` and guarded `--first-installation`
+options. Missing protection options are reported without an individual-server fallback.
 
-For older CLIs without shared commands, the app-owned server remains available.
-Its mobile mutations require `--remote-control-client-name` to avoid replacing
-other registrations. Actions stay disabled until a status response confirms that
+Official CLI uses an app-owned server. Mobile mutations require
+`--remote-control-client-name` to avoid replacing other registrations. Actions stay disabled until a status response confirms that
 mutations are allowed. The popup explains the connection scope and limitations.
 
 Stopping a shared session pins its original turn ID before closing its terminal;
@@ -216,9 +209,8 @@ with unconfirmed remote stop** action becomes available only after all local res
 been reaped. Remote work may continue. This action neither marks it stopped nor
 resends the stop request.
 Pairing codes are not saved. Physical phone pairing and control remain unvalidated.
-Shared connections require the companion CLI fixes for newly started empty threads
-and default-proxy protection. The original R28 binary has remote APIs but lacks
-these fixes. Check the release notes for the compatible executable and checksum.
+Shared connections use the supported R36 CLI/server package. Check the release
+notes for the executable and checksum.
 A history-unavailable warning preserves live session input; it does not mean that
 all previous messages have loaded.
 
@@ -247,12 +239,9 @@ including the current write, with the native 64 KiB per-request ceiling. Input p
 under pressure and resumes after draining; oversized or unaccepted input is reported.
 Resize keeps one current request and the latest unsent size. Disposing a terminal
 releases queued input and geometry. Restored sessions initially load metadata only.
-OpenDIY Codex R28 also bounds its display history to 30 turns, 400 items and 8 MiB
-of retained logical source per display budget. Older sections are fetched on demand;
-distant display references are released when their independent operations finish.
-These budgets do not limit the entire process, durable history or model context.
-Legacy history still uses the official full-read fallback, so its initial load can
-exceed the display budget. Other selected CLIs retain their own history behavior.
+The selected CLI owns terminal history and model context. Desktop keeps its own
+display and input buffers bounded; these limits do not bound the CLI process or
+truncate durable history or model context.
 These bounds and lifecycle tests are not a claim of a completed long-duration leak test.
 Each session retains at most 1,024 answered or resolved server-request IDs. Exceeding this
 limit blocks conversation observation and input handoff, rather than forgetting resolved requests
