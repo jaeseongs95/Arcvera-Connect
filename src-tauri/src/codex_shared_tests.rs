@@ -155,6 +155,40 @@ fn startup_concurrent_installation_refusal_preserves_recovery_and_never_retries_
     fs::remove_dir_all(root).unwrap();
 }
 #[test]
+fn legacy_existing_discovery_preserves_live_servers_and_rejects_uncertain_installations() {
+    let home = env::current_dir().unwrap().join("target/startup-legacy-discovery");
+    let name = if cfg!(windows) { "codex.exe" } else { "codex" };
+    let socket = home.join("app-server-control/app-server-control.sock");
+    let passive = json!({"status":"stopped","managedCodexVersion":null,"appServerVersion":null,
+        "socketPath":socket,"managedCodexPath":home.join("packages/app-server-daemon/current/bin").join(name)});
+    let old_help = String::from_utf8(startup_start_help()).unwrap().replace("      --first-installation\n          Recheck pristine state under the operation lock\n", "").into_bytes();
+    let running = startup_status("running", socket.to_str().unwrap());
+    let mut replies = std::collections::VecDeque::from([Ok(startup_help()), Ok(old_help.clone()), Ok(running)]);
+    assert_eq!(existing_runtime_commands(
+        |_| replies.pop_front().expect("live daemon must not query status or start"),
+        |_| panic!("live daemon must not inspect installation markers"),
+    ).unwrap().unwrap()["status"], "running");
+    assert!(replies.is_empty());
+    let mut unknown = passive.clone(); unknown["status"] = json!("unknown");
+    for (status, metadata_case) in [(Ok(serde_json::to_vec(&passive).unwrap()), 1),
+        (Ok(serde_json::to_vec(&passive).unwrap()), 2),
+        (Ok(serde_json::to_vec(&unknown).unwrap()), 0),
+        (Ok(br#"{"status":"stopped"}"#.to_vec()), 0),
+        (Err("status Access denied".into()), 0), (Ok(b"malformed".to_vec()), 0)] {
+        let mut replies = std::collections::VecDeque::from([Ok(startup_help()), Ok(old_help.clone()), Err("original connection failure".into()), status]);
+        let result = existing_runtime_commands(
+            |_| replies.pop_front().expect("no extra query or retry"),
+            |_| match metadata_case {
+                1 => fs::metadata(env::current_dir().unwrap()), // Existing marker.
+                2 => Err(std::io::ErrorKind::PermissionDenied.into()),
+                _ => panic!("uncertain status must not authorize metadata discovery"),
+            },
+        );
+        assert!(result.is_err(), "existing or uncertain installation must never silently select another adapter");
+        assert!(replies.is_empty());
+    }
+}
+#[test]
 fn startup_preserves_existing_selection_recovery_and_installation_markers() {
     let root = env::current_dir().unwrap().join("target").join(format!("startup-preserve-{}", Uuid::new_v4()));
     for (index, marker) in ["packages/app-server-daemon/current", "packages/standalone/current",
