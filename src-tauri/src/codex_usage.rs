@@ -319,7 +319,11 @@ class UsageFixture {
             if mode == "legacy" { assert!(error.contains("기존 공유 연결"), "{error}"); }
             else if mode == "offline" || mode == "guarded-offline" { assert!(error.contains("23"), "{error}"); }
             else {
-                assert!(error.contains("cancelled"), "{mode}: {error}");
+                if mode == "status-stall" {
+                    assert!(error.contains("23") && error.contains("사용량 조회 전체 기한이 만료"), "{mode}: {error}");
+                } else {
+                    assert!(error.contains("cancelled"), "{mode}: {error}");
+                }
                 assert!(started.elapsed() < Duration::from_secs(3), "전체 기한은 discovery부터 적용되어야 한다");
             }
             for pid in fs::read_to_string(root.join("pids")).unwrap().lines() {
