@@ -4,7 +4,7 @@ fn startup_help() -> Vec<u8> {
     b"Usage: fixture app-server [OPTIONS] [COMMAND]\n\nCommands:\n  daemon  Manage daemon\n  proxy  Relay\n\nOptions:\n  -h, --help\n          Print help\n".to_vec()
 }
 fn startup_start_help() -> Vec<u8> {
-    b"Usage: fixture app-server daemon start [OPTIONS]\n\nOptions:\n      --existing-installation\n          Preserve the installed server and settings\n  -h, --help\n          Print help\n".to_vec()
+    b"Usage: fixture app-server daemon start [OPTIONS]\n\nOptions:\n      --existing-installation\n          Preserve the installed server and settings\n      --first-installation\n          Recheck pristine state under the operation lock\n  -h, --help\n          Print help\n".to_vec()
 }
 fn startup_status(status: &str, socket: &str) -> Vec<u8> {
     serde_json::to_vec(&json!({"status":status,"socketPath":socket,"appServerVersion":"fixture"})).unwrap()
@@ -17,7 +17,7 @@ fn startup_commands_case(replies: Vec<Result<Vec<u8>, String>>, started: Result<
     let mut replies = std::collections::VecDeque::from(replies);
     let result = prepare_runtime_commands(
         |args| { calls.borrow_mut().push(args.join(" ")); replies.pop_front().expect("추가 조회 금지") },
-        |preserve| { calls.borrow_mut().push(if preserve { "start --existing-installation" } else { "start" }.into()); started },
+        |mode| { calls.borrow_mut().push(format!("start {}", mode.option())); started },
         |path| fs::symlink_metadata(path),
     );
     assert!(replies.is_empty(), "예정된 상태 확인을 생략하면 안 된다");
@@ -78,7 +78,7 @@ fn startup_uses_existing_embedded_path_when_preserving_option_is_not_declared() 
     }
 }
 #[test]
-fn startup_confirmed_missing_package_uses_default_start() {
+fn startup_confirmed_missing_package_uses_locked_first_installation() {
     let home = env::current_dir().unwrap().join("target").join(format!("startup-fresh-{}", Uuid::new_v4()));
     fs::create_dir_all(&home).unwrap();
     let socket = home.join("app-server-control/app-server-control.sock").to_str().unwrap().to_owned();
@@ -90,9 +90,69 @@ fn startup_confirmed_missing_package_uses_default_start() {
         let (result, calls) = startup_commands_case(vec![Ok(startup_help()), Ok(startup_start_help()), Err("연결 없음".into()),
             Ok(serde_json::to_vec(&passive).unwrap()), Ok(startup_status("running", &socket))], Ok(startup_status("started", &socket)));
         assert!(result.unwrap().is_some());
-        assert_eq!(calls, ["app-server --help", "app-server daemon start --help", "app-server daemon version", "app-server daemon status --json", "start", "app-server daemon version"]);
+        assert_eq!(calls, ["app-server --help", "app-server daemon start --help", "app-server daemon version", "app-server daemon status --json", "start --first-installation", "app-server daemon version"]);
     }
     fs::remove_dir(&home).unwrap();
+}
+#[test]
+fn startup_first_option_requires_its_own_declaration_and_legacy_fresh_uses_individual_adapter() {
+    let home = env::current_dir().unwrap().join("target/startup-old-first-seam");
+    let name = if cfg!(windows) { "codex.exe" } else { "codex" };
+    let passive = serde_json::to_vec(&json!({"status":"stopped","managedCodexVersion":null,"appServerVersion":null,
+        "socketPath":home.join("app-server-control/app-server-control.sock"),
+        "managedCodexPath":home.join("packages/app-server-daemon/current/bin").join(name)})).unwrap();
+    for declaration in ["", "          Use --first-installation when available\n", "      --first-installation-extra\n"] {
+        let help = format!("Usage: fixture app-server daemon start [OPTIONS]\n\nOptions:\n      --existing-installation\n          Preserve installation\n{declaration}  -h, --help\n          Print help\n").into_bytes();
+        let replies = || std::collections::VecDeque::from([Ok(startup_help()), Ok(help.clone()), Err("no daemon".into()), Ok(passive.clone())]);
+        let mut startup = replies();
+        assert!(prepare_runtime_commands(
+            |_| startup.pop_front().expect("no extra query"),
+            |_| panic!("unguarded daemon start must never run"),
+            |_| Err(std::io::ErrorKind::NotFound.into()),
+        ).unwrap().is_none());
+        assert!(startup.is_empty());
+        let mut discovery = replies();
+        assert!(existing_runtime_commands(
+            |_| discovery.pop_front().expect("no extra query"),
+            |_| Err(std::io::ErrorKind::NotFound.into()),
+        ).unwrap().is_none(), "session discovery must select the same individual adapter");
+        assert!(discovery.is_empty());
+        // The same old CLI must still reuse a live server without a new first-start requirement.
+        let socket = home.join("app-server-control/app-server-control.sock");
+        let (result, calls) = startup_commands_case(vec![Ok(startup_help()), Ok(help),
+            Ok(startup_status("running", socket.to_str().unwrap()))], Err("no start".into()));
+        assert!(result.unwrap().is_some()); assert_eq!(calls.len(), 3);
+    }
+}
+#[test]
+fn startup_concurrent_installation_refusal_preserves_recovery_and_never_retries_bare_start() {
+    let root = env::current_dir().unwrap().join("target").join(format!("startup-first-race-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    let name = if cfg!(windows) { "codex.exe" } else { "codex" };
+    let passive = serde_json::to_vec(&json!({"status":"stopped","managedCodexVersion":null,"appServerVersion":null,
+        "socketPath":root.join("app-server-control/app-server-control.sock"),
+        "managedCodexPath":root.join("packages/app-server-daemon/current/bin").join(name)})).unwrap();
+    let mut replies = std::collections::VecDeque::from([Ok(startup_help()), Ok(startup_start_help()), Err("no daemon".into()), Ok(passive)]);
+    let recovery = root.join("app-server-daemon/loaded-threads.json");
+    let mut starts = Vec::new();
+    let result = prepare_runtime_commands(
+        |_| replies.pop_front().expect("no query after rejected first start"),
+        |mode| {
+            starts.push(mode);
+            // Another lifecycle operation completed after Desktop's empty observation.
+            fs::create_dir_all(recovery.parent().unwrap()).unwrap();
+            fs::write(&recovery, b"concurrent recovery sentinel").unwrap();
+            Err("first-installation start refused: existing daemon state; no state changed".into())
+        },
+        |path| fs::symlink_metadata(path),
+    );
+    assert!(result.unwrap_err().contains("first-installation start refused"));
+    assert_eq!(starts, [DaemonStart::First]);
+    assert_eq!(DaemonStart::First.option(), "--first-installation");
+    assert_eq!(DaemonStart::Existing.option(), "--existing-installation");
+    assert_eq!(fs::read(&recovery).unwrap(), b"concurrent recovery sentinel");
+    assert!(replies.is_empty());
+    fs::remove_dir_all(root).unwrap();
 }
 #[test]
 fn startup_preserves_existing_selection_recovery_and_installation_markers() {
@@ -141,7 +201,7 @@ fn startup_metadata_observation_failure_keeps_preserving_start_and_cli_error() {
     let mut observations = 0;
     let result = prepare_runtime_commands(
         |_| replies.pop_front().expect("추가 조회 금지"),
-        |preserve| { assert!(preserve); Err("CLI 원래 권한 오류: Access denied".into()) },
+        |mode| { assert_eq!(mode, DaemonStart::Existing); Err("CLI 원래 권한 오류: Access denied".into()) },
         |_| { observations += 1; Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)) },
     );
     assert!(result.unwrap_err().contains("CLI 원래 권한 오류: Access denied"));
