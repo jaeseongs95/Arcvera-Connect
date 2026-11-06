@@ -17,6 +17,7 @@ import { createMobileControl } from './mobile-control';
 import { createWeeklyUsage } from './weekly-usage';
 import './weekly-usage.css';
 import { createConversation } from './conversation';
+import { installTerminalExternalLinks } from './external-links';
 import { createContextControls } from './context-controls';
 import { createCronManager } from './cron-manager';
 import { createSubagentManager } from './subagent-manager';
@@ -32,7 +33,7 @@ function stateLabels(state: string): [string, string] { return states[state] ?? 
 const sessions = new Map<string, Session>();
 interface QueuedInput { data: string; generation: number; selectionVersion: number }
 interface QueuedResize { generation: number; selectionVersion: number; cols: number; rows: number }
-const terminals = new Map<string, { terminal: Terminal; fit: FitAddon; search: SearchAddon; card: HTMLElement; observer: ResizeObserver; input: TerminalInputQueue<QueuedInput>; resize: TerminalResizeQueue<QueuedResize>; inputWarning: boolean; resizeTimer?: ReturnType<typeof setTimeout> }>();
+const terminals = new Map<string, { terminal: Terminal; fit: FitAddon; search: SearchAddon; card: HTMLElement; observer: ResizeObserver; links: ReturnType<typeof installTerminalExternalLinks>; input: TerminalInputQueue<QueuedInput>; resize: TerminalResizeQueue<QueuedResize>; inputWarning: boolean; resizeTimer?: ReturnType<typeof setTimeout> }>();
 const conversations = new Map<string, ReturnType<typeof createConversation>>();
 const conversationOwners = new Set<string>();
 const contextControls = new Map<string, ReturnType<typeof createContextControls>>();
@@ -113,7 +114,7 @@ $('#app').innerHTML = `
     <footer><span class="footer-hints">드래그로 순서 변경 <i>·</i> 경계선으로 크기 조절 <i>·</i> Alt + 1–9</span><span id="save-status">레이아웃 자동 저장</span></footer>
   </main>
   <div id="toast-area" class="toast-area" role="status" aria-live="polite"></div>
-  <dialog id="settings-dialog" aria-labelledby="settings-title"><div class="dialog-heading"><h2 id="settings-title">설정</h2><button id="settings-close" class="icon-button" data-close aria-label="설정 닫기" autofocus>×</button></div><div class="settings-options"><button id="codex-settings-open" class="side-link" aria-haspopup="dialog" aria-controls="codex-settings-dialog"><span>⚙</span> 실행 파일 설정</button><button id="attachment-storage-open" class="side-link" aria-haspopup="dialog" aria-controls="attachment-storage-dialog"><span>▣</span> 첨부 저장 공간</button><button id="extensions-open" class="side-link" aria-haspopup="dialog" aria-controls="extensions-dialog"><span>◇</span> <span id="extensions-open-label">플러그인·스킬</span></button><button id="external-toggle" class="side-link" aria-haspopup="dialog" aria-controls="external-dialog"><span>◉</span> 외부 세션 <span class="readonly">읽기 전용</span></button></div><div class="language-setting"><label for="language-select">언어</label><select id="language-select"><option value="ko">한국어</option><option value="en">English</option></select><small id="language-error" role="alert" hidden></small></div></dialog>
+  <dialog id="settings-dialog" aria-labelledby="settings-title"><div class="dialog-heading"><h2 id="settings-title">설정</h2><button id="settings-close" class="icon-button" data-close aria-label="설정 닫기" autofocus>×</button></div><div class="settings-options"><button id="codex-settings-open" class="side-link" aria-haspopup="dialog" aria-controls="codex-settings-dialog"><span>⚙</span> 실행 파일 설정</button><button id="attachment-storage-open" class="side-link" aria-haspopup="dialog" aria-controls="attachment-storage-dialog"><span>▣</span> 첨부 저장 공간</button><button id="extensions-open" class="side-link" aria-haspopup="dialog" aria-controls="extensions-dialog"><span>◇</span> <span id="extensions-open-label">플러그인·스킬·Hook</span></button><button id="external-toggle" class="side-link" aria-haspopup="dialog" aria-controls="external-dialog"><span>◉</span> 외부 세션 <span class="readonly">읽기 전용</span></button></div><div class="language-setting"><label for="language-select">언어</label><select id="language-select"><option value="ko">한국어</option><option value="en">English</option></select><small id="language-error" role="alert" hidden></small></div></dialog>
   <dialog id="create-dialog"><form id="create-form"><div class="dialog-heading"><span class="eyebrow">NEW SESSION</span><button type="button" class="icon-button" data-close aria-label="닫기">×</button></div><h2>새 세션 만들기</h2><p>선택한 프로젝트에서 로컬 에이전트를 시작합니다.</p><label for="session-title">세션 이름</label><input id="session-title" name="title" placeholder="예: API 개선" required maxlength="120"/><label for="session-cwd">프로젝트 경로</label><input id="session-cwd" name="cwd" placeholder="C:\\work\\my-project" required/><small>실제로 존재하는 로컬 디렉터리의 절대 경로를 입력하세요.</small><label for="session-thread">이어갈 스레드 ID <span class="optional">선택</span></label><input id="session-thread" name="thread" placeholder="비워 두면 새 대화로 시작합니다"/><div id="create-error" class="inline-error" role="alert" hidden></div><div class="dialog-actions"><button type="button" class="quiet-button" data-close>취소</button><button id="create-submit" class="primary-button" type="submit">세션 시작 →</button></div></form></dialog>
   <dialog id="restore-dialog"><div class="dialog-heading"><span class="eyebrow">SAVED WORKSPACE</span><button class="icon-button" data-close aria-label="닫기">×</button></div><h2>저장된 세션</h2><p>이전에 실행 중이던 대화는 자동으로 연결합니다. 남은 항목은 선택해서 다시 연결할 수 있습니다.</p><div id="restore-list" class="restore-list"></div></dialog>
   <dialog id="external-dialog"><div class="dialog-heading"><span class="eyebrow">READ ONLY</span><button class="icon-button" data-close aria-label="닫기">×</button></div><h2>외부 세션</h2><p>다른 앱에서 발견한 기록입니다. 관측 정보이며 현재 실행 상태는 미확인입니다. 입력하거나 종료할 수 없습니다.</p><button id="external-refresh" class="quiet-button">새로 고침</button><div id="external-list" class="external-list"></div></dialog>
@@ -296,15 +297,23 @@ function selectedProjectId() { return importedProjects.find(project => `id:${pro
 function visibleOrder() { return order.filter(id => isVisible(id)); }
 function visibleSessions() { return visibleOrder().map(id => sessions.get(id)!); }
 function isVisible(id: string) { const session = sessions.get(id); return !!session && (!selectedProject || sessionProjectKey(session, importedProjects) === selectedProject); }
-function selectProject(key: string) {
+function selectProject(key: string, scrollExisting = false) {
+  const projectChanged = key !== selectedProject;
+  const previousVisible = new Set(visibleOrder().filter(id => !terminals.get(id)!.card.hidden));
   projectSelectionVersion++; selectedProject = key; maximized = ''; dragging = '';
   if (!isVisible(active)) active = visibleOrder()[0] ?? '';
   for (const [id, view] of terminals) { view.input.cancelPending(); view.resize.cancelPending(); clearTimeout(view.resizeTimer); refreshInputState(id); if (!isVisible(id)) view.terminal.blur(); }
   bindText($('#search-result'), '', '');
+  const newlyVisible = new Set(visibleOrder().filter(id => projectChanged || scrollExisting || !previousVisible.has(id)));
   renderAll();
   const selectionVersion = projectSelectionVersion;
-  for (const id of visibleOrder()) {
+  for (const id of newlyVisible) {
     const view = terminals.get(id)!; const generation = sessions.get(id)!.generation;
+    // Already visible conversation cards do not reload through setForeground.
+    const conversation = conversations.get(id);
+    if (conversation && previousVisible.has(id)) void conversation.revealLatest(() =>
+      projectSelectionVersion === selectionVersion && terminals.get(id) === view &&
+      sessions.get(id)?.generation === generation && !view.card.hidden && conversations.get(id) === conversation);
     // 선행 출력 파싱 뒤, 현재 선택과 터미널에만 최신 화면 위치를 적용한다.
     view.terminal.write('', () => {
       if (projectSelectionVersion !== selectionVersion || terminals.get(id) !== view || sessions.get(id)?.generation !== generation || view.card.hidden) return;
@@ -533,11 +542,11 @@ function mountConversation(session: Session) {
   toggle.hidden = true;
   const subagentsButton = card.querySelector<HTMLButtonElement>('.subagents-open')!;
   const cronButton = card.querySelector<HTMLButtonElement>('.cron-open')!;
-  subagentsButton.hidden = true; cronButton.hidden = true;
+  subagentsButton.hidden = true; cronButton.hidden = false;
   toggle.setAttribute('aria-pressed', 'false');
   function getConversation() {
     if (!conversation) {
-      conversation = createConversation({ sessionId: session.id, generation: session.generation, host: conversationHost, call,
+      conversation = createConversation({ sessionId: session.id, generation: session.generation, host: conversationHost, call, onLinkError: error => notifyError('외부 링크 열기 실패', 'Could not open external link', error),
         ownerChanged(owned) { if (conversations.get(session.id) !== conversation) return; if (owned) { conversationOwners.add(session.id); input.cancelPending(); } else conversationOwners.delete(session.id); refreshInputState(session.id); },
       });
       conversations.set(session.id, conversation);
@@ -567,34 +576,19 @@ function mountConversation(session: Session) {
   contextControls.get(session.id)?.dispose();
   contextControls.set(session.id, createContextControls({
     host: card.querySelector<HTMLElement>('.context-controls')!, statusHost: card.querySelector<HTMLElement>('.session-compaction')!, sessionId: session.id, generation: session.generation, call, notify,
-    capabilitiesChanged(supported) { toggle.hidden = !supported.passiveSubscription; subagentsButton.hidden = !supported.subagents; cronButton.hidden = !supported.cron; },
-    async prepare() {
-      if (toggle.disabled) throw new Error('대화 화면 전환 중');
-      toggle.disabled = true;
-      try {
-        const controller = getConversation();
-        await controller.setVisible(true);
-        await controller.setForeground(!card.hidden && !document.hidden && nativeWindowVisible);
-        card.querySelector<HTMLElement>('.terminal-host')!.hidden = true;
-        toggle.setAttribute('aria-pressed', 'true');
-      } catch (error) {
-        const showingConversation = !conversationHost.hidden;
-        card.querySelector<HTMLElement>('.terminal-host')!.hidden = showingConversation;
-        toggle.setAttribute('aria-pressed', String(showingConversation));
-        throw error;
-      } finally { toggle.disabled = false; }
-    },
-    compact: () => getConversation().compact(),
+    capabilitiesChanged(supported) { toggle.hidden = !supported.passiveSubscription; subagentsButton.hidden = !supported.subagents; },
+    compact: () => conversation && !conversationHost.hidden ? conversation.compact() : call('conversation_request', { id: session.id, generation: session.generation, request: { type: 'compact' } }),
   }));
 }
 
 function createTerminal(session: Session) {
   const card = document.createElement('article'); card.className = 'terminal-card'; card.dataset.id = session.id;
-  card.innerHTML = `<header class="terminal-header"><span class="drag-handle" draggable="true" title="드래그로 순서 변경" aria-hidden="true">⠿</span><span class="terminal-title"></span><span class="session-compaction" role="status" hidden></span><span class="session-state"></span><div class="card-actions"><button class="session-id-copy icon-button" type="button" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="12" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></svg></button><span class="context-controls"></span><button class="subagents-open icon-button" type="button" aria-haspopup="dialog" aria-controls="subagents-dialog"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="5" r="3"/><circle cx="5" cy="19" r="3"/><circle cx="19" cy="19" r="3"/><path d="M12 8v4M5 16v-4h14v4"/></svg></button><button class="cron-open icon-button" type="button" aria-haspopup="dialog" aria-controls="cron-dialog"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 6v6l4 2"/></svg></button><button class="move-left icon-button" aria-label="앞으로 이동" title="앞으로 이동">‹</button><button class="move-right icon-button" aria-label="뒤로 이동" title="뒤로 이동">›</button><button class="conversation-toggle icon-button" type="button" aria-label="대화 보기" title="대화 / 터미널">☷</button><button class="maximize icon-button" aria-label="세션 최대화" title="세션 최대화">⛶</button><button class="session-restart icon-button" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M20 12a8 8 0 1 0-2.3 5.7"/></svg></button><button class="stop icon-button" aria-label="이 세션 종료" title="이 세션 종료">×</button></div></header><div class="terminal-path"></div><div class="terminal-host"></div><div class="terminal-footer"><span class="terminal-identity"></span><span class="terminal-hint">Shift+드래그 선택 · Ctrl+C 복사 · Ctrl+V 붙여넣기</span></div>`;
+  card.innerHTML = `<header class="terminal-header"><span class="drag-handle" draggable="true" title="드래그로 순서 변경" aria-hidden="true">⠿</span><span class="terminal-title"></span><span class="session-compaction" role="status" hidden></span><span class="session-state"></span><div class="card-actions"><button class="session-id-copy icon-button" type="button" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="12" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></svg></button><span class="context-controls"></span><button class="subagents-open icon-button" type="button" aria-haspopup="dialog" aria-controls="subagents-dialog"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="5" r="3"/><circle cx="5" cy="19" r="3"/><circle cx="19" cy="19" r="3"/><path d="M12 8v4M5 16v-4h14v4"/></svg></button><button class="cron-open icon-button" type="button" aria-haspopup="dialog" aria-controls="cron-dialog"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 6v6l4 2"/></svg></button><button class="conversation-toggle icon-button" type="button" aria-label="대화 보기" title="대화 / 터미널">☷</button><button class="maximize icon-button" aria-label="세션 최대화" title="세션 최대화">⛶</button><button class="session-restart icon-button" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M20 12a8 8 0 1 0-2.3 5.7"/></svg></button><button class="stop icon-button" aria-label="이 세션 종료" title="이 세션 종료">×</button></div></header><div class="terminal-path"></div><div class="terminal-host"></div><div class="terminal-footer"><span class="terminal-identity"></span><span class="terminal-hint">Shift+드래그 선택 · Ctrl+C 복사 · Ctrl+V 붙여넣기</span></div>`;
   localizeMarkup(card);
   const terminal = new Terminal({ fontFamily: '"Cascadia Code", "Cascadia Mono", Consolas, monospace', fontSize: 12, lineHeight: 1.45, cursorBlink: true, scrollback: 10000, disableStdin: !native, allowProposedApi: false, theme: { background: '#141820', foreground: '#ced5e3', cursor: '#a5b4fc', selectionBackground: '#3b4567', black: '#212735', red: '#f78b99', green: '#91d6ad', yellow: '#eac184', blue: '#8eaafb', magenta: '#c4a4f3', cyan: '#87cfd9', white: '#e3e8f0' } });
   const fit = new FitAddon(); const search = new SearchAddon(); terminal.loadAddon(fit); terminal.loadAddon(search);
   $('#grid').append(card); terminal.open(card.querySelector('.terminal-host')!);
+  const links = installTerminalExternalLinks(terminal, error => notifyError('외부 링크 열기 실패', 'Could not open external link', error));
   let frame = 0;
   const observer = new ResizeObserver(() => { cancelAnimationFrame(frame); frame = requestAnimationFrame(() => { if (card.offsetWidth && card.offsetHeight) fit.fit(); }); });
   observer.observe(card.querySelector('.terminal-host')!);
@@ -608,7 +602,7 @@ function createTerminal(session: Session) {
     if (!current || value.selectionVersion !== projectSelectionVersion || current.generation !== value.generation || !canType(session.id)) return;
     await call('session_resize', { id: session.id, generation: value.generation, cols: value.cols, rows: value.rows });
   }, error => notifyError('터미널 크기 변경 실패', 'Could not resize terminal', error));
-  terminals.set(session.id, { terminal, fit, search, card, observer, input, resize, inputWarning: false });
+  terminals.set(session.id, { terminal, fit, search, card, observer, links, input, resize, inputWarning: false });
   refreshInputState(session.id);
   mountConversation(session);
   terminal.onData(data => sendInput(session.id, data));
@@ -662,10 +656,8 @@ function createTerminal(session: Session) {
   subagentsButton.onclick = () => { const current = sessions.get(session.id); if (!subagentsButton.hidden && current?.active && current.threadId && !exitInProgress) void subagentManager.open(current); };
   const cronButton = card.querySelector<HTMLButtonElement>('.cron-open')!;
   bindAttribute(cronButton, 'aria-label', '예약 작업', 'Scheduled jobs'); bindAttribute(cronButton, 'title', '예약 작업', 'Scheduled jobs');
-  cronButton.onclick = () => { const current = sessions.get(session.id); if (!cronButton.hidden && current?.active && !exitInProgress) void cronManager.open(current); };
+  cronButton.onclick = () => { const current = sessions.get(session.id); if (!cronButton.hidden && current && !exitInProgress) void cronManager.open(current); };
   const projectMove = document.createElement('button'); projectMove.className = 'project-move icon-button'; projectMove.textContent = '▱'; bindAttribute(projectMove, 'aria-label', '프로젝트로 이동', 'Move to project'); bindAttribute(projectMove, 'title', '프로젝트로 이동', 'Move to project'); projectMove.onclick = () => projectManager.move(sessions.get(session.id)!); card.querySelector('.card-actions')!.prepend(projectMove);
-  card.querySelector('.move-left')!.addEventListener('click', () => move(session.id, -1));
-  card.querySelector('.move-right')!.addEventListener('click', () => move(session.id, 1));
   card.querySelector('.drag-handle')!.addEventListener('dragstart', event => { dragging = session.id; (event as DragEvent).dataTransfer!.effectAllowed = 'move'; (event as DragEvent).dataTransfer!.setData('text/plain', session.id); card.classList.add('dragging'); });
   card.addEventListener('dragend', () => { dragging = ''; card.classList.remove('dragging'); });
   card.addEventListener('dragover', event => { if (dragging && dragging !== session.id) event.preventDefault(); });
@@ -673,7 +665,6 @@ function createTerminal(session: Session) {
   return terminal;
 }
 
-function move(id: string, offset: number) { const visible = visibleOrder(); const index = visible.indexOf(id); const next = index + offset; if (index < 0 || next < 0 || next >= visible.length) return; const from = order.indexOf(id); const to = order.indexOf(visible[next]); [order[from], order[to]] = [order[to], order[from]]; renderGrid(); renderSide(); scheduleSave(); }
 function recordExplicitStop(session: SessionInfo) {
   exitResumeIntents.delete(session.id); explicitlyStoppedSessions.add(session.id);
   if (!session.threadId) return;
@@ -691,7 +682,7 @@ function removeSession(id: string, preserveRestore = false) {
     workspaceSlots = workspaceSlots.filter(slot => typeof slot === 'string' || !removed.includes(slot));
     updateRestoreBanner();
   }
-  contextControls.get(id)?.dispose(); contextControls.delete(id); workspaceSlots = workspaceSlots.filter(slot => slot !== id); exitResumeIntents.delete(id); failedRestoreCards.delete(id); explicitlyStoppedSessions.delete(id); const view = terminals.get(id); const conversation = conversations.get(id); conversations.delete(id); conversationOwners.delete(id); if (conversation) void conversation.dispose({ sessionEnded: true }).catch(error => notify('대화 연결 정리를 확인하지 못했습니다. 세션 상태를 확인하세요.', true, 'Conversation cleanup could not be confirmed. Check the session status.')); clearTimeout(view?.resizeTimer); view?.input.dispose(); view?.resize.dispose(); view?.observer.disconnect(); view?.terminal.dispose(); view?.card.remove(); terminals.delete(id); sessions.delete(id); order = order.filter(item => item !== id); if (maximized === id) maximized = ''; if (active === id) active = visibleOrder()[0] ?? ''; renderAll(); scheduleSave(); }
+  contextControls.get(id)?.dispose(); contextControls.delete(id); workspaceSlots = workspaceSlots.filter(slot => slot !== id); exitResumeIntents.delete(id); failedRestoreCards.delete(id); explicitlyStoppedSessions.delete(id); const view = terminals.get(id); const conversation = conversations.get(id); conversations.delete(id); conversationOwners.delete(id); if (conversation) void conversation.dispose({ sessionEnded: true }).catch(error => notify('대화 연결 정리를 확인하지 못했습니다. 세션 상태를 확인하세요.', true, 'Conversation cleanup could not be confirmed. Check the session status.')); clearTimeout(view?.resizeTimer); view?.input.dispose(); view?.resize.dispose(); view?.observer.disconnect(); view?.links.dispose(); view?.terminal.dispose(); view?.card.remove(); terminals.delete(id); sessions.delete(id); order = order.filter(item => item !== id); if (maximized === id) maximized = ''; if (active === id) active = visibleOrder()[0] ?? ''; renderAll(); scheduleSave(); }
 
 function receiveSession(info: SessionInfo, persist = true) {
   if (retiredRestartSessions.has(info.id)) return;
@@ -734,14 +725,14 @@ async function resolveOrphan(id: string) {
 function receiveOutput(output: Output) {
   if (retiredRestartSessions.has(output.id)) { ack(output); return; }
   const session = sessions.get(output.id);
-  if (!session) {
+  if (session && !acceptOutput(session, output)) { ack(output); return; }
+  if (!session || session.state === 'starting') {
     const queue = pending.get(output.id) ?? [];
     // Bound startup metadata races; do not permit an orphan event to grow memory forever.
-    if (pending.size < 32 && queue.reduce((size, part) => size + part.data.length, 0) + output.data.length <= 524288) { queue.push(output); pending.set(output.id, queue); void resolveOrphan(output.id); }
+    if ((pending.has(output.id) || pending.size < 32) && queue.reduce((size, part) => size + part.data.length, 0) + output.data.length <= 524288) { queue.push(output); pending.set(output.id, queue); void resolveOrphan(output.id); }
     else { notify('메타데이터가 없는 터미널 출력이 버퍼 한도를 초과했습니다.', true, 'Terminal output without metadata exceeded the buffer limit.'); ack(output); }
     return;
   }
-  if (!acceptOutput(session, output)) { ack(output); return; }
   session.seq = output.seq;
   const terminal = terminals.get(output.id)?.terminal;
   if (terminal) terminal.write(output.data, () => ack(output)); else ack(output);
@@ -874,7 +865,7 @@ function renderAll() {
     card.querySelector<HTMLButtonElement>('.session-id-copy')!.disabled = demo || !session.threadId;
     card.querySelector<HTMLButtonElement>('.session-restart')!.disabled = !native || !workspaceReady || restoringWorkspace || exitInProgress || restartingSessions.has(id) || !session.threadId || ['starting', 'stopping'].includes(session.state);
     card.querySelector<HTMLButtonElement>('.stop')!.disabled = restartingSessions.has(id) || exitInProgress;
-    card.querySelector<HTMLButtonElement>('.cron-open')!.disabled = !session.active || exitInProgress;
+    card.querySelector<HTMLButtonElement>('.cron-open')!.disabled = !native || exitInProgress;
     card.querySelector<HTMLButtonElement>('.subagents-open')!.disabled = !native || !session.active || !session.threadId || exitInProgress;
     card.querySelector('.terminal-title')!.textContent = session.title;
     card.querySelector('.terminal-path')!.textContent = `▱  ${session.cwd}`;
@@ -922,7 +913,7 @@ const projectManager = createProjectManager({
     if (project) selectProject(`id:${project.id}`);
     scheduleSave();
   },
-  moved(info) { receiveSession(info); selectProject(sessionProjectKey(info, importedProjects)); focusSession(info.id); },
+  moved(info) { receiveSession(info); selectProject(sessionProjectKey(info, importedProjects), true); focusSession(info.id); },
 });
 $('#project-create').onclick = () => projectManager.open();
 for (const id of ['new-session', 'side-add', 'empty-add']) $(`#${id}`).onclick = () => openCreate();
@@ -942,7 +933,7 @@ const weeklyUsage = createWeeklyUsage({ call, initiallyVisible: !native });
 const questionCenter = createQuestionCenter({ call, button: $<HTMLButtonElement>('#notifications'), openSession: focusSession });
 document.body.append(questionCenter.element);
 $('.sidebar').append(weeklyUsage.element);
-bindText($('#extensions-open-label'), '플러그인·스킬', 'Plugins & skills');
+bindText($('#extensions-open-label'), '플러그인·스킬·Hook', 'Plugins, skills & hooks');
 $('#extensions-open').onclick = () => extensionsManager.open(selectedProjectCwd());
 const attachmentStorage = createAttachmentStorage(call, id => sessions.get(id)?.title);
 $('#attachment-storage-open').onclick = () => attachmentStorage.open();
@@ -1238,7 +1229,7 @@ function seedDemo() {
   setActive('demo-0', false);
 }
 
-window.addEventListener('beforeunload', () => { exitInProgress = true; for (const unlisten of unlisteners) unlisten(); for (const view of terminals.values()) { clearTimeout(view.resizeTimer); view.input.dispose(); view.resize.dispose(); view.observer.disconnect(); view.terminal.dispose(); } });
+window.addEventListener('beforeunload', () => { exitInProgress = true; for (const unlisten of unlisteners) unlisten(); for (const view of terminals.values()) { clearTimeout(view.resizeTimer); view.input.dispose(); view.resize.dispose(); view.observer.disconnect(); view.links.dispose(); view.terminal.dispose(); } });
 initialization = initialize();
 
 window.addEventListener('beforeunload', () => questionCenter.dispose());

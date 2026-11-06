@@ -106,6 +106,7 @@ struct Harness {
     collector_stop: Arc<AtomicBool>,
     collector: Option<thread::JoinHandle<()>>,
     errors: Arc<Mutex<Vec<String>>>,
+    cursor_reply_errors: Arc<Mutex<HashMap<(String, u64), String>>>,
     capture: mpsc::SyncSender<Capture>,
     sessions_started: Arc<AtomicU64>,
 }
@@ -132,6 +133,8 @@ impl Harness {
         let output_frames = Arc::new(AtomicU64::new(0));
         let ack = Arc::new(AtomicBool::new(true));
         let errors = Arc::new(Mutex::new(Vec::new()));
+        let cursor_reply_errors = Arc::new(Mutex::new(HashMap::new()));
+        let reply_errors = cursor_reply_errors.clone();
         let collector_stop = Arc::new(AtomicBool::new(false));
         let (writing, bytes, frames, acknowledging, failures, stopping, backend) = (output.clone(), output_bytes.clone(), output_frames.clone(), ack.clone(), errors.clone(), collector_stop.clone(), engine.clone());
         let collector = thread::spawn(move || {
@@ -149,7 +152,12 @@ impl Harness {
                         let scan = tail.clone() + &event.data;
                         *tail = scan.chars().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect();
                         for _ in 0..scan.matches("\x1b[6n").count() {
-                            let _ = backend.write(&event.id, event.generation, "\x1b[1;1R");
+                            if let Err(error) = backend.write(&event.id, event.generation, "\x1b[1;1R") {
+                                // A late query after stop may be discarded normally.
+                                // Preserve the first cause for this exact readiness
+                                // check without failing unrelated completed checks.
+                                reply_errors.lock().unwrap().entry((event.id.clone(), event.generation)).or_insert(error);
+                            }
                         }
                         let mut entries = writing.lock().unwrap();
                         let text = entries.entry(event.id).or_default();
@@ -166,7 +174,7 @@ impl Harness {
                 }
             }
         });
-        Ok(Self { engine, output, output_bytes, output_frames, ack, collector_stop, collector: Some(collector), errors, capture: sender, sessions_started: Arc::new(AtomicU64::new(0)) })
+        Ok(Self { engine, output, output_bytes, output_frames, ack, collector_stop, collector: Some(collector), errors, cursor_reply_errors, capture: sender, sessions_started: Arc::new(AtomicU64::new(0)) })
     }
 
     fn start(&self, script: &str) -> Result<SessionInfo, String> {
@@ -192,6 +200,7 @@ impl Harness {
         // Native finish only means events were sent; this FIFO barrier proves
         // the renderer fixture consumed all earlier output before we inspect it.
         self.barrier()?;
+        self.cursor_reply_errors.lock().unwrap().remove(&(info.id.clone(), info.generation));
         Ok(self.output.lock().unwrap().remove(&info.id).unwrap_or_default())
     }
 
@@ -200,8 +209,10 @@ impl Harness {
         loop {
             if self.output.lock().unwrap().get(&info.id).is_some_and(|text| text.contains(marker)) { return Ok(()); }
             if Instant::now() >= deadline {
+                self.barrier()?;
+                let reply_error = self.cursor_reply_errors.lock().unwrap().get(&(info.id.clone(), info.generation)).cloned();
                 let output = self.take_output(info)?;
-                return Err(format!("fixture readiness marker {marker:?} was not observed; pure-fixture output tail={}", fixture_tail(&output)));
+                return Err(format!("fixture readiness marker {marker:?} was not observed; pure-fixture output tail={}; fixture DSR reply failure: session={} generation={} error={reply_error:?}", fixture_tail(&output), info.id, info.generation));
             }
             thread::sleep(Duration::from_millis(10));
         }
@@ -480,9 +491,9 @@ fn fixture_tail(output: &str) -> String {
 
 #[cfg(windows)]
 fn unrelated_listener_receives_no_authentication() -> Result<(), String> {
-    use crate::{codex, process_job::{LaunchGate, ProcessJob}};
-    use std::{io::Read, net::TcpListener, os::windows::process::CommandExt, process::{Child, Stdio}};
-    struct OwnedSleeper { child: Child, job: Option<ProcessJob>, gate: LaunchGate }
+    use crate::{codex, process_job::ProcessJob, owned_process::{self, Child, Command, Stdio}};
+    use std::{io::Read, net::TcpListener};
+    struct OwnedSleeper { child: Child, job: Option<ProcessJob> }
     impl Drop for OwnedSleeper {
         fn drop(&mut self) {
             if let Some(job) = self.job.take() { let _ = job.terminate(); }
@@ -497,13 +508,13 @@ fn unrelated_listener_receives_no_authentication() -> Result<(), String> {
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
     let endpoint = format!("ws://{}", listener.local_addr().map_err(|e| e.to_string())?);
     let executable = PathBuf::from(std::env::var_os("SystemRoot").ok_or("SystemRoot is not defined")?).join("System32/WindowsPowerShell/v1.0/powershell.exe");
-    let (mut command, gate) = LaunchGate::wrap_std(executable.as_os_str())?;
+    let mut command = Command::new(executable.as_os_str());
     command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 30"])
         .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).creation_flags(0x08000000);
-    let child = command.spawn().map_err(|e| format!("spawn isolated ownership fixture: {e}"))?;
-    let mut sleeper = OwnedSleeper { child, job: None, gate };
-    sleeper.job = Some(ProcessJob::assign_std(&sleeper.child)?);
-    sleeper.gate.release()?;
+    let job = ProcessJob::new(false)?;
+    let (child, pending) = owned_process::spawn_suspended(&mut command, job.as_handle())?;
+    let mut sleeper = OwnedSleeper { child, job: Some(job) };
+    pending.resume()?;
     let receiving = thread::spawn(move || -> Result<usize, String> {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut socket = loop {
@@ -813,6 +824,23 @@ mod resize_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn readiness_timeout_preserves_collector_dsr_reply_failure() {
+        let harness = super::Harness::new().unwrap();
+        let info = crate::session::SessionInfo {
+            id: "dsr-reply-failure-fixture".into(), generation: 17, title: "DSR failure".into(),
+            cwd: String::new(), project_id: None, project_assigned: false, project_revision: 0,
+            thread_id: None, state: "starting".into(), active: true,
+        };
+        harness.capture.send(super::Capture::Event(crate::session::BackendEvent::Output(crate::session::TerminalOutput {
+            id: info.id.clone(), generation: info.generation, seq: 1, data: "\x1b[6n".into(),
+        }))).unwrap();
+        let error = harness.wait_output(&info, "owned-tree-ready", std::time::Duration::ZERO).unwrap_err();
+        assert!(error.contains("owned-tree-ready"), "{error}");
+        assert!(error.contains("\\u001b[6n"), "{error}");
+        assert!(error.contains("fixture DSR reply failure: session=dsr-reply-failure-fixture generation=17 error=Some(\"session not found\")"), "{error}");
+    }
+
     #[test]
     fn engine_control_smoke_requires_explicit_option_and_rejects_unknown_options() {
         let report = std::env::temp_dir().join("opendiy-smoke-options.json");

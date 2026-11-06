@@ -217,7 +217,7 @@ mod tests {
         }
     }
     fn fixture(socket: Option<TcpStream>) -> CodexSession {
-        CodexSession {command:CommandBuilder::new("예약-미송신-시험"),server:None,job:None,_launch_gate:None,stopped:Arc::new(AtomicBool::new(false)),socket,observer:None,mobile:None,shared:None,proxy_job:None,conversation:None}
+        CodexSession {command:CommandBuilder::new("예약-미송신-시험"),server:None,job:None,stopped:Arc::new(AtomicBool::new(false)),socket,observer:None,mobile:None,shared:None,proxy_job:None,conversation:None}
     }
     #[test]
     fn cron_requests_reject_unknown_fields_wrong_shapes_and_missing_mutation_identity() {

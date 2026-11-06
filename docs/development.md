@@ -14,17 +14,21 @@ npm ci
 npm test
 npm run build
 node scripts/notices.mjs
-cargo build --locked --manifest-path src-tauri/Cargo.toml --bin opendiy-desktop-helper
 cargo test --locked --manifest-path src-tauri/Cargo.toml
 npm run tauri -- dev
 ```
 
-Package the console helper before the desktop bundle:
+Package the desktop bundle:
 
 ```powershell
-cargo build --locked --manifest-path src-tauri/Cargo.toml --release --bin opendiy-desktop-helper
 npm run tauri -- build --config src-tauri/tauri.bundle.conf.json --bundles nsis
 ```
+
+Desktop 1.2.0 launches work processes directly in Windows Jobs. There is no
+separate Desktop helper binary to build or distribute. Codex and shell processes
+remain separate from Desktop. The patched portable-pty dependency is kept under
+`src-tauri/vendor/portable-pty`.
+
 If Unicode workspace paths cause native tool failures, build in a separate
 checkout under `D:/codex/build/opendiy-desktop`.
 Generate third-party notices before native compilation; they are bundled
@@ -74,6 +78,15 @@ Before testing, specify each requirement's input, preconditions, procedure,
 expected result and pass/fail rule. Record actual results against the exact
 candidate. Keep fixture, source inspection, CI, native diagnostics and real GUI
 interaction evidence distinct.
+
+The feature-specific cases document required behavior and the scope of earlier
+checks: [hook management](hooks-test-cases.md),
+[session context settings](session-context-test-cases.md),
+[plugin management](plugin-manager-test-cases.md),
+[project-switch scrolling](project-switch-scroll-test-cases.md) and
+[process ownership](process-consolidation-test-cases.md).
+Results for another commit or executable do not establish GUI success for the
+1.2.0 integration candidate. Record its own validation results in its release notes.
 
 The [historical validation record](validation.md) describes only the commits and
 tests named there. The [Task Manager capture](real-world-task-manager.png)

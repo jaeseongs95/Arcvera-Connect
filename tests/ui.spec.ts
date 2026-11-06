@@ -23,7 +23,8 @@ test('design demo preserves terminals through layout, reorder, keyboard selectio
   await page.mouse.move(box.x + box.width / 2 + 90, box.y + 80, { steps: 5 });
   await page.mouse.up();
   await expect.poll(async () => (await cards.nth(0).boundingBox())!.width).toBeGreaterThan(before!.width + 50);
-  await cards.nth(0).getByLabel('뒤로 이동').click();
+  await expect(page.locator('.move-left, .move-right')).toHaveCount(0);
+  await cards.nth(0).locator('.drag-handle').dragTo(cards.nth(1).locator('.terminal-header'));
   await expect(cards.nth(0).locator('.terminal-title')).toHaveText('대시보드 UI');
   await page.getByRole('button', { name: '3열', exact: true }).click();
   await expect(cards).toHaveCount(4);

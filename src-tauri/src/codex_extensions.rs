@@ -2,6 +2,9 @@
 //! cross the renderer boundary. Every short-lived process is owned and reaped.
 use super::*;
 use std::{fs, path::PathBuf, sync::atomic::AtomicBool};
+#[path = "codex_hooks.rs"]
+mod hooks;
+pub use hooks::{ExtensionHook, ExtensionHookError, ExtensionHooks};
 
 const MAX_ROWS: usize = 4096;
 // 실제 카탈로그는 9천 개를 넘는다. CLI 원문 8 MiB 제한도 별도로 유지한다.
@@ -44,6 +47,7 @@ pub struct ExtensionsSnapshot {
     pub executable: String, pub cwd: Option<String>,
     pub plugins: Option<ExtensionPlugins>, pub marketplaces: Option<Vec<ExtensionMarketplace>>,
     pub skills: Option<Vec<ExtensionSkill>>, pub skill_destinations: SkillDestinations,
+    pub hooks: Option<ExtensionHooks>,
     pub errors: Vec<ExtensionError>,
 }
 #[derive(Debug, Deserialize)]
@@ -56,6 +60,8 @@ pub enum ExtensionMutation {
     RemoveMarketplace { name: String },
     UpgradeMarketplace { name: Option<String> },
     SetSkillEnabled { path: String, enabled: bool },
+    SetHookEnabled { key: String, current_hash: String, enabled: bool },
+    TrustHook { key: String, current_hash: String },
     ImportSkill { source_path: String, name: String, scope: SkillImportScope },
 }
 #[derive(Debug, Deserialize)]
@@ -93,7 +99,7 @@ fn with_rpc<T>(exe: &OsString, cwd: &Path, operation: impl FnOnce(&mut Rpc<TcpSt
 }
 
 struct CliProcess {
-    child: Child, job: Option<ProcessJob>, _gate: LaunchGate,
+    child: Child, job: Option<ProcessJob>,
     readers: Vec<JoinHandle<Result<Vec<u8>, String>>>, stop_capture: Arc<AtomicBool>,
 }
 impl Drop for CliProcess {
@@ -107,12 +113,12 @@ impl Drop for CliProcess {
     }
 }
 #[cfg(any(not(windows), test))]
-fn capture(mut pipe: impl Read + Send + 'static, overflow: Arc<AtomicBool>) -> JoinHandle<Result<Vec<u8>, String>> {
-    capture_read(move |block| pipe.read(block), overflow)
+fn capture(name: &'static str, mut pipe: impl Read + Send + 'static, overflow: Arc<AtomicBool>) -> Result<JoinHandle<Result<Vec<u8>, String>>,String> {
+    capture_read(name, move |block| pipe.read(block), overflow)
 }
-fn capture_read(mut read: impl FnMut(&mut [u8]) -> io::Result<usize> + Send + 'static,
-    overflow: Arc<AtomicBool>) -> JoinHandle<Result<Vec<u8>, String>> {
-    thread::spawn(move || {
+fn capture_read(name: &'static str, mut read: impl FnMut(&mut [u8]) -> io::Result<usize> + Send + 'static,
+    overflow: Arc<AtomicBool>) -> Result<JoinHandle<Result<Vec<u8>, String>>,String> {
+    crate::owned_worker::spawn(name, move || {
         let mut bytes = Vec::new();
         let mut block = [0u8; 16 * 1024];
         loop {
@@ -122,14 +128,14 @@ fn capture_read(mut read: impl FnMut(&mut [u8]) -> io::Result<usize> + Send + 's
             bytes.extend_from_slice(&block[..count.min(remaining)]);
             if count > remaining { overflow.store(true, Ordering::Release); }
         }
-    })
+    }).map_err(|error|format!("Start {name} worker: {error}"))
 }
 #[cfg(windows)]
-fn capture_pipe(mut pipe: impl Read + std::os::windows::io::AsRawHandle + Send + 'static,
-    overflow: Arc<AtomicBool>, stop: Arc<AtomicBool>) -> JoinHandle<Result<Vec<u8>, String>> {
+fn capture_pipe(name: &'static str, mut pipe: impl Read + std::os::windows::io::AsRawHandle + Send + 'static,
+    overflow: Arc<AtomicBool>, stop: Arc<AtomicBool>) -> Result<JoinHandle<Result<Vec<u8>, String>>,String> {
     use windows_sys::Win32::{Foundation::ERROR_BROKEN_PIPE, System::Pipes::PeekNamedPipe};
     let mut drain_remaining = None;
-    capture_read(move |block| loop {
+    capture_read(name, move |block| loop {
         // Observe stop before peeking: a stale pre-stop byte count could lose the
         // launcher's final writes. Each read handle is owned by this reader alone.
         let stopping = stop.load(Ordering::Acquire);
@@ -156,8 +162,8 @@ fn capture_pipe(mut pipe: impl Read + std::os::windows::io::AsRawHandle + Send +
     }, overflow)
 }
 #[cfg(not(windows))]
-fn capture_pipe(pipe: impl Read + Send + 'static, overflow: Arc<AtomicBool>, _stop: Arc<AtomicBool>) -> JoinHandle<Result<Vec<u8>, String>> {
-    capture(pipe, overflow)
+fn capture_pipe(name: &'static str, pipe: impl Read + Send + 'static, overflow: Arc<AtomicBool>, _stop: Arc<AtomicBool>) -> Result<JoinHandle<Result<Vec<u8>, String>>,String> {
+    capture(name, pipe, overflow)
 }
 // JSON 명령과 startup 도움말이 같은 프로세스 소유권·출력 상한을 사용한다.
 pub(super) fn command_stdout(exe: &OsString, cwd: &Path, args: &[String], timeout: Duration) -> Result<Vec<u8>, String> {
@@ -194,18 +200,21 @@ fn command_stdout_with_job(exe: &OsString, cwd: &Path, args: &[String], deadline
 fn command_output_with_job(exe: &OsString, cwd: &Path, args: &[String], deadline: Instant, cancelled: Option<&Arc<AtomicBool>>, daemon_launcher: bool) -> Result<CliCommandOutput, String> {
     check_cancelled(cancelled)?;
     if Instant::now() >= deadline { return Err("Codex command timed out; its result is unknown. Refresh before retrying".into()); }
-    let (mut command, gate) = LaunchGate::wrap_std(exe.as_os_str())?;
+    let mut command = background_command(exe.as_os_str());
     // 조회용 CLI에는 TUI의 일회 제어 자격을 상속하지 않는다.
     command.env_remove("CODEX_DESKTOP_CRON_BOOTSTRAP").env_remove("CODEX_DESKTOP_CRON_TOKEN");
-    command.args(args).current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    hidden(&mut command);
-    let child = command.spawn().map_err(|e| format!("Start Codex command: {e}"))?;
-    let mut process = CliProcess { child, job: None, _gate: gate, readers: Vec::new(), stop_capture: Arc::new(AtomicBool::new(false)) };
-    process.job = Some(if daemon_launcher { ProcessJob::assign_daemon_launcher(&process.child)? } else { ProcessJob::assign_std(&process.child)? });
+    command.args(args).current_dir(cwd).stdin(OwnedStdio::null()).stdout(OwnedStdio::piped()).stderr(OwnedStdio::piped());
+    let job = ProcessJob::new(daemon_launcher)?;
+    let (child, pending) = owned_process::spawn_suspended(&mut command, job.as_handle())?;
+    #[cfg(all(test,windows))]
+    super::worker_failure_tests::observe(&child,&job);
+    let mut process = CliProcess { child, job: Some(job), readers: Vec::new(), stop_capture: Arc::new(AtomicBool::new(false)) };
     let overflow = Arc::new(AtomicBool::new(false));
-    process.readers.push(capture_pipe(process.child.stdout.take().ok_or("Codex stdout pipe is missing")?, overflow.clone(), process.stop_capture.clone()));
-    process.readers.push(capture_pipe(process.child.stderr.take().ok_or("Codex stderr pipe is missing")?, overflow.clone(), process.stop_capture.clone()));
-    process._gate.release()?;
+    process.readers.push(capture_pipe("codex-cli-stdout",process.child.stdout.take().ok_or("Codex stdout pipe is missing")?, overflow.clone(), process.stop_capture.clone())?);
+    process.readers.push(capture_pipe("codex-cli-stderr",process.child.stderr.take().ok_or("Codex stderr pipe is missing")?, overflow.clone(), process.stop_capture.clone())?);
+    check_cancelled(cancelled)?;
+    if Instant::now() >= deadline { return Err("Codex command timed out; its result is unknown. Refresh before retrying".into()); }
+    pending.resume()?;
     let status = loop {
         check_cancelled(cancelled)?;
         if overflow.load(Ordering::Acquire) { return Err("Codex command output exceeded 8 MiB; operation result may be unknown. Refresh before retrying".into()); }
@@ -274,6 +283,28 @@ fn parse_plugins(value: &Value) -> Result<ExtensionPlugins, String> {
         available: available.iter().map(parse_plugin).collect::<Result<_, _>>()?,
     })
 }
+fn catalog_query(query: Option<&str>) -> Result<Option<String>, String> {
+    query.map(|query| {
+        argument(query, "Plugin search", 800)?;
+        let query = query.trim();
+        if !(2..=200).contains(&query.chars().count()) { return Err("플러그인 검색어는 2~200자로 입력하세요.".into()); }
+        Ok(query.to_owned())
+    }).transpose()
+}
+fn load_plugins(query: Option<&str>, run: &mut impl FnMut(&[&str]) -> Result<Value, String>) -> Result<ExtensionPlugins, String> {
+    let query = catalog_query(query)?;
+    let args: &[&str] = if query.is_some() { &["plugin", "list", "--available", "--json"] } else { &["plugin", "list", "--json"] };
+    let mut plugins = parse_plugins(&run(args)?)?;
+    if let Some(query) = query {
+        let query = query.to_lowercase();
+        plugins.available.retain(|plugin| [&plugin.name, &plugin.plugin_id, &plugin.marketplace_name].iter().any(|field| field.to_lowercase().contains(&query)));
+    } else {
+        // Installed management never exposes a catalog returned unsolicited by
+        // a CLI. Only an explicit search opts into available-plugin results.
+        plugins.available.clear();
+    }
+    Ok(plugins)
+}
 fn parse_marketplaces(value: &Value) -> Result<Vec<ExtensionMarketplace>, String> {
     rows(value, "marketplaces")?.iter().map(|value| Ok(ExtensionMarketplace {
         name: text(value, "name", 512)?, path: Some(text(value, "root", 128 * 1024)?),
@@ -309,31 +340,50 @@ fn user_home() -> Result<PathBuf, String> {
     Ok(path)
 }
 fn destination(base: &Path) -> PathBuf { base.join(".agents").join("skills") }
-fn snapshot(exe: &OsString, directory: &Path, cwd: Option<&str>) -> ExtensionsSnapshot {
+fn snapshot(exe: &OsString, directory: &Path, cwd: Option<&str>, catalog_query: Option<&str>) -> ExtensionsSnapshot {
     let mut result = ExtensionsSnapshot {
         executable: exe.to_string_lossy().into_owned(), cwd: cwd.map(str::to_owned), plugins: None,
-        marketplaces: None, skills: None,
+        marketplaces: None, skills: None, hooks: None,
         skill_destinations: SkillDestinations { user: None, project: cwd.map(|_| destination(directory).to_string_lossy().into_owned()) }, errors: Vec::new(),
     };
     match user_home() {
         Ok(home) => result.skill_destinations.user = Some(destination(&home).to_string_lossy().into_owned()),
         Err(message) => result.errors.push(ExtensionError { section: "skills", message }),
     }
-    match cli_args(exe, directory, &["plugin", "list", "--available", "--json"]).and_then(|value| parse_plugins(&value)) {
+    match load_plugins(catalog_query, &mut |args| cli_args(exe, directory, args)) {
         Ok(plugins) => result.plugins = Some(plugins), Err(message) => result.errors.push(ExtensionError { section: "plugins", message }),
     }
     match cli_args(exe, directory, &["plugin", "marketplace", "list", "--json"]).and_then(|value| parse_marketplaces(&value)) {
         Ok(marketplaces) => result.marketplaces = Some(marketplaces), Err(message) => result.errors.push(ExtensionError { section: "marketplaces", message }),
     }
-    match with_rpc(exe, directory, |rpc| parse_skills(&rpc.call("skills/list", json!({"cwds":[directory],"forceReload":true}))?)) {
-        Ok((skills, errors)) => { result.skills = Some(skills); result.errors.extend(errors); },
-        Err(message) => result.errors.push(ExtensionError { section: "skills", message }),
+    match with_rpc(exe, directory, |rpc| Ok((
+        rpc.call("skills/list", json!({"cwds":[directory],"forceReload":true})).and_then(|value| parse_skills(&value)),
+        hooks::list(directory, &mut |method, params| rpc.call(method, params)),
+    ))) {
+        Ok((skills, hooks)) => {
+            match skills {
+                Ok((skills, errors)) => { result.skills = Some(skills); result.errors.extend(errors); },
+                Err(message) => result.errors.push(ExtensionError { section: "skills", message }),
+            }
+            match hooks {
+                Ok(hooks) => result.hooks = Some(hooks),
+                Err(message) => result.errors.push(ExtensionError { section: "hooks", message }),
+            }
+        },
+        Err(message) => {
+            result.errors.push(ExtensionError { section: "skills", message });
+            result.errors.push(ExtensionError { section: "hooks", message: "Hook 조회용 Codex 연결에 실패했습니다. 새로고침 후 다시 시도하세요.".into() });
+        },
     }
     result
 }
 pub(crate) fn extensions_list_with_executable(exe: &OsString, cwd: Option<String>, _permit: &ExtensionPermit) -> Result<ExtensionsSnapshot, String> {
+    extensions_list_with_catalog_query(exe, cwd, None, _permit)
+}
+pub(crate) fn extensions_list_with_catalog_query(exe: &OsString, cwd: Option<String>, query: Option<String>, _permit: &ExtensionPermit) -> Result<ExtensionsSnapshot, String> {
+    let query = catalog_query(query.as_deref())?;
     let directory = context(cwd.as_deref())?;
-    Ok(snapshot(exe, &directory, cwd.as_deref()))
+    Ok(snapshot(exe, &directory, cwd.as_deref(), query.as_deref()))
 }
 fn argument(value: &str, label: &str, maximum: usize) -> Result<(), String> {
     if value.trim().is_empty() || value.len() > maximum || value.chars().any(char::is_control) {
@@ -551,6 +601,12 @@ pub(crate) fn extensions_mutate_with_executable(exe: &OsString, cwd: Option<Stri
             if effective != enabled { return Err("Skill setting was written, but an effective policy overrides the requested state".into()); }
             expected_skill = Some((selected, Some(enabled)));
         }
+        ExtensionMutation::SetHookEnabled { key, current_hash, enabled } => {
+            with_rpc(exe, &directory, |rpc| hooks::mutate(&directory, &key, &current_hash, hooks::HookChange::Enabled(enabled), &mut |method, params| rpc.call(method, params)))?;
+        }
+        ExtensionMutation::TrustHook { key, current_hash } => {
+            with_rpc(exe, &directory, |rpc| hooks::mutate(&directory, &key, &current_hash, hooks::HookChange::Trust, &mut |method, params| rpc.call(method, params)))?;
+        }
         ExtensionMutation::ImportSkill { source_path, name, scope } => {
             let base = match scope {
                 SkillImportScope::User => user_home()?,
@@ -566,7 +622,7 @@ pub(crate) fn extensions_mutate_with_executable(exe: &OsString, cwd: Option<Stri
             expected_marketplace = Some((text(&response, "marketplaceName", 512)?, true));
         }
     }
-    let result = snapshot(exe, &directory, cwd.as_deref());
+    let result = snapshot(exe, &directory, cwd.as_deref(), None);
     if let Some((id, state)) = expected_plugin {
         let plugins = result.plugins.as_ref().ok_or("The CLI operation completed, but plugin verification failed; refresh before retrying")?;
         let found = plugins.installed.iter().find(|plugin| plugin.plugin_id == id);
@@ -593,6 +649,57 @@ pub(crate) fn extensions_mutate_with_executable(exe: &OsString, cwd: Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn search_plugin(id: &str, name: &str, marketplace: &str) -> Value {
+        json!({"pluginId":id,"name":name,"marketplaceName":marketplace,"version":null,"enabled":true,"source":{"source":"remote","id":"fixture"}})
+    }
+    // PM01 / PM02: verify the production command boundary, not a copied argv table.
+    #[test]
+    fn default_plugin_management_never_requests_or_displays_available_catalog() {
+        let mut calls = 0;
+        let plugins = load_plugins(None, &mut |args| {
+            calls += 1;
+            assert_eq!(args, &["plugin", "list", "--json"]);
+            Ok(json!({"installed":[search_plugin("kept@fixture", "Installed", "fixture")],
+                "available":[search_plugin("other@fixture", "Catalog", "fixture")]}))
+        }).unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(plugins.installed.len(), 1);
+        assert_eq!(plugins.installed[0].plugin_id, "kept@fixture");
+        assert!(plugins.available.is_empty());
+    }
+    // PM03: query is a local literal filter, never a shell argument or new RPC.
+    #[test]
+    fn explicit_search_requests_catalog_and_filters_name_id_and_marketplace() {
+        let mut calls = 0;
+        let plugins = load_plugins(Some("  Find  "), &mut |args| {
+            calls += 1;
+            assert_eq!(args, &["plugin", "list", "--available", "--json"]);
+            Ok(json!({"installed":[search_plugin("keep@local", "Keep", "local")], "available":[
+                search_plugin("alpha@one", "FIND by name", "one"),
+                search_plugin("find.beta@two", "Beta", "two"),
+                search_plugin("gamma@Find-market", "Gamma", "Find-market"),
+                search_plugin("unrelated@four", "Unrelated", "four")]}))
+        }).unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(plugins.installed[0].plugin_id, "keep@local");
+        assert_eq!(plugins.available.iter().map(|plugin| plugin.plugin_id.as_str()).collect::<Vec<_>>(), ["alpha@one", "find.beta@two", "gamma@Find-market"]);
+        // Empty successful search results remain distinct from failed queries.
+        assert!(load_plugins(Some("no match"), &mut |_| Ok(json!({"installed":[],"available":[search_plugin("alpha@one", "Alpha", "one")]}))).unwrap().available.is_empty());
+    }
+    #[test]
+    fn invalid_search_never_runs_a_cli_and_unicode_limits_count_characters() {
+        for query in ["".to_owned(), "a".into(), "  a  ".into(), "ab\n".into(), "x".repeat(201), "한".repeat(201)] {
+            assert!(load_plugins(Some(&query), &mut |_| panic!("invalid query launched CLI")).is_err());
+        }
+        assert!(catalog_query(Some("한글")).is_ok());
+        assert!(catalog_query(Some(&"한".repeat(200))).is_ok());
+    }
+    // PM06: command/response failures cannot become empty successful searches.
+    #[test]
+    fn plugin_catalog_search_preserves_cli_and_invalid_response_failures() {
+        assert_eq!(load_plugins(Some("sample"), &mut |_| Err("unsupported --available".into())).unwrap_err(), "unsupported --available");
+        assert!(load_plugins(Some("sample"), &mut |_| Ok(json!({"installed":[],"available":null}))).is_err());
+    }
     #[test]
     fn literal_plugin_keys_do_not_split_dotted_names_or_accept_options() {
         assert_eq!(plugin_key("same.name@market-place").unwrap(), "plugins.\"same.name@market-place\".enabled");
@@ -642,7 +749,7 @@ mod tests {
     #[test]
     fn output_capture_is_bounded() {
         let overflow = Arc::new(AtomicBool::new(false));
-        let output = capture(io::Cursor::new(vec![b'x'; MAX_FRAME + 100]), overflow.clone()).join().unwrap().unwrap();
+        let output = capture("codex-capture-fixture",io::Cursor::new(vec![b'x'; MAX_FRAME + 100]), overflow.clone()).unwrap().join().unwrap().unwrap();
         assert_eq!(output.len(), MAX_FRAME);
         assert!(overflow.load(Ordering::Acquire));
     }

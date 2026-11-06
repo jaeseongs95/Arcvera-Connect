@@ -59,7 +59,7 @@ for (const capability of ['absent', false, 'true', null]) {
     await expect(card.locator('.context-usage')).toBeEnabled();
     await expect(card.locator('.conversation-toggle')).toBeHidden();
     await expect(card.locator('.subagents-open')).toBeHidden();
-    await expect(card.locator('.cron-open')).toBeHidden();
+    await expect(card.locator('.cron-open')).toBeVisible();
     await expect(card.locator('.context-compact')).toBeHidden();
     await card.locator('.xterm-helper-textarea').press('p');
     await expect.poll(() => page.evaluate(() => (window as any).capabilityFixture.calls.some((c: any) => c.command === 'session_write' && c.args.data === 'p'))).toBe(true);
@@ -123,10 +123,11 @@ for (const value of [true, false, 'true', null, 'absent']) {
   test(`독립 기능 버튼은 대화 지원 없이도 자체 명시 지원만 반영한다: ${JSON.stringify(value)}`, async ({ page }) => {
     const independent = value === 'absent' ? {} : { subagentsSupported: value, cronSupported: value, compactSupported: value };
     const card = await fixture(page, false, true, independent);
-    for (const selector of ['.subagents-open', '.cron-open', '.context-compact']) await expect(card.locator(selector)).toBeHidden();
+    for (const selector of ['.subagents-open', '.context-compact']) await expect(card.locator(selector)).toBeHidden();
+    await expect(card.locator('.cron-open')).toBeVisible();
     await page.evaluate(() => (window as any).capabilityFixture.releaseStatus());
     await expect(card.locator('.conversation-toggle')).toBeHidden();
-    for (const selector of ['.subagents-open', '.cron-open', '.context-compact']) {
+    for (const selector of ['.subagents-open', '.context-compact']) {
       if (value === true) await expect(card.locator(selector)).toBeVisible();
       else await expect(card.locator(selector)).toBeHidden();
     }
@@ -140,7 +141,8 @@ for (const value of [true, false, 'true', null, 'absent']) {
 test('대화 지원 true는 독립 기능 버튼의 지원을 대신하지 않는다', async ({ page }) => {
   const card = await fixture(page, true);
   await expect(card.locator('.conversation-toggle')).toBeVisible();
-  for (const selector of ['.subagents-open', '.cron-open', '.context-compact']) await expect(card.locator(selector)).toBeHidden();
+  for (const selector of ['.subagents-open', '.context-compact']) await expect(card.locator(selector)).toBeHidden();
+  await expect(card.locator('.cron-open')).toBeVisible();
 });
 
 test('상태 조회 실패는 이전 독립 기능 지원 표시를 지우고 PTY를 보존한다', async ({ page }) => {
@@ -148,7 +150,8 @@ test('상태 조회 실패는 이전 독립 기능 지원 표시를 지우고 PT
   await expect(card.locator('.subagents-open')).toBeVisible();
   await page.evaluate(() => { (window as any).capabilityFixture.statusFailure = true; });
   await card.locator('.context-usage').click();
-  for (const selector of ['.conversation-toggle', '.subagents-open', '.cron-open', '.context-compact']) await expect(card.locator(selector)).toBeHidden();
+  for (const selector of ['.conversation-toggle', '.subagents-open', '.context-compact']) await expect(card.locator(selector)).toBeHidden();
+  await expect(card.locator('.cron-open')).toBeVisible();
   await expect(card.locator('.context-usage')).toBeVisible();
   await card.locator('.xterm-helper-textarea').press('e');
   await expect.poll(() => page.evaluate(() => (window as any).capabilityFixture.calls.some((c: any) => c.command === 'session_write' && c.args.data === 'e'))).toBe(true);
@@ -159,7 +162,8 @@ for (const [field, selector] of [['subagentsSupported', '.subagents-open'], ['cr
   test(`독립 지원 ${field}는 해당 버튼만 표시한다`, async ({ page }) => {
     const card = await fixture(page, false, false, { [field]: true });
     await expect(card.locator(selector)).toBeVisible();
-    for (const other of ['.subagents-open', '.cron-open', '.context-compact'].filter(value => value !== selector)) await expect(card.locator(other)).toBeHidden();
+    for (const other of ['.subagents-open', '.context-compact'].filter(value => value !== selector)) await expect(card.locator(other)).toBeHidden();
+    await expect(card.locator('.cron-open')).toBeVisible();
     await expect(card.locator('.conversation-toggle')).toBeHidden();
   });
 }

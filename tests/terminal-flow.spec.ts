@@ -1,5 +1,7 @@
 import { test, expect, type Page } from '@playwright/test';
 import { writeFile } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
+import ts from 'typescript';
 
 const sessions = [
   { id: 'flow-a', title: 'Flow Alpha', cwd: 'D:\\Work\\Alpha', generation: 7, state: 'idle', active: true, threadId: 'flow-thread-a' },
@@ -20,10 +22,11 @@ async function workspace(page: Page, fixtureSessions = sessions) {
     let callback = 0;
     const callbacks = new Map<number, (value: any) => void>();
     const listeners = new Map<string, (value: any) => void>();
-    const writes: (() => void)[] = []; const resizes: (() => void)[] = [];
-    state.flow = { calls: [], sent: [], holdWrites: false, holdResize: false, activeWrites: 0, maxWrites: 0, activeResizes: 0, maxResizes: 0,
+    const writes: (() => void)[] = []; const resizes: (() => void)[] = []; const metadata: (() => void)[] = [];
+    state.flow = { calls: [], sent: [], holdWrites: false, holdResize: false, holdMetadata: false, activeWrites: 0, maxWrites: 0, activeResizes: 0, maxResizes: 0,
       releaseWrites() { this.holdWrites = false; for (const release of writes.splice(0)) release(); },
       releaseResize() { this.holdResize = false; for (const release of resizes.splice(0)) release(); },
+      releaseMetadata(info: any = {}) { Object.assign(sessions.find(item => item.id === info.id) ?? {}, info); this.holdMetadata = false; for (const release of metadata.splice(0)) release(); },
       emit(info: any) { Object.assign(sessions.find(item => item.id === info.id)!, info); listeners.get('session-changed')!({ event: 'session-changed', id: 1, payload: sessions.find(item => item.id === info.id) }); },
       output(info: any) { listeners.get('terminal-output')!({ event: 'terminal-output', id: 1, payload: info }); },
     };
@@ -38,7 +41,7 @@ async function workspace(page: Page, fixtureSessions = sessions) {
         if (command === 'get_ui_language') return 'ko';
         if (command === 'set_ui_language') return { show: 'OpenDIY Desktop 열기', exit: '종료…' };
         if (command === 'load_layout') return { version: 1, columns: 2, sessions: [] };
-        if (command === 'list_sessions') return sessions;
+        if (command === 'list_sessions') { if (flow.holdMetadata) await new Promise<void>(resolve => metadata.push(resolve)); return sessions; }
         if (command === 'list_projects') return sessions.map(item => ({ id: item.id, name: item.title, cwd: item.cwd, createdAt: 1 }));
         if (command === 'session_write') {
           if (new TextEncoder().encode(args.data).byteLength > 64 * 1024) throw Error('Native input limit');
@@ -60,6 +63,94 @@ async function workspace(page: Page, fixtureSessions = sessions) {
   await expect(card(page)).toBeVisible();
   await input(page).focus();
 }
+
+async function startingWorkspace(page: Page) {
+  await page.route('**/src/main.ts*', async route => {
+    const response = await route.fetch(); let body = await response.text();
+    if (process.env.TERMINAL_STARTUP_BASELINE === '1') {
+      const original = ts.transpileModule(execFileSync('git', ['show', '93f66e10cc1fe99166f1db84ec5cfc128116db6f:src/main.ts'], { encoding: 'utf8' }), { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } }).outputText;
+      const portion = (source: string) => {
+        const start = source.indexOf('function receiveOutput('); const end = source.indexOf('function renderCounts(', start);
+        if (start < 0 || end < 0) throw Error('원래 receiveOutput 경계를 찾지 못했습니다.');
+        return { start, end, text: source.slice(start, end) };
+      };
+      const current = portion(body); body = body.slice(0, current.start) + portion(original).text + body.slice(current.end);
+    }
+    await route.fulfill({ response, body: body + '\nwindow.__flowTerminals = terminals; window.__flowCanType = canType; window.__flowPending = pending;\n' });
+  });
+  await workspace(page, [{ ...sessions[0], state: 'starting' }]);
+  await page.evaluate(() => {
+    const state = window as any; state.flow.holdMetadata = true; state.parserWrites = [];
+    const terminal = state.__flowTerminals.get('flow-a').terminal; const write = terminal.write.bind(terminal);
+    terminal.write = (data: string, parsed?: () => void) => { if (data) state.parserWrites.push(data); return write(data, parsed); };
+    state.parseBarrier = () => new Promise<void>(resolve => terminal.write('', resolve));
+  });
+}
+
+for (const liveMetadata of ['Changed', 'list_sessions']) {
+  test(`N7 ${liveMetadata}: starting 출력 parse를 보류하고 live 뒤 실제 xterm CPR을 정확히 한 번 전달한다`, async ({ page }) => {
+    await startingWorkspace(page);
+    await input(page).press('x');
+    const before = await page.evaluate(async () => {
+      const state = window as any; const terminal = state.__flowTerminals.get('flow-a').terminal;
+      state.flow.output({ id: 'flow-a', generation: 7, seq: 1, data: 'N7-BEFORE\u001b[3;9H\u001b[6nN7-AFTER' });
+      await state.parseBarrier();
+      return { canType: state.__flowCanType('flow-a'), disableStdin: terminal.options.disableStdin, parsed: state.parserWrites, sent: state.flow.sent,
+        acks: state.flow.calls.filter((call: any) => call.command === 'session_output_ack') };
+    });
+    expect(before).toEqual({ canType: false, disableStdin: true, parsed: [], sent: [], acks: [] });
+    await page.evaluate(liveMetadata => {
+      const state = window as any;
+      if (liveMetadata === 'Changed') state.flow.emit({ id: 'flow-a', state: 'idle', active: true });
+      else state.flow.releaseMetadata({ id: 'flow-a', state: 'idle', active: true });
+    }, liveMetadata);
+    await expect.poll(() => page.evaluate(() => (window as any).flow.sent.map((item: any) => ({ id: item.id, generation: item.generation, data: item.data })))).toEqual([{ id: 'flow-a', generation: 7, data: '\u001b[3;9R' }]);
+    await expect.poll(() => page.evaluate(() => (window as any).flow.calls.filter((call: any) => call.command === 'session_output_ack').map((call: any) => call.args))).toEqual([{ id: 'flow-a', generation: 7, seq: 1 }]);
+    await page.evaluate(async () => { const state = window as any; state.flow.releaseMetadata(); await state.parseBarrier(); });
+    expect(await page.evaluate(() => { const state = window as any; return { canType: state.__flowCanType('flow-a'), disableStdin: state.__flowTerminals.get('flow-a').terminal.options.disableStdin, parsed: state.parserWrites.length, sent: state.flow.sent.length, pending: state.__flowPending.size }; })).toEqual({ canType: true, disableStdin: false, parsed: 1, sent: 1, pending: 0 });
+    await input(page).press('z');
+    await expect.poll(() => page.evaluate(() => (window as any).flow.sent.map((item: any) => item.data))).toEqual(['\u001b[3;9R', 'z']);
+  });
+}
+
+test('N7 stale generation·중복 seq·startup overflow·stopped tail과 ACK 정책을 보존한다', async ({ page }) => {
+  await startingWorkspace(page);
+  const before = await page.evaluate(async () => {
+    const state = window as any;
+    state.flow.output({ id: 'flow-a', generation: 6, seq: 100, data: 'STALE-MUST-NOT-PARSE' });
+    for (let duplicate = 0; duplicate < 2; duplicate++) state.flow.output({ id: 'flow-a', generation: 7, seq: 1, data: 'STOP-TAIL\u001b[3;9H\u001b[6n' });
+    state.flow.output({ id: 'flow-a', generation: 7, seq: 3, data: 'x'.repeat(524289) });
+    await state.parseBarrier();
+    const buffered = state.__flowPending.get('flow-a') ?? [];
+    return { parsed: state.parserWrites.map((data: string) => ({ length: data.length, prefix: data.slice(0, 80) })), pending: buffered.map((part: any) => [part.generation, part.seq]), bytes: buffered.reduce((sum: number, part: any) => sum + part.data.length, 0), acks: state.flow.calls.filter((call: any) => call.command === 'session_output_ack').map((call: any) => call.args) };
+  });
+  expect(before.parsed).toEqual([]);
+  expect(before.pending).toEqual([[7, 1], [7, 1]]);
+  expect(before.bytes).toBeLessThanOrEqual(524288);
+  expect(before.acks).toEqual([{ id: 'flow-a', generation: 6, seq: 100 }, { id: 'flow-a', generation: 7, seq: 3 }]);
+  await expect(page.locator('.toast.error')).toContainText('버퍼 한도를 초과');
+  await page.evaluate(async () => { const state = window as any; state.flow.emit({ id: 'flow-a', state: 'stopped', active: false }); state.flow.releaseMetadata(); await state.parseBarrier(); });
+  expect(await page.evaluate(() => { const state = window as any; return { parsed: state.parserWrites, sent: state.flow.sent, pending: state.__flowPending.size, canType: state.__flowCanType('flow-a'), disableStdin: state.__flowTerminals.get('flow-a').terminal.options.disableStdin }; })).toEqual({ parsed: ['STOP-TAIL\u001b[3;9H\u001b[6n'], sent: [], pending: 0, canType: false, disableStdin: true });
+});
+
+test('N7 32키에서도 기존 startup 세션 frame은 보존하고 33번째 새 키만 거절한다', async ({ page }) => {
+  await startingWorkspace(page);
+  const snapshot = await page.evaluate(async () => {
+    const state = window as any;
+    state.flow.output({ id: 'flow-a', generation: 7, seq: 1, data: 'FIRST' });
+    for (let index = 0; index < 31; index++) state.flow.output({ id: `startup-orphan-${index}`, generation: 7, seq: 1, data: 'OWN-FIXTURE' });
+    state.flow.output({ id: 'flow-a', generation: 7, seq: 2, data: 'SECOND' });
+    state.flow.output({ id: 'startup-orphan-33', generation: 7, seq: 1, data: 'MUST-BE-REFUSED' });
+    await state.parseBarrier();
+    return { keys: state.__flowPending.size, existing: state.__flowPending.get('flow-a')?.map((part: any) => part.seq), refused: state.__flowPending.has('startup-orphan-33'), parsed: state.parserWrites,
+      acks: state.flow.calls.filter((call: any) => call.command === 'session_output_ack').map((call: any) => call.args) };
+  });
+  expect(snapshot).toEqual({ keys: 32, existing: [1, 2], refused: false, parsed: [], acks: [{ id: 'startup-orphan-33', generation: 7, seq: 1 }] });
+  await expect(page.locator('.toast.error')).toContainText('버퍼 한도를 초과');
+  await page.evaluate(async () => { const state = window as any; state.flow.emit({ id: 'flow-a', state: 'idle', active: true }); state.flow.releaseMetadata(); await state.parseBarrier(); });
+  await expect.poll(() => page.evaluate(() => (window as any).__flowPending.size)).toBe(0);
+  expect(await page.evaluate(() => (window as any).parserWrites)).toEqual(['FIRST', 'SECOND']);
+});
 
 test('Shift+Enter sends the CLI newline key once while plain Enter and IME keep their own input', async ({ page }) => {
   await workspace(page);

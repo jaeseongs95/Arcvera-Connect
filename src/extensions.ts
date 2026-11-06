@@ -6,20 +6,30 @@ export interface ExtensionPlugin {
 }
 export interface ExtensionSkill { name: string; description: string; path: string; scope: string; enabled: boolean; pluginId: string | null }
 export interface ExtensionMarketplace { name: string; source: string; path: string | null }
+export interface ExtensionHook {
+  key: string; eventName: string; handlerType: 'command' | 'mcpTool' | 'prompt' | 'agent';
+  command: string | null; server: string | null; tool: string | null; async: boolean;
+  matcher: string | null; timeoutSec: number; statusMessage: string | null; additionalContextLimit: number | null;
+  sourcePath: string; source: string; pluginId: string | null;
+  enabled: boolean; isManaged: boolean; currentHash: string; trustStatus: 'managed' | 'untrusted' | 'trusted' | 'modified';
+}
+export interface ExtensionHooks { items: ExtensionHook[]; warnings: string[]; errors: { path: string; message: string }[] }
 export interface ExtensionsSnapshot {
   executable: string; cwd: string | null;
   plugins: { installed: ExtensionPlugin[]; available: ExtensionPlugin[] } | null;
   marketplaces: ExtensionMarketplace[] | null; skills: ExtensionSkill[] | null;
+  hooks: ExtensionHooks | null;
   skillDestinations: { user: string | null; project: string | null };
-  errors: { section: 'plugins' | 'marketplaces' | 'skills'; message: string }[];
+  errors: { section: 'plugins' | 'marketplaces' | 'skills' | 'hooks'; message: string }[];
 }
 interface ExtensionsHost {
   call<T>(command: string, args?: Record<string, unknown>): Promise<T>;
   notify(ko: string, error?: boolean, en?: string): void;
 }
-type Tab = 'plugins' | 'skills' | 'marketplaces';
+type Tab = 'plugins' | 'skills' | 'hooks' | 'marketplaces';
+const TABS: readonly Tab[] = ['plugins', 'skills', 'hooks', 'marketplaces'];
 type Mutation = { operation: string; [key: string]: unknown };
-type Row = { id: string; title: string; subtitle: string; searchable: string[]; item: ExtensionPlugin | ExtensionSkill | ExtensionMarketplace };
+type Row = { id: string; title: string; subtitle: string; searchable: string[]; item: ExtensionPlugin | ExtensionSkill | ExtensionMarketplace | ExtensionHook };
 
 export function createExtensionsManager(host: ExtensionsHost) {
   const dialog = document.createElement('dialog'); dialog.id = 'extensions-dialog';
@@ -28,8 +38,8 @@ export function createExtensionsManager(host: ExtensionsHost) {
   dialog.innerHTML = `<div class="dialog-heading"><div><span class="eyebrow" id="extensions-eyebrow"></span><h2 id="extensions-title"></h2></div><button id="extensions-close" class="icon-button">×</button></div>
     <p id="extensions-description"></p>
     <dl class="extensions-context"><dt id="extensions-executable-label"></dt><dd id="extensions-executable"></dd><dt id="extensions-project-label"></dt><dd id="extensions-project"></dd></dl>
-    <div class="extensions-tabs" role="tablist"><button id="extensions-tab-plugins" role="tab" aria-controls="extensions-content" data-tab="plugins"></button><button id="extensions-tab-skills" role="tab" aria-controls="extensions-content" data-tab="skills"></button><button id="extensions-tab-marketplaces" role="tab" aria-controls="extensions-content" data-tab="marketplaces"></button></div>
-    <div class="extensions-tools"><label for="extensions-search" id="extensions-search-label"></label><input id="extensions-search" type="search" maxlength="200" autocomplete="off"/><button id="extensions-refresh" class="quiet-button"></button></div>
+    <div class="extensions-tabs" role="tablist"><button id="extensions-tab-plugins" role="tab" aria-controls="extensions-content" data-tab="plugins"></button><button id="extensions-tab-skills" role="tab" aria-controls="extensions-content" data-tab="skills"></button><button id="extensions-tab-hooks" role="tab" aria-controls="extensions-content" data-tab="hooks"></button><button id="extensions-tab-marketplaces" role="tab" aria-controls="extensions-content" data-tab="marketplaces"></button></div>
+    <div class="extensions-tools"><label for="extensions-search" id="extensions-search-label"></label><input id="extensions-search" type="search" maxlength="200" autocomplete="off"/><button id="extensions-plugin-discover" class="quiet-button"></button><button id="extensions-plugin-search" class="quiet-button" hidden></button><button id="extensions-refresh" class="quiet-button"></button></div>
     <div id="extensions-status" role="status" aria-live="polite"></div><div id="extensions-error" class="inline-error" role="alert" hidden></div>
     <section id="extensions-content" class="extensions-panes" role="tabpanel"><div class="extensions-list-pane"><div id="extensions-list" role="listbox" tabindex="0"></div><div class="extensions-paging"><small id="extensions-range"></small><button id="extensions-previous" class="quiet-button" hidden></button><button id="extensions-more" class="quiet-button" hidden></button></div></div><div class="extensions-detail-pane"><div id="extensions-detail"></div>
       <form id="extensions-skill-form" class="extensions-form" hidden><h3 id="extensions-import-title"></h3><label for="extensions-skill-source" id="extensions-skill-source-label"></label><div class="extensions-picker"><input id="extensions-skill-source" readonly/><button type="button" id="extensions-skill-choose" class="quiet-button"></button></div><label for="extensions-skill-name" id="extensions-skill-name-label"></label><input id="extensions-skill-name" maxlength="64" pattern="[a-z0-9_][a-z0-9_\\-]{0,63}" required/><small id="extensions-skill-name-help"></small><label for="extensions-skill-scope" id="extensions-skill-scope-label"></label><select id="extensions-skill-scope"><option value="user" id="extensions-scope-user"></option><option value="project" id="extensions-scope-project"></option></select><small id="extensions-skill-destination"></small><button id="extensions-skill-import" class="primary-button" type="submit"></button></form>
@@ -41,10 +51,11 @@ export function createExtensionsManager(host: ExtensionsHost) {
   const $ = <T extends HTMLElement = HTMLElement>(selector: string) => dialog.querySelector<T>(selector)!;
   const text = (selector: string, ko: string, en: string) => bindText($(selector), ko, en);
   for (const [selector, ko, en] of [
-    ['#extensions-eyebrow', '확장 관리', 'EXTENSIONS'], ['#extensions-title', '플러그인·스킬', 'Plugins & skills'],
-    ['#extensions-description', '선택한 실행 파일의 실제 플러그인과 스킬을 조회하고 관리합니다.', 'Browse and manage plugins and skills using the selected executable.'],
+    ['#extensions-eyebrow', '확장 관리', 'EXTENSIONS'], ['#extensions-title', '플러그인·스킬·Hook', 'Plugins, skills & hooks'],
+    ['#extensions-description', '설치된 확장을 관리하거나 필요한 플러그인을 찾아 추가하세요.', 'Manage installed extensions or find a plugin to add.'],
     ['#extensions-executable-label', '실행 파일', 'Executable'], ['#extensions-project-label', '프로젝트', 'Project'],
     ['#extensions-tab-plugins', '플러그인', 'Plugins'], ['#extensions-tab-skills', '스킬', 'Skills'], ['#extensions-tab-marketplaces', '마켓플레이스', 'Marketplaces'],
+    ['#extensions-tab-hooks', 'Hook', 'Hooks'], ['#extensions-plugin-discover', '플러그인 추가', 'Add a plugin'], ['#extensions-plugin-search', '찾기', 'Find'],
     ['#extensions-search-label', '목록 검색', 'Search list'], ['#extensions-refresh', '새로 고침', 'Refresh'],
     ['#extensions-more', '50개 더 보기', 'Show 50 more'],
     ['#extensions-previous', '이전 항목', 'Previous entries'],
@@ -62,11 +73,12 @@ export function createExtensionsManager(host: ExtensionsHost) {
   bindAttribute($('#extensions-list'), 'aria-label', '확장 목록', 'Extension list');
   const search = $<HTMLInputElement>('#extensions-search');
   const selections: Partial<Record<Tab, string>> = {};
-  const limits: Record<Tab, number> = { plugins: 50, skills: 50, marketplaces: 50 };
-  const starts: Record<Tab, number> = { plugins: 0, skills: 0, marketplaces: 0 };
+  const limits: Record<Tab, number> = { plugins: 50, skills: 50, hooks: 50, marketplaces: 50 };
+  const starts: Record<Tab, number> = { plugins: 0, skills: 0, hooks: 0, marketplaces: 0 };
   let tab: Tab = 'plugins'; let snapshot: ExtensionsSnapshot | undefined; let cwd: string | null = null;
   let version = 0; let busy = false; let mutation: Promise<ExtensionsSnapshot> | undefined;
-  let pendingRead: { token: number; cwd: string | null } | undefined; let readPump: Promise<void> | undefined;
+  let pendingRead: { token: number; cwd: string | null; catalogQuery: string | null } | undefined; let readPump: Promise<void> | undefined;
+  let catalogMode = false; let loadedCatalogQuery: string | null = null;
   let pendingAction: Mutation | undefined;
   let exitRequested = false; let exitDrain: Promise<void> | undefined; let picker: Promise<string | null> | undefined;
   const current = (token: number) => dialog.open && token === version;
@@ -85,6 +97,7 @@ export function createExtensionsManager(host: ExtensionsHost) {
       $('#extensions-list').querySelectorAll<HTMLButtonElement>('button').forEach(button => button.disabled = false);
       updateDestination();
     }
+    updateCatalogControls();
   }
   function cancelReview() { pendingAction = undefined; $('#extensions-review').hidden = true; }
   function review(request: Mutation, target: string, ko: string, en: string, scopeKo: string, scopeEn: string) {
@@ -97,13 +110,25 @@ export function createExtensionsManager(host: ExtensionsHost) {
     $('#extensions-review-confirm').focus();
   }
   const userScope = ['선택한 CLI의 사용자 구성에 저장됩니다. 모든 프로젝트에 영향을 줄 수 있습니다.', 'Saved in the selected CLI user configuration. This can affect all projects.'] as const;
+  function hookHandler(hook: ExtensionHook) {
+    return hook.handlerType === 'command' ? hook.command ?? '' : hook.handlerType === 'mcpTool' ? `${hook.server} / ${hook.tool}` : hook.handlerType;
+  }
+  const hookTrustNames = { trusted: ['신뢰함', 'Trusted'], untrusted: ['신뢰 확인 필요', 'Review required'], modified: ['내용 변경 · 재검토 필요', 'Changed · review required'], managed: ['관리 정책', 'Managed'] } as const;
+  function hookTrust(hook: ExtensionHook) {
+    return t(hookTrustNames[hook.trustStatus][0], hookTrustNames[hook.trustStatus][1]);
+  }
+  function hookReview(hook: ExtensionHook) {
+    return `${hook.eventName}\n${hook.sourcePath}\n${hookHandler(hook)}\n${hook.matcher ?? ''}\n${t('시간 제한', 'Timeout')}: ${hook.timeoutSec}s\n${t('내용 지문', 'Content fingerprint')}: ${hook.currentHash}`;
+  }
   function rows(): Row[] {
     if (!snapshot) return [];
     if (tab === 'plugins') {
       const installed = snapshot.plugins?.installed ?? []; const ids = new Set(installed.map(item => item.pluginId));
-      return [...installed, ...(snapshot.plugins?.available ?? []).filter(item => !ids.has(item.pluginId))].map(item => ({ id: item.pluginId, title: item.name, subtitle: `${item.marketplaceName}${item.version ? ` · ${item.version}` : ''}`, searchable: [item.name, item.pluginId, item.marketplaceName, item.source], item }));
+      const items = catalogMode ? (loadedCatalogQuery === search.value.trim() ? snapshot.plugins?.available ?? [] : []).filter(item => !ids.has(item.pluginId)) : installed;
+      return items.map(item => ({ id: item.pluginId, title: item.name, subtitle: `${item.marketplaceName}${item.version ? ` · ${item.version}` : ''}`, searchable: [item.name, item.pluginId, item.marketplaceName, item.source], item }));
     }
     if (tab === 'skills') return (snapshot.skills ?? []).map(item => ({ id: item.path, title: item.name, subtitle: item.description, searchable: [item.name, item.description, item.path, item.scope, item.pluginId ?? ''], item }));
+    if (tab === 'hooks') return (snapshot.hooks?.items ?? []).map(item => ({ id: item.key, title: item.eventName, subtitle: `${item.source} · ${item.enabled ? t('사용 중', 'Enabled') : t('사용 안 함', 'Disabled')} · ${hookTrust(item)}`, searchable: [item.key, item.eventName, item.sourcePath, item.source, item.pluginId ?? '', hookHandler(item)], item }));
     return (snapshot.marketplaces ?? []).map(item => ({ id: item.name, title: item.name, subtitle: item.source, searchable: [item.name, item.source, item.path ?? ''], item }));
   }
   function metadata(parent: HTMLElement, ko: string, en: string, value: string | null | undefined) {
@@ -133,6 +158,24 @@ export function createExtensionsManager(host: ExtensionsHost) {
       metadata(data, '파일', 'File', skill.path); metadata(data, '범위', 'Scope', skill.scope); metadata(data, '플러그인', 'Plugin', skill.pluginId);
       const state = document.createElement('p'); bindText(state, skill.enabled ? '사용 중' : '사용 안 함', skill.enabled ? 'Enabled' : 'Disabled'); detail.append(state);
       action(actions, 'extensions-skill-toggle', skill.enabled ? '사용 안 함' : '사용', skill.enabled ? 'Disable' : 'Enable', () => review({ operation: 'setSkillEnabled', path: skill.path, enabled: !skill.enabled }, skill.path, '스킬 사용 설정', 'Change skill activation', ...userScope));
+    } else if (tab === 'hooks') {
+      const hook = row.item as ExtensionHook;
+      metadata(data, '이벤트', 'Event', hook.eventName); metadata(data, '출처', 'Source', hook.source);
+      metadata(data, '등록 파일', 'Definition file', hook.sourcePath); metadata(data, '플러그인', 'Plugin', hook.pluginId);
+      metadata(data, '종류', 'Handler', hook.handlerType); metadata(data, '대상 조건', 'Matcher', hook.matcher);
+      metadata(data, '시간 제한', 'Timeout', `${hook.timeoutSec}s`); metadata(data, '내용 지문', 'Content fingerprint', hook.currentHash);
+      const content = document.createElement('pre'); content.id = 'extensions-hook-content'; content.textContent = hookHandler(hook); detail.append(content);
+      const state = document.createElement('p'); bindText(state, `${hook.enabled ? '사용 중' : '사용 안 함'} · ${hookTrustNames[hook.trustStatus][0]}`, `${hook.enabled ? 'Enabled' : 'Disabled'} · ${hookTrustNames[hook.trustStatus][1]}`); detail.append(state);
+      if (hook.isManaged) {
+        const managed = document.createElement('p'); bindText(managed, '관리자가 정한 Hook입니다. 여기서는 사용·신뢰 설정을 바꾸지 않습니다.', 'This hook is managed by policy. Its activation and trust cannot be changed here.'); detail.append(managed);
+      } else {
+        const needsReview = hook.trustStatus === 'untrusted' || hook.trustStatus === 'modified';
+        if (hook.enabled || !needsReview) action(actions, 'extensions-hook-toggle', hook.enabled ? '사용 안 함' : '사용', hook.enabled ? 'Disable' : 'Enable', () => review({ operation: 'setHookEnabled', key: hook.key, currentHash: hook.currentHash, enabled: !hook.enabled }, hookReview(hook), 'Hook 사용 설정', 'Change hook activation', ...userScope));
+        if (needsReview && hook.handlerType === 'command') action(actions, 'extensions-hook-trust', '내용 검토 후 신뢰…', 'Review and trust…', () => review({ operation: 'trustHook', key: hook.key, currentHash: hook.currentHash }, hookReview(hook), '이 Hook의 현재 내용을 신뢰할까요?', 'Trust the current contents of this hook?', '등록 파일과 실행 내용을 확인하세요. 현재 내용만 승인하며 사용 상태는 바꾸지 않습니다.', 'Review its definition file and handler. Only these contents are trusted; activation is unchanged.'));
+        else if (needsReview) {
+          const unavailable = document.createElement('p'); bindText(unavailable, '실행 입력을 모두 확인할 수 없어 이 앱에서는 신뢰 승인할 수 없습니다. 등록 파일과 사용 중인 CLI의 지원 범위를 확인하세요.', 'The complete execution input is unavailable, so this app cannot approve trust. Review the definition file and the capabilities of your CLI.'); detail.append(unavailable);
+        }
+      }
     } else {
       const marketplace = row.item as ExtensionMarketplace;
       metadata(data, '소스', 'Source', marketplace.source); metadata(data, '경로', 'Path', marketplace.path);
@@ -155,7 +198,7 @@ export function createExtensionsManager(host: ExtensionsHost) {
     }
     if (!filtered.length) {
       const empty = document.createElement('p'); const unavailable = !snapshot || snapshot[tab] === null;
-      bindText(empty, unavailable ? '목록을 불러오지 못했습니다.' : query ? '검색 결과가 없습니다.' : '등록된 항목이 없습니다.', unavailable ? 'This list could not be loaded.' : query ? 'No matching items.' : 'No entries found.'); list.append(empty);
+      bindText(empty, tab === 'plugins' && catalogMode && !loadedCatalogQuery ? '플러그인 이름을 두 글자 이상 입력하고 찾기를 누르세요.' : unavailable ? '목록을 불러오지 못했습니다.' : query ? '검색 결과가 없습니다.' : '등록된 항목이 없습니다.', tab === 'plugins' && catalogMode && !loadedCatalogQuery ? 'Enter at least two characters of a plugin name and choose Find.' : unavailable ? 'This list could not be loaded.' : query ? 'No matching items.' : 'No entries found.'); list.append(empty);
     }
     $('#extensions-more').hidden = filtered.length <= starts[tab] + limits[tab];
     $('#extensions-previous').hidden = starts[tab] === 0;
@@ -163,6 +206,10 @@ export function createExtensionsManager(host: ExtensionsHost) {
     $('#extensions-range').textContent = filtered.length ? `${starts[tab] + 1}–${starts[tab] + visible.length} / ${filtered.length}` : '';
     renderDetail(visible.find(row => row.id === selections[tab]));
     const sectionErrors = snapshot?.errors.filter(error => error.section === tab) ?? [];
+    if (tab === 'hooks' && snapshot?.hooks && (snapshot.hooks.errors.length || snapshot.hooks.warnings.length)) {
+      const diagnostics = document.createElement('p'); diagnostics.id = 'extensions-hook-diagnostics';
+      bindText(diagnostics, `Hook 구성 안내 ${snapshot.hooks.warnings.length}건 · 읽지 못한 구성 ${snapshot.hooks.errors.length}건. 등록 파일을 확인한 뒤 새로 고침하세요.`, `${snapshot.hooks.warnings.length} hook notices · ${snapshot.hooks.errors.length} configuration errors. Check the definition files and refresh.`); $('#extensions-detail').append(diagnostics);
+    }
     if (sectionErrors.length) { $('#extensions-error').textContent = preview(sectionErrors.map(error => error.message).join('\n')); $('#extensions-error').hidden = false; }
     else $('#extensions-error').hidden = true;
     $('#extensions-content').setAttribute('aria-labelledby', `extensions-tab-${tab}`);
@@ -171,7 +218,14 @@ export function createExtensionsManager(host: ExtensionsHost) {
       const selected = button.dataset.tab === tab; button.setAttribute('aria-selected', String(selected)); button.tabIndex = selected ? 0 : -1;
       button.dataset.error = String(!!snapshot?.errors.some(error => error.section === button.dataset.tab));
     }
-    updateDestination();
+    updateDestination(); updateCatalogControls();
+  }
+  function updateCatalogControls() {
+    $('#extensions-plugin-discover').hidden = tab !== 'plugins';
+    $('#extensions-plugin-search').hidden = tab !== 'plugins' || !catalogMode;
+    text('#extensions-plugin-discover', catalogMode ? '설치된 플러그인' : '플러그인 추가', catalogMode ? 'Installed plugins' : 'Add a plugin');
+    $<HTMLButtonElement>('#extensions-plugin-search').disabled = busy || exitRequested || [...search.value.trim()].length < 2;
+    bindAttribute(search, 'placeholder', tab === 'plugins' && catalogMode ? '추가할 플러그인 이름 (두 글자 이상)' : '이름·설명·경로로 검색', tab === 'plugins' && catalogMode ? 'Plugin name to add (at least two characters)' : 'Search names, descriptions and paths');
   }
   function updateDestination() {
     const scope = $<HTMLSelectElement>('#extensions-skill-scope').value as 'user' | 'project';
@@ -191,8 +245,8 @@ export function createExtensionsManager(host: ExtensionsHost) {
       try {
         if (mutation) { try { await mutation; } catch { /* Requery after the earlier operation settles. */ } }
         if (!current(intent.token) || exitRequested) continue;
-        const value = await host.call<ExtensionsSnapshot>('extensions_list', { cwd: intent.cwd });
-        if (current(intent.token)) { show(value); status(value.errors.length ? '일부 목록을 불러오지 못했습니다. 오류가 있는 탭을 확인하세요.' : '실제 CLI 구성을 불러왔습니다.', value.errors.length ? 'Some lists could not be loaded. Review the marked tabs.' : 'Loaded the actual CLI configuration.'); }
+        const value = await host.call<ExtensionsSnapshot>('extensions_list', { cwd: intent.cwd, ...(intent.catalogQuery ? { catalogQuery: intent.catalogQuery } : {}) });
+        if (current(intent.token)) { loadedCatalogQuery = intent.catalogQuery; show(value); status(value.errors.length ? '일부 목록을 불러오지 못했습니다. 오류가 있는 탭을 확인하세요.' : '실제 CLI 구성을 불러왔습니다.', value.errors.length ? 'Some lists could not be loaded. Review the marked tabs.' : 'Loaded the actual CLI configuration.'); }
       } catch (error) {
         if (current(intent.token)) { snapshot = undefined; renderList(); showError(error); status('구성을 불러오지 못했습니다. 새로 고침으로 다시 시도하세요.', 'Could not load the configuration. Refresh to retry.'); }
       } finally { if (current(intent.token)) setBusy(false); }
@@ -200,9 +254,11 @@ export function createExtensionsManager(host: ExtensionsHost) {
   }
   function load() {
     if (exitRequested || busy && dialog.getAttribute('aria-busy') === 'true') return;
+    const catalogQuery = tab === 'plugins' && catalogMode ? search.value.trim() : null;
+    if (catalogQuery !== null && [...catalogQuery].length < 2) return;
     cancelReview(); $('#extensions-error').hidden = true; setBusy(true); status('구성을 불러오는 중…', 'Loading configuration…');
     // ponytail: one active read and one replaceable intent; no server per popup reopen.
-    pendingRead = { token: version, cwd };
+    pendingRead = { token: version, cwd, catalogQuery };
     if (!readPump) readPump = pumpReads().finally(() => { readPump = undefined; });
   }
   async function apply() {
@@ -211,7 +267,7 @@ export function createExtensionsManager(host: ExtensionsHost) {
     const operation = host.call<ExtensionsSnapshot>('extensions_mutate', { cwd, request }); mutation = operation;
     try {
       const value = await operation;
-      if (current(token)) { show(value); status('변경이 적용되고 다시 조회되었습니다.', 'Changes applied and read back.'); }
+      if (current(token)) { if (request.operation === 'installPlugin') { catalogMode = false; loadedCatalogQuery = null; search.value = ''; } show(value); status('변경이 저장되고 선택한 문맥의 구성을 다시 확인했습니다.', 'Saved changes and read back the selected configuration.'); }
       else host.notify('확장 구성이 변경되었습니다. 확장 관리를 다시 열어 확인하세요.', false, 'Extension configuration changed. Reopen the manager to review it.');
     } catch (error) {
       if (current(token)) { snapshot = undefined; renderList(); showError(error); status('변경을 완료하지 못했습니다. 오류와 실제 구성을 확인하세요.', 'The change could not be completed. Review the error and refresh the actual configuration.'); }
@@ -221,13 +277,20 @@ export function createExtensionsManager(host: ExtensionsHost) {
   $('#extensions-close').onclick = () => dialog.close();
   dialog.onclose = () => { version++; pendingRead = undefined; snapshot = undefined; cancelReview(); $('#extensions-list').replaceChildren(); $('#extensions-detail').replaceChildren(); $('#extensions-error').textContent = ''; $('#extensions-error').hidden = true; $('#extensions-more').hidden = true; $('#extensions-previous').hidden = true; $('#extensions-range').textContent = ''; };
   $('#extensions-refresh').onclick = load; search.oninput = () => { if (!busy && !exitRequested) { limits[tab] = 50; starts[tab] = 0; cancelReview(); renderList(); } };
+  $('#extensions-plugin-discover').onclick = () => {
+    if (busy || exitRequested) return;
+    catalogMode = !catalogMode; loadedCatalogQuery = null; search.value = ''; delete selections.plugins; limits.plugins = 50; starts.plugins = 0; cancelReview(); renderList();
+    if (catalogMode) search.focus(); else load();
+  };
+  $('#extensions-plugin-search').onclick = load;
+  search.onkeydown = event => { if (event.key === 'Enter' && tab === 'plugins' && catalogMode) { event.preventDefault(); load(); } };
   $('#extensions-more').onclick = () => { if (!busy && !exitRequested) { if (limits[tab] < 250) limits[tab] += 50; else { starts[tab] += 250; limits[tab] = 50; } cancelReview(); renderList(); } };
   $('#extensions-previous').onclick = () => { if (!busy && !exitRequested) { starts[tab] = Math.max(0, starts[tab] - 250); limits[tab] = 250; cancelReview(); renderList(); } };
   for (const button of dialog.querySelectorAll<HTMLButtonElement>('[data-tab]')) button.onclick = () => { if (!busy && !exitRequested) { cancelReview(); tab = button.dataset.tab as Tab; renderList(); } };
   $('.extensions-tabs').onkeydown = event => {
     if (busy || exitRequested || !['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
-    event.preventDefault(); const tabs: Tab[] = ['plugins', 'skills', 'marketplaces']; const index = tabs.indexOf(tab);
-    tab = tabs[event.key === 'Home' ? 0 : event.key === 'End' ? 2 : (index + (event.key === 'ArrowRight' ? 1 : 2)) % 3]; cancelReview(); renderList(); $(`#extensions-tab-${tab}`).focus();
+    event.preventDefault(); const index = TABS.indexOf(tab);
+    tab = TABS[event.key === 'Home' ? 0 : event.key === 'End' ? TABS.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : TABS.length - 1)) % TABS.length]; cancelReview(); renderList(); $(`#extensions-tab-${tab}`).focus();
   };
   $('#extensions-list').onkeydown = event => {
     if (busy || exitRequested || !['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
@@ -283,8 +346,9 @@ export function createExtensionsManager(host: ExtensionsHost) {
     cancelExit() { exitRequested = false; exitDrain = undefined; setBusy(busy); },
     open(projectCwd?: string) {
       if (dialog.open || exitRequested) return;
-      const nextCwd = projectCwd || null; if (cwd !== nextCwd) for (const key of ['plugins', 'skills', 'marketplaces'] as Tab[]) delete selections[key];
-      snapshot = undefined; cwd = nextCwd; version++; busy = false; for (const key of ['plugins', 'skills', 'marketplaces'] as Tab[]) { limits[key] = 50; starts[key] = 0; } $('#extensions-executable').textContent = '…';
+      const nextCwd = projectCwd || null; if (cwd !== nextCwd) for (const key of TABS) delete selections[key];
+      if (catalogMode) search.value = ''; catalogMode = false; loadedCatalogQuery = null;
+      snapshot = undefined; cwd = nextCwd; version++; busy = false; for (const key of TABS) { limits[key] = 50; starts[key] = 0; } $('#extensions-executable').textContent = '…';
       if (cwd) { unbindText($('#extensions-project')); $('#extensions-project').textContent = cwd; } else text('#extensions-project', '사용자 구성 · 선택된 프로젝트 없음', 'User configuration · no project selected');
       renderList();
       dialog.showModal(); load(); $('#extensions-close').focus();

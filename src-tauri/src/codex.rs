@@ -8,14 +8,15 @@ use std::{
     io::{self, Read, Write},
     net::{Shutdown, TcpListener, TcpStream},
     path::Path,
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{Command, Stdio},
     sync::{atomic::{AtomicBool, Ordering}, mpsc, Arc, Mutex},
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tungstenite::{client::IntoClientRequest, Message, WebSocket};
 use uuid::Uuid;
-use crate::process_job::{LaunchGate, ProcessJob};
+use crate::process_job::ProcessJob;
+use crate::owned_process::{self, Child, ChildStdin, Command as OwnedCommand, Stdio as OwnedStdio};
 
 const TOKEN_ENV: &str = "AGENT_GRID_REMOTE_TOKEN";
 const RPC_TIMEOUT: Duration = Duration::from_secs(20);
@@ -32,7 +33,7 @@ pub use catalog::{catalog_list, catalog_list_with_executable, catalog_preview, c
 #[path = "codex_extensions.rs"]
 mod extensions;
 pub use extensions::{ExtensionMutation, ExtensionsSnapshot};
-pub(crate) use extensions::{extension_admission, extensions_list_with_executable, extensions_mutate_with_executable, ExtensionPermit};
+pub(crate) use extensions::{extension_admission, extensions_list_with_executable, extensions_list_with_catalog_query, extensions_mutate_with_executable, ExtensionPermit};
 
 #[path = "codex_mobile.rs"]
 mod mobile;
@@ -81,7 +82,7 @@ pub use conversation::{ConversationConnection, ConversationRequest, SubagentRequ
 
 #[path = "codex_cron.rs"]
 mod cron;
-pub use cron::CronRequest;
+pub use cron::{CronRequest, CronSchedule};
 
 #[cfg(windows)]
 #[path = "codex_cron_wire.rs"]
@@ -112,7 +113,6 @@ pub struct CodexSession {
     pub command: CommandBuilder,
     server: Option<Child>,
     job: Option<Arc<ProcessJob>>,
-    _launch_gate: Option<LaunchGate>,
     stopped: Arc<AtomicBool>,
     socket: Option<TcpStream>,
     observer: Option<JoinHandle<()>>,
@@ -154,6 +154,13 @@ fn hidden(command: &mut Command) {
         command.creation_flags(0x08000000); // CREATE_NO_WINDOW, background protocol process only.
     }
     #[cfg(not(windows))] let _ = command;
+}
+
+fn background_command(executable: &std::ffi::OsStr) -> OwnedCommand {
+    let mut command = OwnedCommand::new(executable);
+    // A background query/proxy must never inherit a TUI's one-use control credentials.
+    command.env_remove("CODEX_DESKTOP_CRON_BOOTSTRAP").env_remove("CODEX_DESKTOP_CRON_TOKEN");
+    command
 }
 
 fn server_args(endpoint: &str, verifier: &str, no_remote_control: bool, remote_client_name: Option<&str>) -> Vec<String> {
@@ -419,18 +426,18 @@ fn launch_server_with_cancellation(exe: &OsString, cwd: &Path, thread_id: Option
     // Two independent OS-random UUIDs provide 244 unpredictable bits; raw token stays in memory/child environment.
     let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
     let verifier = format!("{:x}", Sha256::digest(token.as_bytes()));
-    let (mut process, launch_gate) = LaunchGate::wrap_std(exe.as_os_str())?;
+    let mut process = background_command(exe.as_os_str());
     process.args(server_args(&endpoint, &verifier, no_remote_control, remote_client_name.as_deref())).current_dir(&cwd)
-        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-    hidden(&mut process);
-    let server = process.spawn().map_err(|e| format!("Cannot start Codex app-server: {e}"))?;
+        .stdin(OwnedStdio::null()).stdout(OwnedStdio::null()).stderr(OwnedStdio::null());
+    let job = Arc::new(ProcessJob::new(false)?);
+    let (server, pending) = owned_process::spawn_suspended(&mut process, job.as_handle())?;
     let mut session = CodexSession {
-        command: tui_command(exe, cwd, &endpoint, &token, thread_id), server:Some(server), job:None, _launch_gate:Some(launch_gate),
+        command: tui_command(exe, cwd, &endpoint, &token, thread_id), server:Some(server), job:Some(job),
         stopped:Arc::new(AtomicBool::new(false)), socket:None, observer:None, mobile:None, shared:None, proxy_job:None, conversation:None,
     };
-    session.job = Some(Arc::new(ProcessJob::assign_std(session.server.as_ref().unwrap())?));
     session.mobile = Some(MobileConnection::new(endpoint.clone(), token.clone(), session.job.as_ref().unwrap(), session.stopped.clone(), namespaced_remote));
-    session._launch_gate.as_ref().unwrap().release()?;
+    check_cancelled(cancelled.as_ref())?;
+    pending.resume()?;
     let job = session.job.as_ref().ok_or("Codex server has no owned process job")?;
     let mut rpc = connect(&endpoint, &token, session.server.as_mut().unwrap(), job, cancelled)?;
     let initialized = rpc.call("initialize", initialize())?;
@@ -524,6 +531,9 @@ fn observe<S: Read + Write>(rpc: &mut Rpc<S>, mut selected: Option<String>, cwd:
                 }
                 next_poll = Instant::now() + Duration::from_secs(1);
             }
+            if let (Some(id),Some(conversation))=(selected.as_deref(),conversation) {
+                conversation.observer_compact(rpc,id);
+            }
             let incoming = rpc.read();
             if stopped.load(Ordering::Acquire) { break; }
             match incoming {
@@ -576,7 +586,6 @@ impl Write for ProxyStream {
 struct Proxy {
     child: Child,
     job: Option<Arc<ProcessJob>>,
-    _launch_gate: LaunchGate,
     rpc: Option<Rpc<ProxyStream>>,
     reader: Option<JoinHandle<()>>,
     expiry: Option<ProxyExpiry>,
@@ -589,7 +598,7 @@ impl ProxyExpiry {
     fn new(job: &Arc<ProcessJob>, deadline: Option<Instant>, cancelled: Option<Arc<AtomicBool>>) -> Result<Self, String> {
         let job = Arc::downgrade(job);
         let (cancel, receiver) = mpsc::channel();
-        let worker = thread::Builder::new().name("codex-proxy-deadline".into()).spawn(move || {
+        let worker = crate::owned_worker::spawn("codex-proxy-deadline", move || {
             loop {
                 if deadline.is_some_and(|deadline| Instant::now() >= deadline)
                     || cancelled.as_ref().is_some_and(|flag| flag.load(Ordering::Acquire)) {
@@ -632,11 +641,14 @@ impl Proxy {
         let job=self.job.take();
         if let Some(job)=job.as_ref() {if let Err(error)=job.terminate(){errors.push(format!("공유 proxy Job 종료 실패: {error}"));}}
         else {errors.push("공유 proxy의 소유 Job 종료를 확인할 수 없습니다.".into());}
-        match self.child.try_wait() {
-            Ok(Some(_))=>{},
-            Ok(None)=>if let Err(error)=self.child.kill(){if !matches!(self.child.try_wait(),Ok(Some(_))) {errors.push(format!("공유 proxy 직접 자식 종료 실패: {error}"));}},
-            Err(error)=>errors.push(format!("공유 proxy 직접 자식 상태 확인 실패: {error}")),
-        }
+        // Job termination is asynchronous. TerminateProcess may report access
+        // denied while the same owned handle is still becoming signalled;
+        // decide cleanup by its bounded wait, not that intermediate request.
+        let kill_error = match self.child.try_wait() {
+            Ok(Some(_))=>None,
+            Ok(None)=>self.child.kill().err(),
+            Err(error)=>{errors.push(format!("공유 proxy 직접 자식 상태 확인 실패: {error}"));None},
+        };
         let mut child_done=false;
         #[cfg(windows)] let mut job_empty=false;
         loop {
@@ -647,7 +659,10 @@ impl Proxy {
             if complete || Instant::now()>=deadline {break;}
             thread::sleep(Duration::from_millis(10));
         }
-        if !child_done {errors.push("공유 proxy 직접 자식의 3초 내 정산을 확인하지 못했습니다.".into());}
+        if !child_done {
+            if let Some(error)=kill_error {errors.push(format!("공유 proxy 직접 자식 종료 실패: {error}"));}
+            errors.push("공유 proxy 직접 자식의 3초 내 정산을 확인하지 못했습니다.".into());
+        }
         #[cfg(windows)] if !job_empty {errors.push("공유 proxy의 자기 Job ActiveProcesses=0을 3초 내 확인하지 못했습니다.".into());}
         if let Some(reader)=self.reader.take() {
             while !reader.is_finished()&&Instant::now()<deadline {thread::sleep(Duration::from_millis(10));}
@@ -670,20 +685,20 @@ impl Proxy {
     fn open_until(exe: &OsString, cancelled: Option<Arc<AtomicBool>>, overall: Option<Instant>) -> Result<Self, String> {
         check_cancelled(cancelled.as_ref())?;
         if overall.is_some_and(|deadline| Instant::now() >= deadline) { return Err("공유 연결 전체 기한이 만료되었습니다.".into()); }
-        let (mut command, launch_gate) = LaunchGate::wrap_std(exe.as_os_str())?;
+        let mut command = background_command(exe.as_os_str());
         command.args(["app-server", "proxy"]);
-        command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
-        hidden(&mut command);
-        let child = command.spawn().map_err(|e| format!("Cannot open existing Codex daemon proxy: {e}"))?;
-        let mut proxy = Self {child,job:None,_launch_gate:launch_gate,rpc:None,reader:None,expiry:None,finished:false};
+        command.stdin(OwnedStdio::piped()).stdout(OwnedStdio::piped()).stderr(OwnedStdio::null());
+        let job = Arc::new(ProcessJob::new(false)?);
+        let (child, pending) = owned_process::spawn_suspended(&mut command, job.as_handle())?;
+        #[cfg(all(test,windows))]
+        worker_failure_tests::observe(&child,&job);
+        let mut proxy = Self {child,job:Some(job),rpc:None,reader:None,expiry:None,finished:false};
         let result=(|| {
-        proxy.job = Some(Arc::new(ProcessJob::assign_std(&proxy.child)?));
         if overall.is_some() || cancelled.is_some() { proxy.expiry = Some(ProxyExpiry::new(proxy.job.as_ref().unwrap(), overall, cancelled.clone())?); }
-        proxy._launch_gate.release()?;
         let input = proxy.child.stdin.take().expect("piped stdin");
         let mut output = proxy.child.stdout.take().expect("piped stdout");
         let (sender, receiver) = mpsc::sync_channel(32);
-        let reader = thread::spawn(move || {
+        let reader = crate::owned_worker::spawn("codex-proxy-reader", move || {
             loop {
                 let mut bytes = vec![0; 16 * 1024];
                 let value = match output.read(&mut bytes) {
@@ -694,8 +709,11 @@ impl Proxy {
                 let failed = value.is_err();
                 if sender.send(value).is_err() || failed { break; }
             }
-        });
+        }).map_err(|error|format!("공유 proxy 출력 reader를 시작할 수 없습니다: {error}"))?;
         proxy.reader = Some(reader);
+        check_cancelled(cancelled.as_ref())?;
+        if overall.is_some_and(|deadline| Instant::now() >= deadline) { return Err("공유 연결 전체 기한이 만료되었습니다.".into()); }
+        pending.resume()?;
         let stream = ProxyStream {input,receiver:Some(receiver),pending:Vec::new(),offset:0,timeout:Duration::from_millis(500)};
         let mut config = tungstenite::protocol::WebSocketConfig::default();
         config.max_message_size = Some(MAX_FRAME);
@@ -728,6 +746,10 @@ impl Proxy {
             .map_err(|e| format!("Existing Codex daemon request failed: {e}; no daemon was started"))
     }
 }
+
+#[cfg(all(test,windows))]
+#[path="codex_worker_tests.rs"]
+pub(super) mod worker_failure_tests;
 
 fn external(thread: &Value, observed_at: &str) -> Result<ExternalSession, String> {
     let id = thread["id"].as_str().ok_or("Codex thread list entry has no ID")?.to_owned();

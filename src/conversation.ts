@@ -1,5 +1,6 @@
 import { bindAttribute, bindText, onLanguageChange, t } from './i18n';
 import './conversation.css';
+import { appendLinkifiedText } from './external-links';
 
 type Json = Record<string, any>;
 export interface ConversationOptions {
@@ -8,6 +9,7 @@ export interface ConversationOptions {
   host: HTMLElement;
   call<T>(command: string, args?: Record<string, unknown>): Promise<T>;
   ownerChanged?(owned: boolean): void;
+  onLinkError?(error: unknown): void;
 }
 interface Attachment { type: 'localImage' | 'file'; path: string; name?: string }
 interface RuntimeEvent { seq: number; method: string; params: Json; requestId?: string; responded?: boolean }
@@ -133,12 +135,13 @@ export function createConversation(options: ConversationOptions) {
     if (attachments.length > MAX_ATTACHMENTS) { attachments = attachments.slice(0, MAX_ATTACHMENTS); status('한 번에 12개까지 첨부할 수 있습니다.', 'You can attach up to 12 files.'); }
     renderAttachments(); updateControls();
   }
+  function linkFailure(error: unknown) { if (disposed) return; if (options.onLinkError) options.onLinkError(error); else status('외부 링크를 열지 못했습니다. 기본 브라우저 설정과 주소를 확인하세요.', 'Could not open the external link. Check the address and default browser settings.'); }
   function appendFormatted(parent: HTMLElement, content: string) {
-    // Only text and code nodes: messages never supply HTML, links, event handlers or image URLs.
+    // User content supplies text only; HTTP(S) anchors use the validated native opener.
     const fence = /```[^\n]*\n([\s\S]*?)(?:```|$)/g;
     let position = 0; let match: RegExpExecArray | null;
     while ((match = fence.exec(content))) {
-      if (match.index > position) parent.append(document.createTextNode(content.slice(position, match.index)));
+      if (match.index > position) appendLinkifiedText(parent, content.slice(position, match.index), linkFailure);
       const block = document.createElement('div'); block.className = 'conversation-code';
       const pre = document.createElement('pre'); const code = document.createElement('code'); code.textContent = match[1]; pre.append(code);
       const copy = document.createElement('button'); copy.type = 'button'; copy.className = 'quiet-button'; bindText(copy, '코드 복사', 'Copy code');
@@ -146,7 +149,7 @@ export function createConversation(options: ConversationOptions) {
       const codeText = match[1]; copy.onclick = () => void copyText(codeText, true);
       block.append(copy, pre); parent.append(block); position = fence.lastIndex;
     }
-    if (position < content.length) parent.append(document.createTextNode(content.slice(position)));
+    if (position < content.length) appendLinkifiedText(parent, content.slice(position), linkFailure);
   }
   async function copyText(text: string, code = false) {
     if (!visible || !foreground || disposed) return;
@@ -161,7 +164,7 @@ export function createConversation(options: ConversationOptions) {
   function displayedText(body: HTMLElement) {
     // 표시 본문만 사용한다. 코드 복사 버튼과 원문 페이지 이동 문구는 제외한다.
     return [...body.childNodes].map(node => node.nodeType === Node.TEXT_NODE ? node.textContent ?? ''
-      : node instanceof HTMLElement && node.classList.contains('conversation-code') ? node.querySelector('code')?.textContent ?? '' : '').join('');
+      : node instanceof HTMLElement && node.classList.contains('conversation-code') ? node.querySelector('code')?.textContent ?? '' : node instanceof HTMLAnchorElement ? node.textContent ?? '' : '').join('');
   }
   function updateSearch() {
     const query = searchQuery; const matches: string[] = [];
@@ -189,10 +192,12 @@ export function createConversation(options: ConversationOptions) {
     updateSearch(); messages.scrollTop += row.getBoundingClientRect().top - messages.getBoundingClientRect().top;
   }
   function clearSearch() { search.value = ''; searchQuery = ''; selectedMatch = ''; searchComposing = false; updateSearch(); }
-  async function moveLatest() {
+  async function moveLatest(isCurrent = () => true) {
+    if (!visible || !foreground || !attached || disposed || !isCurrent()) return;
     const version = epoch; const content = contentVersion;
-    await loadPage();
-    if (alive(version) && foreground && content === contentVersion) messages.scrollTop = messages.scrollHeight;
+    const page = loadPage(); const query = historyQuery;
+    await page;
+    if (alive(version) && foreground && content === contentVersion && query === historyQuery && isCurrent()) messages.scrollTop = messages.scrollHeight;
   }
   function renderItems() {
     const nearEnd = messages.scrollHeight - messages.scrollTop - messages.clientHeight < 80;
@@ -351,7 +356,7 @@ export function createConversation(options: ConversationOptions) {
     for (const event of pendingRequests) {
       const panel = document.createElement('section'); panel.className = 'conversation-request';
       const title = document.createElement('strong'); title.textContent = event.method;
-      const description = document.createElement('pre'); description.textContent = JSON.stringify(event.params, null, 2); panel.append(title, description);
+      const description = document.createElement('pre'); appendLinkifiedText(description, JSON.stringify(event.params, null, 2), linkFailure); panel.append(title, description);
       const id = event.requestId;
       if (!id) { const reason = document.createElement('p'); bindText(reason, '요청 식별자를 확인하지 못해 응답할 수 없습니다.', 'Cannot respond without a verified request ID.'); panel.append(reason); requests.append(panel); continue; }
       if (event.method === 'item/commandExecution/requestApproval' || event.method === 'item/fileChange/requestApproval') {
@@ -369,7 +374,7 @@ export function createConversation(options: ConversationOptions) {
         const form = document.createElement('form'); const answerInputs = new Map<string, () => string>();
         const draft = questionDrafts.get(id) ?? new Map<string, QuestionDraft>(); questionDrafts.set(id, draft);
         for (const question of event.params.questions ?? []) {
-          const label = document.createElement('label'); label.textContent = string(question.question ?? question.header);
+          const label = document.createElement('label'); appendLinkifiedText(label, string(question.question ?? question.header), linkFailure);
           let control: HTMLInputElement | HTMLSelectElement;
           if (Array.isArray(question.options) && question.options.length) {
             control = document.createElement('select'); option(control, '', t('선택하세요', 'Choose an answer'));
@@ -388,6 +393,17 @@ export function createConversation(options: ConversationOptions) {
             answerInputs.set(questionId, () => control.value === otherValue ? other.value : control.value); label.append(other);
           }
           form.append(label);
+          // Native select options cannot contain interactive anchors. Keep their
+          // values intact and expose any linked option text beside the select.
+          if (control instanceof HTMLSelectElement) {
+            const references = document.createElement('div'); references.className = 'conversation-option-links';
+            for (const value of question.options ?? []) {
+              const reference = document.createElement('p');
+              appendLinkifiedText(reference, `${string(value.label)}${value.description ? ` — ${value.description}` : ''}`, linkFailure);
+              if (reference.querySelector('a')) references.append(reference);
+            }
+            if (references.childElementCount) form.append(references);
+          }
         }
         const submit = document.createElement('button'); submit.type = 'submit'; submit.className = 'primary-button'; bindText(submit, '답변 보내기', 'Send answers'); form.append(submit);
         form.onsubmit = event => { event.preventDefault(); const answers = Object.fromEntries([...answerInputs].map(([key, value]) => [key, { answers: [value()] }])); void respond(id, { answers }, panel); }; panel.append(form);
@@ -629,6 +645,7 @@ export function createConversation(options: ConversationOptions) {
     handoffToTerminal,
     compact,
     setForeground,
+    revealLatest: moveLatest,
     refresh: () => visible && foreground && !loading ? loadPage() : Promise.resolve(),
     hasDraft: () => !!input.value || !!attachments.length,
     canRestart: () => !sending && !staging && !uncertain && !composing && !interrupting && !responding.size && !questionDrafts.size,

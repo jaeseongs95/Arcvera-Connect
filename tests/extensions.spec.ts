@@ -18,21 +18,28 @@ async function fixture(page: Page) {
     const installed = [{ pluginId: 'review-kit@local-market', name: 'review-kit', marketplaceName: 'local-market', version: '1.2.3', installed: true, enabled: true, source: 'local', installPolicy: 'AVAILABLE', authPolicy: 'ON_INSTALL' }];
     const available = [{ pluginId: 'writing-kit@local-market', name: 'writing-kit', marketplaceName: 'local-market', version: '2.0.0', installed: false, enabled: false, source: 'local', installPolicy: 'AVAILABLE', authPolicy: 'ON_INSTALL' }];
     const marketplaces = [{ name: 'local-market', source: 'D:\\fixture marketplace', path: 'D:\\fixture marketplace' }];
+    const hookBase = { handlerType: 'command', command: 'python review.py', server: null, tool: null, async: false, matcher: null, timeoutSec: 30, statusMessage: null, additionalContextLimit: null, pluginId: null, source: 'user', sourcePath: 'D:\\fixture-home\\.codex\\hooks.json', enabled: true, isManaged: false, currentHash: 'opaque-review:v1', trustStatus: 'trusted' };
+    const hooks = [
+      { ...hookBase, key: 'user.review', eventName: 'preToolUse' },
+      { ...hookBase, key: 'project.review', eventName: 'stop', source: 'project', enabled: false, trustStatus: 'untrusted', currentHash: 'opaque-project:v1', command: '<img src=x onerror="window.__hookInjection=true">' },
+      { ...hookBase, key: 'managed.review', eventName: 'sessionStart', source: 'system', trustStatus: 'managed', isManaged: true },
+    ];
     const f = state.extensionsFixture = {
       calls: [] as any[], listFailure: '', mutationFailure: '', sectionFailure: false,
       holdLists: false, holdMutation: false, pendingLists: [] as any[], pendingMutations: [] as any[],
       holdCompleteExit: false, completeExitFailure: '', pendingExits: [] as any[], exitObservations: [] as any[], settledMutations: 0,
-      installed, available, marketplaces, importedSkill: null as any,
+      installed, available, marketplaces, hooks, importedSkill: null as any,
       emit(event: string, payload: any) { listeners.get(event)!({ event, id: 1, payload }); },
       releaseList(index = 0) { const pending = this.pendingLists.splice(index, 1)[0]; if (!pending) throw new Error('No pending extension list'); pending.resolve(pending.snapshot); },
       releaseMutation() { const pending = this.pendingMutations.shift(); if (!pending) throw new Error('No pending extension mutation'); pending(); },
       releaseCompleteExit() { const pending = this.pendingExits.shift(); if (!pending) throw new Error('No pending native exit'); pending(); },
-      snapshot(cwd?: string | null) {
+      snapshot(cwd?: string | null, catalogQuery?: string | null) {
         const project = projects.find(project => project.cwd === cwd);
         return {
           executable: runtime, cwd: cwd ?? null,
           skillDestinations: { user: 'D:\\fixture-home\\.agents\\skills', project: cwd ? cwd + '\\.agents\\skills' : null },
-          plugins: this.sectionFailure ? null : { installed: structuredClone(this.installed), available: structuredClone(this.available) },
+          plugins: this.sectionFailure ? null : { installed: structuredClone(this.installed), available: catalogQuery ? structuredClone(this.available.filter((plugin: any) => [plugin.name, plugin.pluginId, plugin.marketplaceName].some(value => value.toLowerCase().includes(catalogQuery.toLowerCase())))) : [] },
+          hooks: { items: structuredClone(this.hooks), warnings: [], errors: [] },
           marketplaces: structuredClone(this.marketplaces),
           skills: [
             { name: 'user-review', description: '사용자가 만든 검토 스킬', path: 'D:\\fixture-home\\.agents\\skills\\user-review\\SKILL.md', scope: 'user', enabled: true, pluginId: null },
@@ -65,7 +72,7 @@ async function fixture(page: Page) {
         }
         if (command === 'extensions_list') {
           if (f.listFailure) throw new Error(f.listFailure);
-          const snapshot = f.snapshot(args.cwd);
+          const snapshot = f.snapshot(args.cwd, args.catalogQuery);
           if (f.holdLists) return await new Promise(resolve => { f.pendingLists.push({ resolve, snapshot }); });
           return snapshot;
         }
@@ -74,7 +81,11 @@ async function fixture(page: Page) {
           if (f.holdMutation) await new Promise<void>(resolve => { f.pendingMutations.push(resolve); });
           if (f.mutationFailure) throw new Error(f.mutationFailure);
           const request = args.request;
-          if (request.operation === 'installPlugin') {
+          if (request.operation === 'setHookEnabled' || request.operation === 'trustHook') {
+            const hook = f.hooks.find((item: any) => item.key === request.key);
+            if (!hook || hook.currentHash !== request.currentHash || hook.isManaged) throw new Error('Hook changed or is managed; refresh before retrying');
+            if (request.operation === 'trustHook') hook.trustStatus = 'trusted'; else hook.enabled = request.enabled;
+          } else if (request.operation === 'installPlugin') {
             const index = f.available.findIndex((plugin: any) => plugin.pluginId === request.selector);
             if (index < 0) throw new Error('Unknown plugin selector');
             const plugin = f.available.splice(index, 1)[0]; f.installed.push({ ...plugin, installed: true, enabled: true });
@@ -114,6 +125,12 @@ const processCalls = (page: Page) => page.evaluate(() => (window as any).extensi
 const projectTab = (page: Page, name: string) => page.locator('#project-tabs [role=tab]').filter({ hasText: name });
 
 const rows = (page: Page) => page.locator('#extensions-list [role=option]');
+async function discover(page: Page, query: string) {
+  if (!await page.locator('#extensions-plugin-search').isVisible()) await page.locator('#extensions-plugin-discover').click();
+  await page.locator('#extensions-search').fill(query);
+  await page.locator('#extensions-plugin-search').click();
+  await expect(page.locator('#extensions-dialog')).toHaveAttribute('aria-busy', 'false');
+}
 async function open(page: Page, projectIndex?: number, wait = true) {
   if (projectIndex !== undefined) {
     if (await page.locator('#settings-dialog').isVisible()) await page.locator('#settings-close').click();
@@ -148,8 +165,13 @@ test('discovery searches selected-runtime metadata without mutating or replacing
   const before = await processCalls(page);
   await open(page);
   await expect(page.locator('#extensions-executable')).toHaveText(runtime);
-  await expect(rows(page)).toHaveCount(2);
-  await page.locator('#extensions-search').fill('WRITING-KIT');
+  await expect(rows(page)).toHaveCount(1);
+  expect((await extensionCalls(page, 'extensions_list')).every((call: any) => call.args.catalogQuery === undefined)).toBe(true);
+  const reads = (await extensionCalls(page, 'extensions_list')).length;
+  await page.locator('#extensions-plugin-discover').click();
+  await expect(rows(page)).toHaveCount(0);
+  expect(await extensionCalls(page, 'extensions_list')).toHaveLength(reads);
+  await discover(page, 'WRITING-KIT');
   await expect(rows(page)).toHaveCount(1);
   await expect(page.locator('#extensions-detail')).toContainText('writing-kit@local-market');
   await expect(page.locator('#extensions-detail')).toContainText('2.0.0');
@@ -166,8 +188,83 @@ test('discovery searches selected-runtime metadata without mutating or replacing
   await expect(page.locator('.xterm-rows')).toContainText('EXTENSIONS_LIVE_OUTPUT');
 });
 
+test('hook metadata stays text and trust approval does not silently enable the hook', async ({ page }) => {
+  await fixture(page); await open(page, 0);
+  await page.locator('#extensions-tab-hooks').click();
+  await expect(rows(page)).toHaveCount(3);
+  await page.locator('[data-extension-id="project.review"]').click();
+  await expect(page.locator('#extensions-hook-content')).toHaveText('<img src=x onerror="window.__hookInjection=true">');
+  await expect(page.locator('#extensions-detail img')).toHaveCount(0);
+  expect(await page.evaluate(() => (window as any).__hookInjection)).toBeUndefined();
+  await expect(page.locator('#extensions-hook-toggle')).toHaveCount(0);
+  await page.locator('#extensions-hook-trust').click();
+  await expect(page.locator('#extensions-review-target')).toContainText('opaque-project:v1');
+  expect(await extensionCalls(page)).toEqual([]);
+  await confirm(page);
+  expect((await extensionCalls(page))[0].args.request).toEqual({ operation: 'trustHook', key: 'project.review', currentHash: 'opaque-project:v1' });
+  await expect(page.locator('#extensions-detail')).toContainText('사용 안 함');
+  await expect(page.locator('#extensions-hook-toggle')).toHaveText('사용');
+});
+
+test('hook activation addresses only the reviewed key and managed hooks have no mutation controls', async ({ page }) => {
+  await fixture(page); await open(page, 0); await page.locator('#extensions-tab-hooks').click();
+  await page.locator('[data-extension-id="user.review"]').click();
+  await page.locator('#extensions-hook-toggle').click(); await confirm(page);
+  expect((await extensionCalls(page))[0].args.request).toEqual({ operation: 'setHookEnabled', key: 'user.review', currentHash: 'opaque-review:v1', enabled: false });
+  await expect(page.locator('#extensions-detail')).toContainText('사용 안 함');
+  await page.locator('[data-extension-id="managed.review"]').click();
+  await expect(page.locator('#extensions-hook-toggle')).toHaveCount(0);
+  await expect(page.locator('#extensions-hook-trust')).toHaveCount(0);
+  await expect(page.locator('#extensions-detail')).toContainText('관리자가 정한 Hook');
+  expect(await extensionCalls(page)).toHaveLength(1);
+});
+
+test('a hook changed after review is not reported as successfully trusted', async ({ page }) => {
+  await fixture(page); await open(page); await page.locator('#extensions-tab-hooks').click();
+  await page.locator('[data-extension-id="project.review"]').click(); await page.locator('#extensions-hook-trust').click();
+  await page.evaluate(() => { (window as any).extensionsFixture.hooks[1].currentHash = 'changed:v2'; });
+  await page.locator('#extensions-review-confirm').click();
+  await expect(page.locator('#extensions-error')).toContainText('Hook changed');
+  await expect(page.locator('#extensions-status')).toContainText('완료하지 못했습니다');
+  expect(await extensionCalls(page)).toHaveLength(1);
+});
+
+for (const handlerType of ['mcpTool', 'prompt', 'agent']) test(`incomplete ${handlerType} execution metadata never offers trust approval while trusted activation remains available`, async ({ page }) => {
+  await fixture(page);
+  await page.evaluate(handlerType => {
+    const hook = (window as any).extensionsFixture.hooks[1];
+    Object.assign(hook, { handlerType, command: null, server: 'fixture-server', tool: 'fixture-tool' });
+  }, handlerType);
+  await open(page); await page.locator('#extensions-tab-hooks').click();
+  await page.locator('[data-extension-id="project.review"]').click();
+  await expect(page.locator('#extensions-hook-trust')).toHaveCount(0);
+  await expect(page.locator('#extensions-detail')).toContainText('실행 입력을 모두 확인할 수 없어');
+  await expect(page.locator('#extensions-hook-toggle')).toHaveCount(0);
+  expect(await extensionCalls(page)).toEqual([]);
+  await page.evaluate(() => { const hook = (window as any).extensionsFixture.hooks[1]; hook.enabled = true; });
+  await page.locator('#extensions-refresh').click();
+  await expect(page.locator('#extensions-dialog')).toHaveAttribute('aria-busy', 'false');
+  await page.locator('#extensions-hook-toggle').click(); await confirm(page);
+  expect((await extensionCalls(page))[0].args.request).toEqual({ operation: 'setHookEnabled', key: 'project.review', currentHash: 'opaque-project:v1', enabled: false });
+  await page.evaluate(() => { (window as any).extensionsFixture.hooks[1].trustStatus = 'trusted'; });
+  await page.locator('#extensions-refresh').click();
+  await expect(page.locator('#extensions-dialog')).toHaveAttribute('aria-busy', 'false');
+  await expect(page.locator('#extensions-hook-toggle')).toHaveText('사용');
+  await expect(page.locator('#extensions-hook-trust')).toHaveCount(0);
+});
+
+test('all four extension tabs remain keyboard reachable without catalog discovery', async ({ page }) => {
+  await fixture(page); await open(page); const before = await extensionCalls(page, 'extensions_list');
+  await page.locator('#extensions-tab-plugins').focus(); await page.keyboard.press('ArrowRight'); await page.keyboard.press('ArrowRight');
+  await expect(page.locator('#extensions-tab-hooks')).toBeFocused();
+  await page.keyboard.press('End'); await expect(page.locator('#extensions-tab-marketplaces')).toBeFocused();
+  await page.keyboard.press('ArrowRight'); await expect(page.locator('#extensions-tab-plugins')).toBeFocused();
+  expect(await extensionCalls(page, 'extensions_list')).toEqual(before);
+});
+
 test('plugin installation reviews the exact catalog selector then displays the read-back installed state', async ({ page }) => {
   await fixture(page); await open(page, 0);
+  await discover(page, 'writing-kit');
   await rows(page).filter({ hasText: 'writing-kit' }).click();
   await page.locator('#extensions-plugin-install').click();
   await expect(page.locator('#extensions-review-target')).toHaveText('writing-kit@local-market');
@@ -196,6 +293,10 @@ test('installed plugin toggle and removal address one ID and removal can be canc
     { command: 'extensions_mutate', args: { cwd: null, request: { operation: 'setPluginEnabled', pluginId: 'review-kit@local-market', enabled: false } } },
     { command: 'extensions_mutate', args: { cwd: null, request: { operation: 'removePlugin', pluginId: 'review-kit@local-market' } } },
   ]);
+  await expect(rows(page)).toHaveCount(0);
+  await expect(page.locator('#extensions-detail')).toContainText('목록에서 항목을 선택하세요');
+  await discover(page, 'review-kit');
+  await rows(page).filter({ hasText: 'review-kit' }).click();
   await expect(page.locator('#extensions-detail')).toContainText('설치할 수 있음');
 });
 
@@ -213,7 +314,7 @@ test('unsupported plugin list remains an error while skills work and refresh can
   await page.locator('#extensions-refresh').click();
   await expect(page.locator('#extensions-dialog')).toHaveAttribute('aria-busy', 'false');
   await page.locator('#extensions-tab-plugins').click();
-  await expect(rows(page)).toHaveCount(2);
+  await expect(rows(page)).toHaveCount(1);
   await expect(page.locator('#extensions-error')).toBeHidden();
   expect(await extensionCalls(page)).toEqual([]);
 });
@@ -234,7 +335,7 @@ test('설정에서 언어를 바꾸고 확장 창을 다시 열어도 초안과 
   await page.locator('#extensions-review-confirm').click();
   await expect(page.locator('#extensions-dialog')).toHaveAttribute('aria-busy', 'true');
   await language(page, 'en');
-  await expect(page.locator('#extensions-title')).toHaveText('Plugins & skills');
+  await expect(page.locator('#extensions-title')).toHaveText('Plugins, skills & hooks');
   await expect(page.locator('#extensions-search')).toHaveValue('review-kit');
   await expect(page.locator('#extensions-marketplace-source')).toHaveValue('https://example.test/사용자/market.git');
   await expect(page.locator('#extensions-marketplace-ref')).toHaveValue('draft-branch');
@@ -368,13 +469,15 @@ test('editing an import destination invalidates the reviewed action until the ne
 });
 
 
-test('large catalogs bound rendered rows and close releases row and detail DOM while keeping a small query draft', async ({ page }) => {
+test('explicit catalog search bounds rendered rows and close releases DOM then returns to installed management', async ({ page }) => {
   await fixture(page);
   await page.evaluate(() => {
     const f = (window as any).extensionsFixture;
     for (let index = 0; index < 1000; index++) f.available.push({ pluginId: `bulk-${index}@local-market`, name: `bulk-${index}`, marketplaceName: 'local-market', version: '1.0', enabled: false, source: 'fixture', installPolicy: 'AVAILABLE', authPolicy: 'ON_INSTALL' });
   });
   await open(page);
+  await expect(rows(page)).toHaveCount(1);
+  await discover(page, 'bulk-');
   await expect(rows(page)).toHaveCount(50);
   await page.locator('#extensions-more').click();
   await expect(rows(page)).toHaveCount(100);
@@ -388,8 +491,8 @@ test('large catalogs bound rendered rows and close releases row and detail DOM w
   await expect(rows(page).first()).not.toContainText('review-kit');
   await page.locator('#extensions-previous').click();
   await expect(rows(page)).toHaveCount(250);
-  await expect(rows(page).first()).toContainText('review-kit');
-  await page.locator('#extensions-search').fill('bulk-999');
+  await expect(rows(page).first()).toContainText('bulk-0');
+  await discover(page, 'bulk-999');
   await expect(rows(page)).toHaveCount(1);
   await expect(rows(page).first()).toContainText('bulk-999');
   for (let cycle = 0; cycle < 3; cycle++) {
@@ -397,7 +500,9 @@ test('large catalogs bound rendered rows and close releases row and detail DOM w
     await expect(rows(page)).toHaveCount(0);
     await expect(page.locator('#extensions-detail > *')).toHaveCount(0);
     await open(page);
-    await expect(page.locator('#extensions-search')).toHaveValue('bulk-999');
+    await expect(page.locator('#extensions-search')).toHaveValue('');
+    await expect(rows(page).first()).toContainText('review-kit');
+    await discover(page, 'bulk-999');
     await expect(rows(page)).toHaveCount(1);
   }
   await page.locator('#extensions-close').click();

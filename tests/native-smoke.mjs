@@ -266,16 +266,19 @@ try {
       await page.locator('#catalog-close').click();
       return { projectSessionRows: count, previewMessagesRendered: messageCount, selectedThreadIdSha256: hash(selected), titleSearchPerformed: true, existingSessionResumed: false, transcriptSaved: false };
     });
-    await check('completed catalog queries leave no owned helper or CLOSE_WAIT socket', async () => {
+    await check('completed catalog queries leave no direct CLI child or CLOSE_WAIT socket', async () => {
       const powershell = path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
       // Fixed code reads the explicitly supplied fixture identity from its own
       // environment. No path or command text is interpolated into this script.
-      const command = `$ErrorActionPreference='Stop'; $targetProcessId=[int]$env:AGENT_GRID_NATIVE_PID; $target=Get-Process -Id $targetProcessId; if(-not [string]::Equals([IO.Path]::GetFullPath($target.Path),[IO.Path]::GetFullPath($env:AGENT_GRID_NATIVE_EXE),[StringComparison]::OrdinalIgnoreCase)){throw 'Unexpected fixture process'}; $children=@(Get-CimInstance Win32_Process -Filter ('ParentProcessId='+$targetProcessId)); $connections=@(Get-NetTCPConnection -ErrorAction Stop); @{ownedHelperChildren=@($children|Where-Object Name -eq 'opendiy-desktop-helper.exe').Count; closeWaitSockets=@($connections|Where-Object {$_.OwningProcess -eq $targetProcessId -and $_.State -eq 'CloseWait'}).Count}|ConvertTo-Json -Compress`;
+      const settings = await nativeCall('get_codex_settings');
+      const selected = [settings.resolvedPath, settings.appServer?.resolvedPath].filter(Boolean);
+      assert(selected.length > 0, 'CLI identity is required for the cleanup oracle');
+      const command = `$ErrorActionPreference='Stop'; $targetProcessId=[int]$env:AGENT_GRID_NATIVE_PID; $target=Get-Process -Id $targetProcessId; if(-not [string]::Equals([IO.Path]::GetFullPath($target.Path),[IO.Path]::GetFullPath($env:AGENT_GRID_NATIVE_EXE),[StringComparison]::OrdinalIgnoreCase)){throw 'Unexpected fixture process'}; $paths=@(ConvertFrom-Json $env:AGENT_GRID_PROBE_CLI_PATHS); $children=@(Get-CimInstance Win32_Process -Filter ('ParentProcessId='+$targetProcessId)); $connections=@(Get-NetTCPConnection -ErrorAction Stop); $owned=@($children|Where-Object {$child=$_; @($paths|Where-Object {[string]::Equals([IO.Path]::GetFullPath($_),[IO.Path]::GetFullPath($child.ExecutablePath),[StringComparison]::OrdinalIgnoreCase)}).Count -gt 0}); @{ownedCliChildren=$owned.Count; closeWaitSockets=@($connections|Where-Object {$_.OwningProcess -eq $targetProcessId -and $_.State -eq 'CloseWait'}).Count}|ConvertTo-Json -Compress`;
       const deadline = Date.now() + 15_000; let sample;
       do {
-        const { stdout } = await execFileAsync(powershell, ['-NoProfile', '-NonInteractive', '-Command', command], { windowsHide: true, timeout: 10_000, maxBuffer: 64 * 1024 });
+        const { stdout } = await execFileAsync(powershell, ['-NoProfile', '-NonInteractive', '-Command', command], { windowsHide: true, timeout: 10_000, maxBuffer: 64 * 1024, env: { ...process.env, AGENT_GRID_PROBE_CLI_PATHS: JSON.stringify(selected) } });
         sample = JSON.parse(stdout.trim());
-        if (sample.ownedHelperChildren === 0 && sample.closeWaitSockets === 0) return { ...sample, scope: 'Only the root-launched native fixture process, after catalog replies and before PTYs start' };
+        if (sample.ownedCliChildren === 0 && sample.closeWaitSockets === 0) return { ...sample, scope: 'Only the root-launched native fixture process, matching selected CLI/server executable paths after catalog replies and before PTYs start; exact descendant-handle cleanup is covered by native_pty' };
         await new Promise(resolve => setTimeout(resolve, 100));
       } while (Date.now() < deadline);
       assert.fail(`Catalog resources remained: ${JSON.stringify(sample)}`);

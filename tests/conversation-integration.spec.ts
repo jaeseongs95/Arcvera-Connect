@@ -65,11 +65,11 @@ test('세션 재시작은 미전송 초안과 첨부를 보존하며 종료 명�
 });
 
 for (const startingView of ['terminal', 'conversation'] as const) {
-  test(`세션 상단 압축은 ${startingView}에서 같은 세션에 연결하고 초안을 보존한다`, async ({ page }) => {
+  test(`세션 상단 압축은 ${startingView} 보기와 입력 소유권을 바꾸지 않고 초안을 보존한다`, async ({ page }) => {
     await page.goto('/');
     const card = page.locator('.terminal-card[data-id="chat-session"]');
     await expect(card).toBeVisible();
-    await page.evaluate(() => { (window as any).contextSnapshot = { revision: 1, threadId: 'original-thread', connected: true, guiConnected: false, active: false, canCompact: false, reason: 'guiDisconnected', compacting: false, tokenUsageFresh: true, tokenUsage: { last: { totalTokens: 40000 }, modelContextWindow: 100000 } }; });
+    await page.evaluate(() => { (window as any).contextSnapshot = { revision: 1, threadId: 'original-thread', connected: true, guiConnected: false, active: false, canCompact: true, reason: null, compacting: false, tokenUsageFresh: true, tokenUsage: { last: { totalTokens: 40000 }, modelContextWindow: 100000 } }; });
     await card.locator('.context-usage').click();
     await expect(card.locator('.context-usage')).toHaveText('40%');
     if (startingView === 'conversation') {
@@ -77,16 +77,23 @@ for (const startingView of ['terminal', 'conversation'] as const) {
       await card.locator('.conversation-input').fill('압축 후에도 보존할 초안');
     }
     await card.locator('.context-compact').click();
-    await expect(card.locator('.conversation-host')).toBeVisible();
-    await expect(card.locator('.terminal-host')).toBeHidden();
-    await expect(card.locator('.conversation-status')).toContainText('서버의 완료 확인');
+    if (startingView === 'conversation') {
+      await expect(card.locator('.conversation-host')).toBeVisible();
+      await expect(card.locator('.terminal-host')).toBeHidden();
+      await expect(card.locator('.conversation-status')).toContainText('서버의 완료 확인');
+      await expect(card.locator('.conversation-send')).toBeDisabled();
+    } else {
+      await expect(card.locator('.conversation-host')).toBeHidden();
+      await expect(card.locator('.terminal-host')).toBeVisible();
+      await expect(card.locator('.conversation-toggle')).toHaveAttribute('aria-pressed', 'false');
+    }
     await expect(card.locator('.context-compact')).toHaveAttribute('aria-busy', 'true');
-    await expect(card.locator('.conversation-send')).toBeDisabled();
     if (startingView === 'conversation') await expect(card.locator('.conversation-input')).toHaveValue('압축 후에도 보존할 초안');
     const calls = await page.evaluate(() => (window as any).chatCalls);
     const compact = calls.filter((entry: any) => entry.command === 'conversation_request' && entry.args.request.type === 'compact');
     expect(compact).toHaveLength(1);
     expect(compact[0].args).toMatchObject({ id: 'chat-session', generation: 1 });
+    if (startingView === 'terminal') expect(calls.filter((entry: any) => entry.command === 'conversation_request' && ['attach', 'detach', 'handoffToTerminal'].includes(entry.args.request.type))).toEqual([]);
     expect(calls.some((entry: any) => entry.command === 'start_session' || (entry.command === 'conversation_request' && entry.args.request.type === 'send'))).toBe(false);
   });
 }

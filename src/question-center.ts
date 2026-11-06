@@ -1,9 +1,12 @@
 import { locale, onLanguageChange, t } from './i18n';
+import { appendLinkifiedText } from './external-links';
+import { MAX_WORKSPACE_SESSIONS } from './model';
 import './question-center.css';
 
 export interface PendingQuestion {
   id: string; sessionId: string; threadId?: string | null; generation: number; requestId?: string;
   kind: 'question' | 'approval' | 'unsupported'; title?: string; message?: string; sessionTitle?: string;
+  source?: 'async' | 'request';
   canRespond: boolean; responded?: boolean; metadataAvailable?: boolean;
   questions?: { id: string; header?: string; question: string; options?: { label: string; description?: string }[] | null; isOther?: boolean; isSecret?: boolean }[];
   approval?: { options: { id: string; label: string }[] };
@@ -15,11 +18,13 @@ interface QuestionCenterHost {
 }
 interface Draft { values: Record<string, { selected?: string; text?: string }>; phase?: 'sending' | 'sent' | 'uncertain'; openFailed?: boolean }
 const interval = 3_000;
+// Each native session retains at most 32 RPC requests plus 32 async questions.
+const maxPendingItems = MAX_WORKSPACE_SESSIONS * (32 + 32);
 const key = (item: PendingQuestion) => JSON.stringify([item.sessionId, item.threadId ?? '', item.generation, item.requestId ?? item.id]);
 
 function readItems(value: unknown): PendingQuestion[] {
   const items = (value as { items?: unknown })?.items;
-  if (!Array.isArray(items) || items.length > 1024) throw new Error(t('질문 목록 형식이 올바르지 않습니다.', 'Invalid question list.'));
+  if (!Array.isArray(items) || items.length > maxPendingItems) throw new Error(t('질문 목록 형식이 올바르지 않습니다.', 'Invalid question list.'));
   const result = new Map<string, PendingQuestion>();
   for (const item of items as PendingQuestion[]) {
     if (!item || typeof item.id !== 'string' || typeof item.sessionId !== 'string' || !Number.isSafeInteger(item.generation)
@@ -48,10 +53,18 @@ export function createQuestionCenter(host: QuestionCenterHost) {
   const drafts = new Map<string, Draft>();
   const rows = new Map<string, { node: HTMLElement; signature: string }>();
   const abort = new AbortController();
-  let items: PendingQuestion[] = []; let readFailed = false; let lastCheckedAt: number | undefined; let disposed = false; let exiting = false; let nativeVisible = true; let epoch = 0;
+  let items: PendingQuestion[] = []; let readFailed = false; let listIncomplete = false; let lastCheckedAt: number | undefined; let disposed = false; let exiting = false; let nativeVisible = true; let epoch = 0;
   let timer: ReturnType<typeof setTimeout> | undefined; let running: Promise<void> | undefined; let lastStarted = -Infinity;
   const responses = new Set<Promise<void>>();
-  const text = (tag: string, content: string) => { const node = document.createElement(tag); node.textContent = content; return node; };
+  const text = (tag: string, content: string) => {
+    const node = document.createElement(tag);
+    appendLinkifiedText(node, content, () => {
+      let notice = node.querySelector<HTMLElement>('.question-link-error');
+      if (!notice) { notice = document.createElement('small'); notice.className = 'question-link-error'; notice.setAttribute('role', 'alert'); node.append(notice); }
+      notice.textContent = t('브라우저를 열지 못했습니다. 링크 주소를 복사해 브라우저에서 열어 주세요.', 'Could not open the browser. Copy the link address and open it in your browser.');
+    });
+    return node;
+  };
   const clearTimer = () => { clearTimeout(timer); timer = undefined; };
   const active = () => !disposed && !exiting && nativeVisible && !document.hidden;
 
@@ -60,7 +73,7 @@ export function createQuestionCenter(host: QuestionCenterHost) {
     const count = items.filter(item => item.kind !== 'unsupported').length;
     const unavailable = items.filter(item => item.kind === 'unsupported').length;
     const stale = items.some(item => item.metadataAvailable === false);
-    const unknown = readFailed && lastCheckedAt === undefined;
+    const unknown = readFailed && lastCheckedAt === undefined || listIncomplete && !count;
     const label = unknown ? t('질문함 · 상태 확인 불가', 'Questions · Status unavailable') : t(`질문함 · 미응답 ${count}건`, `Questions · ${count} unanswered`);
     button.setAttribute('aria-label', label); button.title = label + (stale || readFailed && !unknown ? t(' · 마지막 확인 목록 포함', ' · Includes last confirmed requests') : '');
     button.setAttribute('aria-haspopup', 'dialog'); button.setAttribute('aria-controls', element.id);
@@ -70,7 +83,9 @@ export function createQuestionCenter(host: QuestionCenterHost) {
     element.querySelector('.question-summary')!.textContent = unknown ? t('미응답 상태를 확인할 수 없습니다.', 'Unanswered status is unavailable.')
       : t(`미응답 ${count}건`, `${count} unanswered`) + (unavailable ? t(` · 확인 필요 세션 ${unavailable}개`, ` · ${unavailable} sessions need checking`) : '') + (stale || readFailed ? t(' · 마지막 확인 목록 포함', ' · Includes last confirmed requests') : '');
     const checked = lastCheckedAt === undefined ? '' : t(' 마지막 확인: ', ' Last checked: ') + new Date(lastCheckedAt).toLocaleTimeString(locale(), { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    element.querySelector('.question-list-status')!.textContent = readFailed ? (unknown
+    element.querySelector('.question-list-status')!.textContent = listIncomplete
+      ? t('일부 세션의 질문 상태를 확인하지 못했습니다. 표시된 질문 외에 미응답 질문이 있을 수 있습니다.', 'Question status is unavailable for some sessions. There may be unanswered questions beyond those shown.')
+      : readFailed ? (unknown
       ? t('질문 목록에 연결할 수 없습니다. 잠시 후 다시 확인하거나 원래 세션에서 상태를 확인하세요.', 'Cannot connect to the question list. Try again shortly or check the original session.')
       : t('조회 실패 · 이전 목록을 유지합니다. 잠시 후 다시 확인하거나 원래 세션에서 상태를 확인하세요.', 'Could not refresh · Previous list preserved. Try again shortly or check the original session.') + checked)
       : !items.length ? t('미응답 질문이 없습니다.', 'No unanswered questions.') : '';
@@ -178,7 +193,9 @@ export function createQuestionCenter(host: QuestionCenterHost) {
     lastStarted = performance.now(); const token = epoch;
     running = Promise.resolve().then(() => host.call('list_pending_questions')).then(value => {
       if (!active() || token !== epoch) return;
-      items = readItems(value); readFailed = false; lastCheckedAt = Date.now(); render();
+      const complete = (value as { complete?: unknown })?.complete;
+      if (complete !== undefined && typeof complete !== 'boolean') throw new Error('Invalid question completeness.');
+      items = readItems(value); listIncomplete = complete === false; readFailed = false; lastCheckedAt = Date.now(); render();
     }).catch(() => { if (active() && token === epoch) { readFailed = true; render(); } }).finally(() => { running = undefined; schedule(); });
   }
   function visibility() { epoch++; clearTimer(); if (active()) poll(); }

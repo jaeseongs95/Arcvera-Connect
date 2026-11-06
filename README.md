@@ -17,7 +17,7 @@ This is a usage example, not a performance comparison or a recording of the late
 ## Supported Codex runtimes
 
 Desktop and Codex are installed separately. The documented runtime baseline for
-Desktop **1.1.1** is:
+Desktop **1.2.0** is:
 
 | Runtime | Support scope |
 | --- | --- |
@@ -35,8 +35,7 @@ does not guarantee a feature. See [runtime selection and server transitions](doc
 2. **Install or extract Desktop.** Download the Windows x64 installer or portable
    ZIP from [Releases](https://github.com/jaeseongs95/opendiy-desktop/releases/latest).
    Windows and WebView2 are required; builds are unsigned. For the portable edition,
-   extract the **whole ZIP** and keep `opendiy-desktop-helper.exe` beside
-   `opendiy-desktop.exe`. Check the download against the release's `SHA256SUMS.txt`,
+   extract the **whole ZIP**. Check the download against the release's `SHA256SUMS.txt`,
    then launch the installed app or `opendiy-desktop.exe`.
 3. **Select your CLI.** Open **⚙ Settings → Executable settings** and choose the
    native `codex.exe` or installed `opendiy-codex-launcher.exe`. A server executable
@@ -58,9 +57,10 @@ system labels keep their own language.
 | Group sessions, reorder projects or switch the grid | [Projects and terminals](docs/user-guide.md#projects) |
 | Resume a saved conversation or restart one session | [History, restore and restart](docs/user-guide.md#restore) |
 | Use conversation view and answer questions or approvals | [Conversation and question inbox](docs/user-guide.md#conversation) |
-| Manage plugins, marketplaces or skills | [Plugins and skills](docs/user-guide.md#extensions) |
+| Manage installed plugins, find a plugin or manage skills | [Plugins and skills](docs/user-guide.md#extensions) |
+| Inspect hooks, change activation or review trust | [Hooks](docs/user-guide.md#hooks) |
 | Inspect and control direct subagents | [Subagents](docs/user-guide.md#subagents) |
-| Inspect context usage, compact or schedule work | [Context](docs/user-guide.md#context) · [Schedules](docs/user-guide.md#schedules) |
+| Inspect usage, adjust one session's context size, compact or schedule work | [Context](docs/user-guide.md#context) · [Schedules](docs/user-guide.md#schedules) |
 | Pair a phone with a running session | [Mobile remote control](docs/user-guide.md#mobile) |
 | Check weekly usage or stored attachments | [Usage](docs/user-guide.md#usage) · [Storage](docs/user-guide.md#storage) |
 
@@ -69,6 +69,9 @@ system labels keep their own language.
 - **Closing the window hides it to the tray.** Use **Exit app** for a complete exit
   and confirmed cleanup of app-owned processes. Restoring later starts new processes
   against saved conversation IDs; it does not revive old process IDs or resend input.
+- Desktop launches and owns its work processes directly through Windows Jobs.
+  A separate Desktop helper executable is no longer required; Codex, shell and
+  WebView2 processes still run separately.
 - Codex owns authentication, configuration and conversation history. Desktop stores
   layout, projects, session metadata and preferences in its own SQLite database;
   it does not copy Codex authentication files or terminal transcripts into that database.

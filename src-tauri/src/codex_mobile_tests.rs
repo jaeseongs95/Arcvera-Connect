@@ -32,20 +32,22 @@ fn real_owned_mobile_connection_pins_peer_and_does_not_keep_the_server_job_alive
     let root = env::temp_dir().join(format!("opendiy-mobile-owned-{}", Uuid::new_v4()));
     std::fs::create_dir(&root).unwrap();
     let ready = root.join("ready");
-    let (mut command, gate) = LaunchGate::wrap_std(env::current_exe().unwrap().as_os_str()).unwrap();
+    use crate::owned_process::{spawn_suspended, Child as NativeChild, Command as NativeCommand, Stdio as NativeStdio};
+    let mut command = NativeCommand::new(env::current_exe().unwrap());
     command.args(["--exact", "codex::mobile::tests::owned_mobile_server_fixture_child", "--nocapture"])
-        .env("OPENDIY_MOBILE_FIXTURE_READY", &ready).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-    hidden(&mut command);
-    let child = command.spawn().unwrap();
-    struct OwnedFixture { child: Child, job: Option<Arc<ProcessJob>>, _gate: LaunchGate }
+        .env("OPENDIY_MOBILE_FIXTURE_READY", &ready).stdin(NativeStdio::null()).stdout(NativeStdio::null()).stderr(NativeStdio::null());
+    let job = Arc::new(ProcessJob::new(false).unwrap());
+    let (child, resume) = spawn_suspended(&mut command, job.as_handle()).unwrap();
+    struct OwnedFixture { child: NativeChild, job: Option<Arc<ProcessJob>> }
     impl Drop for OwnedFixture {
         fn drop(&mut self) {
             self.job.take();
             let _ = self.child.kill(); let _ = self.child.wait();
         }
     }
-    let mut owned = OwnedFixture { job:Some(Arc::new(ProcessJob::assign_std(&child).unwrap())), child, _gate:gate };
-    owned._gate.release().unwrap();
+    let mut owned = OwnedFixture { job:Some(job), child };
+    assert!(!ready.exists(), "mobile fixture가 resume 전에 실행됐습니다.");
+    resume.resume().unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     let address = loop {
         if let Ok(value) = std::fs::read_to_string(&ready) {

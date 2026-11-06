@@ -133,22 +133,43 @@ test('지원하지 않는 실행 환경과 활성 작업에서는 압축을 전�
   expect(await page.evaluate(() => (window as any).contextFixture.preparations)).toBe(0);
 });
 
-test('원래 세션 연결 후에만 압축하고 중복 클릭과 완료 선표시를 막는다', async ({ page }) => {
+test('터미널 보기와 CLI 입력 소유권을 유지하며 압축만 요청하고 중복 클릭과 완료 선표시를 막는다', async ({ page }) => {
   await fixture(page);
   const compact = page.locator('#context-fixture .context-compact');
   await expect(compact).toBeEnabled();
-  await page.evaluate(() => { const d = (window as any).contextFixture; d.snapshot.guiConnected = false; d.snapshot.canCompact = false; d.snapshot.reason = 'guiDisconnected'; d.hold = true; });
+  await page.evaluate(() => { const d = (window as any).contextFixture; d.snapshot.guiConnected = false; d.snapshot.canCompact = true; delete d.snapshot.reason; d.hold = true; });
   await page.locator('#context-fixture .context-usage').click();
   await expect(compact).toBeEnabled();
   await compact.click();
   await expect(compact).toBeDisabled();
   await compact.evaluate((button: HTMLButtonElement) => button.click());
   expect(await page.evaluate(() => (window as any).contextFixture.mutations)).toBe(1);
-  expect(await page.evaluate(() => (window as any).contextFixture.preparations)).toBe(1);
+  expect(await page.evaluate(() => (window as any).contextFixture.preparations)).toBe(0);
+  expect(await page.evaluate(() => (window as any).contextFixture.snapshot.guiConnected)).toBe(false);
   await page.evaluate(() => (window as any).contextFixture.release());
   await expect(compact).toHaveAttribute('aria-busy', 'true');
   await expect(page.locator('#context-fixture .context-usage')).toHaveText('—');
   expect(await page.evaluate(() => JSON.stringify((window as any).contextFixture.notices))).not.toContain('압축했습니다');
+});
+
+test('관측 후 작업이 시작되면 압축은 skippedBusy를 알리고 화면 연결이나 재전송을 하지 않는다', async ({ page }) => {
+  await fixture(page);
+  const compact = page.locator('#context-fixture .context-compact');
+  await expect(compact).toBeEnabled();
+  await page.evaluate(() => { const f = (window as any).contextFixture; f.snapshot.guiConnected = false; f.result = 'skippedBusy'; });
+  await compact.click();
+  await expect.poll(() => page.evaluate(() => (window as any).contextFixture.notices.at(-1)?.ko)).toContain('다른 작업');
+  expect(await page.evaluate(() => ({ mutations: (window as any).contextFixture.mutations, preparations: (window as any).contextFixture.preparations, guiConnected: (window as any).contextFixture.snapshot.guiConnected }))).toEqual({ mutations: 1, preparations: 0, guiConnected: false });
+});
+
+test('압축 직전 최신 상태가 pendingRequest이면 화면 연결과 압축을 모두 하지 않는다', async ({ page }) => {
+  await fixture(page);
+  const compact = page.locator('#context-fixture .context-compact');
+  await expect(compact).toBeEnabled();
+  await page.evaluate(() => { const f = (window as any).contextFixture; Object.assign(f.snapshot, { revision: 2, guiConnected: false, canCompact: false, reason: 'pendingRequest' }); });
+  await compact.click();
+  await expect(compact).toBeDisabled();
+  expect(await page.evaluate(() => ({ mutations: (window as any).contextFixture.mutations, preparations: (window as any).contextFixture.preparations }))).toEqual({ mutations: 0, preparations: 0 });
 });
 
 test('숨김과 폐기 후 조회를 멈추고 늦은 응답을 화면에 적용하지 않는다', async ({ page }) => {

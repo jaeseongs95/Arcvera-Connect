@@ -17,8 +17,8 @@ async function fixture(page: Page, items: unknown[] = [question, approval, unsup
   await page.clock.pauseAt(new Date('2026-10-30T00:00:01Z'));
   await page.route('**/question-harness', route => route.fulfill({ contentType: 'text/html', body: '<!doctype html><html><body></body></html>' }));
   await page.goto('/question-harness');
-  await page.evaluate(async ({ items, options }) => {
-    const modulePath = '/src/question-center.ts'; const { createQuestionCenter } = await import(modulePath);
+  await page.evaluate(async ({ items, options, modulePath }) => {
+    const { createQuestionCenter } = await import(modulePath);
     const languagePath = '/src/i18n.ts'; const { setLanguage } = await import(languagePath); setLanguage('ko');
     const f = (window as any).questionFixture = {
       items, hidden: options.hidden ?? false, holdPoll: options.holdPoll ?? false, holdResponse: options.holdResponse ?? false,
@@ -28,19 +28,24 @@ async function fixture(page: Page, items: unknown[] = [question, approval, unsup
       visibility(value: boolean) { this.hidden = value; document.dispatchEvent(new Event('visibilitychange')); },
     };
     Object.defineProperty(document, 'hidden', { configurable: true, get: () => f.hidden });
+    (window as any).__TAURI_INTERNALS__ = { async invoke(command: string, args?: any) {
+      f.calls.push({ command, args, time: performance.now() });
+      if (f.linkError) throw new Error(f.linkError);
+    } };
     f.widget = createQuestionCenter({ openSession(id: string) { f.opens.push(id); if (f.openError) throw new Error(f.openError); }, async call(command: string, args?: any) {
       f.calls.push({ command, args, time: performance.now() });
       if (command === 'respond_pending_question') {
         if (f.holdResponse) await new Promise<void>(resolve => f.responses.push(resolve));
         if (f.responseError) throw new Error(f.responseError); return {};
       }
-      const result = structuredClone({ items: f.items }); const error = f.pollError;
+      if (command === 'open_external_url') { if (f.linkError) throw new Error(f.linkError); return; }
+      const result = structuredClone({ items: f.items, complete: f.complete }); const error = f.pollError;
       f.active++; f.maxActive = Math.max(f.maxActive, f.active);
       try { if (f.holdPoll) await new Promise<void>(resolve => f.polls.push(resolve)); if (error) throw new Error(error); return result; }
       finally { f.active--; }
     } });
     document.body.append(f.widget.button, f.widget.element);
-  }, { items, options });
+  }, { items, options, modulePath: process.env.AGENT_GRID_QUESTION_MODULE ?? '/src/question-center.ts' });
 }
 const open = (page: Page) => page.getByRole('button', { name: /^질문함 ·/ }).click();
 const polls = (page: Page) => page.evaluate(() => (window as any).questionFixture.calls.filter((call: any) => call.command === 'list_pending_questions').length);
@@ -59,6 +64,81 @@ test('세션별 질문 항목만 중복 제거해 세고 원문 없는 세션과
   await page.evaluate(() => (window as any).questionFixture.setLanguage('en'));
   await expect(page.getByRole('heading', { name: 'Questions', exact: true })).toBeVisible();
   await expect(page.locator('.question-summary')).toHaveText('2 unanswered · 1 sessions need checking');
+});
+
+test('일부 질문 상태 미확인을 확정 0건으로 표시하지 않고 정상 조회 후에만 빈 목록을 확정한다', async ({ page }) => {
+  await fixture(page, []);
+  await page.evaluate(() => { const f = (window as any).questionFixture; f.complete = false; });
+  await page.clock.runFor(3_000); await open(page);
+  await expect(page.locator('.question-summary')).toHaveText('미응답 상태를 확인할 수 없습니다.');
+  await expect(page.locator('.question-list-status')).toContainText('일부 세션');
+  await expect(page.locator('.question-list-status')).not.toContainText('미응답 질문이 없습니다');
+  await page.evaluate(() => (window as any).questionFixture.setLanguage('en'));
+  await expect(page.locator('.question-summary')).toHaveText('Unanswered status is unavailable.');
+  await page.evaluate(() => { const f = (window as any).questionFixture; f.complete = true; f.setLanguage('ko'); });
+  await page.clock.runFor(3_000);
+  await expect(page.locator('.question-list-status')).toHaveText('미응답 질문이 없습니다.');
+});
+
+test('비동기 질문 초안과 안정 질문 ID를 보존하고 응답 수락을 해결 완료로 표시하지 않는다', async ({ page }) => {
+  const id = '["request_user_input_async","async-call",0]';
+  await fixture(page, [{ ...question, source: 'async', id, requestId: id, questions: [{ id, question: '확인할 내용' }] }]);
+  await open(page); await page.getByRole('textbox', { name: '확인할 내용' }).fill('비동기 답변');
+  await page.evaluate(() => { (window as any).questionFixture.complete = false; }); await page.clock.runFor(3_000);
+  await expect(page.getByRole('textbox', { name: '확인할 내용' })).toHaveValue('비동기 답변');
+  await expect(page.locator('.question-list-status')).toContainText('일부 세션');
+  await page.getByRole('button', { name: '응답 보내기' }).click();
+  expect(await responses(page)).toEqual([expect.objectContaining({ args: { sessionId: 'session-one', generation: 4, requestId: id, answers: { [id]: { answers: ['비동기 답변'] } } } })]);
+  await expect(page.locator('#question-count')).toHaveText('1');
+  await expect(page.locator('.question-response-status')).toContainText('서버의 해결 확인');
+});
+
+test('터미널 비동기 질문은 원래 세션을 열지 않고 한글로 답변하며 전송 중 재제출하지 않는다', async ({ page }) => {
+  const id = '["request_user_input_async","terminal-question",0]';
+  await fixture(page, [{ ...question, source: 'async', id, requestId: id, metadataAvailable: true,
+    sessionTitle: '터미널 세션', questions: [{ id, question: '진행 방법을 알려 주세요.' }] }], { holdResponse: true });
+  await open(page);
+  const answer = page.getByRole('textbox', { name: '진행 방법을 알려 주세요.' });
+  await expect(answer).toBeEnabled();
+  await answer.focus(); await page.keyboard.insertText('지정한 시험 환경에서 계속 진행해 주세요.');
+  await page.clock.runFor(3_000);
+  await expect(answer).toBeFocused(); await expect(answer).toHaveValue('지정한 시험 환경에서 계속 진행해 주세요.');
+  await page.getByRole('button', { name: '응답 보내기' }).click();
+  await page.locator('form').dispatchEvent('submit');
+  await page.clock.runFor(6_000);
+  expect(await responses(page)).toEqual([expect.objectContaining({ args: {
+    sessionId: 'session-one', generation: 4, requestId: id,
+    answers: { [id]: { answers: ['지정한 시험 환경에서 계속 진행해 주세요.'] } },
+  } })]);
+  expect(await page.evaluate(() => (window as any).questionFixture.opens)).toEqual([]);
+  expect(await page.evaluate(() => (window as any).questionFixture.calls.filter((call: any) => call.command === 'conversation_request'))).toEqual([]);
+  await expect(page.locator('#question-center')).toBeVisible();
+  await page.evaluate(() => (window as any).questionFixture.releaseResponse());
+  await expect(page.locator('.question-response-status')).toContainText('서버의 해결 확인');
+  await expect(page.locator('#question-count')).toHaveText('1');
+});
+
+test('질문 제목·본문·선택지·설명 URL 클릭은 선택이나 응답 없이 외부 브라우저 명령으로 전달한다', async ({ page }) => {
+  const urls = ['https://example.test/title', 'https://example.test/body?q=한글', 'http://localhost:4567/option', 'https://example.test/description'];
+  await fixture(page, [{ ...question, title: urls[0], message: urls[1], questions: [{ id: 'q', question: '선택하세요', options: [{ label: urls[2], description: urls[3] }] }] }]);
+  await open(page);
+  for (const url of urls) await page.getByRole('link', { name: url, exact: true }).click();
+  expect(await page.evaluate(() => (window as any).questionFixture.calls.filter((call: any) => call.command === 'open_external_url').map((call: any) => call.args.url))).toEqual([
+    'https://example.test/title', 'https://example.test/body?q=%ED%95%9C%EA%B8%80', 'http://localhost:4567/option', 'https://example.test/description',
+  ]);
+  await expect(page.getByRole('radio')).not.toBeChecked(); expect(await responses(page)).toHaveLength(0);
+});
+
+test('질문 링크 열기 실패는 안전한 안내를 표시하고 질문 초안을 보존한다', async ({ page }) => {
+  const url = 'https://example.test/question';
+  await fixture(page, [{ ...question, message: url }]); await open(page);
+  await page.getByRole('textbox', { name: '덧붙일 내용' }).fill('보존할 초안');
+  await page.evaluate(() => { (window as any).questionFixture.linkError = 'D:/private/error INTERNAL_BROWSER_FAILURE'; });
+  await page.getByRole('link', { name: url, exact: true }).click();
+  await expect(page.getByRole('alert')).toContainText('브라우저를 열지 못했습니다');
+  await expect(page.getByRole('textbox', { name: '덧붙일 내용' })).toHaveValue('보존할 초안');
+  expect(await page.locator('html').evaluate(node => node.outerHTML)).not.toContain('INTERNAL_BROWSER_FAILURE');
+  expect(await responses(page)).toHaveLength(0);
 });
 
 test('질문 초안·포커스를 갱신 중 보존하고 전송·responded 상태 뒤에도 서버 해결 전까지 건수를 유지한다', async ({ page }) => {

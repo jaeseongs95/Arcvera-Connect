@@ -16,7 +16,7 @@
 
 ## 지원하는 Codex
 
-Desktop과 Codex는 별도로 설치합니다. Desktop **1.1.1**의 문서상 지원 기준은 다음과 같습니다.
+Desktop과 Codex는 별도로 설치합니다. Desktop **1.2.0**의 문서상 지원 기준은 다음과 같습니다.
 
 | 실행 환경 | 지원 범위 |
 | --- | --- |
@@ -34,7 +34,7 @@ Desktop과 Codex는 별도로 설치합니다. Desktop **1.1.1**의 문서상 �
 2. **Desktop을 설치하거나 압축을 풉니다.**
    [릴리스](https://github.com/jaeseongs95/opendiy-desktop/releases/latest)에서 Windows x64 설치 파일이나
    포터블 ZIP을 받으세요. Windows와 WebView2가 필요하며, 실행 파일은 서명되어 있지 않습니다.
-   포터블은 **ZIP 전체를 풀고** `opendiy-desktop.exe` 옆에 `opendiy-desktop-helper.exe`를 함께 두세요.
+   포터블은 **ZIP 전체를 풀어** 사용하세요.
    릴리스의 `SHA256SUMS.txt`와 다운로드한 파일의 해시를 대조할 수 있습니다.
    설치한 앱 또는 `opendiy-desktop.exe`를 실행하세요.
 3. **CLI를 선택합니다.** **⚙ 설정 → 실행 파일 설정**에서 네이티브 `codex.exe` 또는 설치된
@@ -54,9 +54,10 @@ Desktop과 Codex는 별도로 설치합니다. Desktop **1.1.1**의 문서상 �
 | 세션을 묶고 프로젝트 순서나 격자를 바꾸기 | [프로젝트와 터미널](docs/user-guide.ko.md#projects) |
 | 저장된 대화 이어가기, 특정 세션 재시작 | [기록·복원·재시작](docs/user-guide.ko.md#restore) |
 | 대화 보기에서 질문·승인에 답하기 | [대화 보기와 질문함](docs/user-guide.ko.md#conversation) |
-| 플러그인·마켓플레이스·스킬 관리 | [플러그인과 스킬](docs/user-guide.ko.md#extensions) |
+| 설치된 플러그인 관리, 새 플러그인 찾기, 스킬 관리 | [플러그인과 스킬](docs/user-guide.ko.md#extensions) |
+| Hook 조회, 사용 설정과 신뢰 검토 | [Hook](docs/user-guide.ko.md#hooks) |
 | 직접 생성한 서브에이전트 조회·관리 | [서브에이전트](docs/user-guide.ko.md#subagents) |
-| 컨텍스트 사용량 확인, 압축, 작업 예약 | [컨텍스트](docs/user-guide.ko.md#context) · [예약](docs/user-guide.ko.md#schedules) |
+| 사용량 확인, 특정 세션의 컨텍스트 크기 조절, 압축, 작업 예약 | [컨텍스트](docs/user-guide.ko.md#context) · [예약](docs/user-guide.ko.md#schedules) |
 | 실행 중인 세션을 휴대전화와 연결 | [모바일 원격 제어](docs/user-guide.ko.md#mobile) |
 | 주간 사용량과 첨부 이미지 저장 공간 확인 | [사용량](docs/user-guide.ko.md#usage) · [저장 공간](docs/user-guide.ko.md#storage) |
 
@@ -65,6 +66,8 @@ Desktop과 Codex는 별도로 설치합니다. Desktop **1.1.1**의 문서상 �
 - **창을 닫으면 트레이로 숨겨집니다.** 완전히 종료하려면 **앱 종료**를 사용하고 앱이 소유한
   프로세스의 정리를 확인하세요. 다음 실행에서는 저장된 대화 ID로 새 프로세스를 연결합니다.
   이전 프로세스 ID를 되살리거나 지난 입력을 다시 보내지 않습니다.
+- Desktop이 작업 프로세스를 직접 실행하고 Windows Job으로 소유·정리합니다.
+  별도 Desktop helper 실행 파일은 필요하지 않습니다. Codex·셸·WebView2는 별도 프로세스로 실행됩니다.
 - 인증·설정·대화 기록은 Codex가 관리합니다. Desktop은 배치·프로젝트·세션 메타데이터·환경설정을
   자체 SQLite에 저장하며, 그 데이터베이스에 Codex 인증 파일이나 터미널 전문을 복사하지 않습니다.
   전송한 붙여넣기 이미지는 대화 기록에서 참조할 수 있어 별도로 보존합니다.

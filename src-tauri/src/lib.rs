@@ -2,8 +2,12 @@ mod codex;
 mod codex_settings;
 mod conversation_attachments;
 mod executable_picker;
+mod external_links;
 mod flow;
+#[cfg(test)]
 mod launch_gate;
+mod owned_process;
+mod owned_worker;
 mod project;
 pub mod process_job;
 mod owned_tui_control;
@@ -230,9 +234,12 @@ async fn catalog_preview(engine: State<'_, Engine>, thread_id: String, cursor: O
     tauri::async_runtime::spawn_blocking(move || engine.catalog_preview(&thread_id, cursor)).await.map_err(|e| format!("Session preview worker: {e}"))?
 }
 #[tauri::command]
-async fn extensions_list(engine: State<'_, Engine>, cwd: Option<String>) -> Result<codex::ExtensionsSnapshot, String> {
+async fn extensions_list(engine: State<'_, Engine>, cwd: Option<String>, catalog_query: Option<String>) -> Result<codex::ExtensionsSnapshot, String> {
     let engine = engine.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || engine.extensions_list(cwd)).await.map_err(|e| format!("Extension list worker: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || match catalog_query {
+        Some(query) => engine.extensions_list_with_catalog_query(cwd, Some(query)),
+        None => engine.extensions_list(cwd),
+    }).await.map_err(|e| format!("Extension list worker: {e}"))?
 }
 #[tauri::command]
 async fn extensions_mutate(engine: State<'_, Engine>, cwd: Option<String>, request: codex::ExtensionMutation) -> Result<codex::ExtensionsSnapshot, String> {
@@ -253,6 +260,27 @@ async fn subagents_request(engine: State<'_, Engine>, id: String, generation: u6
 async fn cron_request(engine: State<'_, Engine>, id: String, generation: u64, request: codex::CronRequest) -> Result<serde_json::Value,String> {
     let engine=engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move||engine.cron_request(&id,generation,request)).await.map_err(|e|format!("예약 요청 작업자: {e}"))?
+}
+
+#[tauri::command]
+async fn saved_cron_list(engine: State<'_, Engine>, thread_id: String) -> Result<Vec<storage::SavedCron>, String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.saved_cron_list(&thread_id)).await.map_err(|e| format!("저장 예약 조회 작업자: {e}"))?
+}
+#[tauri::command]
+async fn saved_cron_save(engine: State<'_, Engine>, id: Option<String>, thread_id: String, prompt: String, schedule: codex::CronSchedule) -> Result<storage::SavedCron, String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.saved_cron_save(id, thread_id, prompt, schedule)).await.map_err(|e| format!("저장 예약 쓰기 작업자: {e}"))?
+}
+#[tauri::command]
+async fn saved_cron_delete(engine: State<'_, Engine>, id: String, thread_id: String) -> Result<(), String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.saved_cron_delete(&id, &thread_id)).await.map_err(|e| format!("저장 예약 삭제 작업자: {e}"))?
+}
+#[tauri::command]
+async fn saved_cron_register(engine: State<'_, Engine>, id: String, generation: u64, definition_id: String, thread_id: String) -> Result<serde_json::Value, String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.saved_cron_register(&id, generation, &definition_id, &thread_id)).await.map_err(|e| format!("저장 예약 등록 작업자: {e}"))?
 }
 #[tauri::command]
 async fn conversation_request(engine: State<'_, Engine>, id: String, generation: u64, request: codex::ConversationRequest) -> Result<serde_json::Value, String> {
@@ -384,7 +412,7 @@ pub fn run() {
             tray.build(app)?;
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_ui_language, set_ui_language, prepare_runtime, start_session, list_sessions, session_write, session_resize, session_stop, session_output_ack, load_layout, save_layout, list_external, list_projects, import_project, create_project, rename_project, set_project_favorite, reorder_project, delete_project, move_session_to_project, choose_project_folder, choose_project, catalog_list, catalog_preview, get_codex_settings, runtime_compatibility, runtime_pair_status, runtime_transition_preview, apply_runtime_transition, set_codex_executable, choose_codex_executable, set_app_server_executable, choose_app_server_executable, extensions_list, extensions_mutate, choose_skill_folder, mobile_control, cron_request, subagents_request, conversation_request, list_pending_questions, respond_pending_question, choose_conversation_attachments, conversation_attachment_storage, stage_conversation_image, cleanup_conversation_attachment, weekly_usage, unconfirmed_exit_available, complete_exit])
+        .invoke_handler(tauri::generate_handler![external_links::open_external_url, get_ui_language, set_ui_language, prepare_runtime, start_session, list_sessions, session_write, session_resize, session_stop, session_output_ack, load_layout, save_layout, list_external, list_projects, import_project, create_project, rename_project, set_project_favorite, reorder_project, delete_project, move_session_to_project, choose_project_folder, choose_project, catalog_list, catalog_preview, get_codex_settings, runtime_compatibility, runtime_pair_status, runtime_transition_preview, apply_runtime_transition, set_codex_executable, choose_codex_executable, set_app_server_executable, choose_app_server_executable, extensions_list, extensions_mutate, choose_skill_folder, mobile_control, cron_request, saved_cron_list, saved_cron_save, saved_cron_delete, saved_cron_register, subagents_request, conversation_request, list_pending_questions, respond_pending_question, choose_conversation_attachments, conversation_attachment_storage, stage_conversation_image, cleanup_conversation_attachment, weekly_usage, unconfirmed_exit_available, complete_exit])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if !window.state::<ExitState>().0.load(Ordering::Acquire) {

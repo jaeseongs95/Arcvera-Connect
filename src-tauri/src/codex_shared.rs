@@ -367,7 +367,7 @@ pub(super) fn prepare(cwd: &Path, requested: Option<&str>, endpoint: SharedEndpo
         drop(rpc); // receiver를 먼저 닫아 bounded pipe reader의 send를 깨운다.
         drop(proxy);
     });
-    Ok(CodexSession { command,server:None,job:None,_launch_gate:None,stopped,socket:None,observer:Some(observer),mobile:Some(mobile),shared:Some(control),proxy_job,conversation })
+    Ok(CodexSession { command,server:None,job:None,stopped,socket:None,observer:Some(observer),mobile:Some(mobile),shared:Some(control),proxy_job,conversation })
 }
 
 #[cfg(test)]

@@ -170,7 +170,8 @@ test('session shortcuts, maximize and reorder stay within the selected project',
   await expect(card(page, 'a1')).toHaveClass(/focused/);
   await page.keyboard.press('Control+Shift+Tab');
   await expect(card(page, 'a2')).toHaveClass(/focused/);
-  await card(page, 'a1').getByLabel('뒤로 이동').click();
+  await expect(page.locator('.move-left, .move-right')).toHaveCount(0);
+  await card(page, 'a1').locator('.drag-handle').dragTo(card(page, 'a2').locator('.terminal-header'));
   await expect.poll(() => visibleIds(page)).toEqual(['a2', 'a1']);
   await page.locator('#project-tabs [role=tab]').first().click();
   await expect.poll(() => visibleIds(page)).toEqual(['a2', 'b1', 'a1', 'parent', 'child', 'sibling']);
@@ -612,7 +613,9 @@ test('세션 상단은 확인된 압축 진행 상태만 표시하고 완료·�
   await page.evaluate(session => { const f = (window as any).tabsFixture; delete f.contextSnapshots.a1; f.emit('session-changed', { ...session, generation: 8 }); }, owned[0]);
   await expect(badge).toBeHidden();
   await expect(state).toHaveText('Ready');
-  expect(await page.evaluate(() => (window as any).tabsFixture.calls.filter((c: any) => c.command === 'conversation_request' && c.args.request.type !== 'contextStatus'))).toEqual([]);
+  // Clicking the usage icon may query per-thread settings, but must never
+  // change them or request compaction while observing the status badge.
+  expect(await page.evaluate(() => (window as any).tabsFixture.calls.filter((c: any) => c.command === 'conversation_request' && !['contextStatus', 'contextSettings'].includes(c.args.request.type)))).toEqual([]);
 });
 
 

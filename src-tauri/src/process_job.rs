@@ -1,7 +1,6 @@
 //! Only processes created by this application are assigned to these jobs.
-//! LaunchGate prevents app-created helpers from spawning before Job assignment.
+//! Direct children enter a precreated Job before their first instruction.
 //! Do not extend this to external PIDs or existing vendor services.
-pub use crate::launch_gate::{run_child, LaunchGate};
 
 #[cfg(windows)]
 mod platform {
@@ -78,7 +77,7 @@ mod platform {
     static APP_JOB: OnceLock<ProcessJob> = OnceLock::new();
 
     impl ProcessJob {
-        fn assign(handle: HANDLE, allow_breakaway: bool) -> Result<Self, String> {
+        pub fn new(allow_breakaway: bool) -> Result<Self, String> {
             unsafe {
                 let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
                 if job.is_null() {
@@ -93,18 +92,27 @@ mod platform {
                 if SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits as *const _ as _, std::mem::size_of_val(&limits) as u32) == 0 {
                     return Err(format!("configure owned process job: {}", std::io::Error::last_os_error()));
                 }
-                if AssignProcessToJobObject(job, handle) == 0 {
-                    return Err(format!("assign owned process job: {}", std::io::Error::last_os_error()));
-                }
                 Ok(guard)
             }
+        }
+
+        pub fn as_handle(&self) -> BorrowedHandle<'_> {
+            unsafe { BorrowedHandle::borrow_raw(self.0) }
+        }
+
+        fn assign(handle: HANDLE, allow_breakaway: bool) -> Result<Self, String> {
+            let job = Self::new(allow_breakaway)?;
+            if unsafe { AssignProcessToJobObject(job.0, handle) } == 0 {
+                return Err(format!("assign owned process job: {}", std::io::Error::last_os_error()));
+            }
+            Ok(job)
         }
 
         pub fn assign_std(child: &std::process::Child) -> Result<Self, String> {
             Self::assign(child.as_raw_handle() as HANDLE, false)
         }
 
-        /// 공유 daemon을 시작하는 전용 LaunchGate 실행기에만 사용한다.
+        /// 공유 daemon을 시작하는 전용 실행기에만 사용한다.
         /// 명시적 CREATE_BREAKAWAY_FROM_JOB만 허용하며, 보통 자손은 계속 회수한다.
         pub fn assign_daemon_launcher(child: &std::process::Child) -> Result<Self, String> {
             Self::assign(child.as_raw_handle() as HANDLE, true)
@@ -247,6 +255,8 @@ mod platform {
     #[derive(Debug)]
     pub struct ProcessJob;
     impl ProcessJob {
+        pub fn new(_: bool) -> Result<Self, String> { Ok(Self) }
+        pub fn as_handle(&self) {}
         pub fn assign_std(_: &std::process::Child) -> Result<Self, String> { Ok(Self) }
         pub fn assign_daemon_launcher(_: &std::process::Child) -> Result<Self, String> { Ok(Self) }
         pub fn assign_pty(_: &dyn portable_pty::Child) -> Result<Self, String> { Ok(Self) }

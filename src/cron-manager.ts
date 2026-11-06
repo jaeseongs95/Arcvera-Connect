@@ -7,6 +7,7 @@ type Schedule = { type: 'every'; seconds: number } | { type: 'at'; atUnixMs: num
 interface Job { id: string; promptPreview: string; schedule: Schedule; state: string; paused: boolean; removed: boolean; nextRunAt?: number | null; skipped?: number }
 interface List { supported: boolean; connected: boolean; scope: 'cliLifetime'; jobs: Job[]; hasMore?: boolean; mutationState?: 'clear' | 'unknown'; reconciledRequestId?: string; supportsExpectedTurnInterrupt?: boolean }
 interface Reply { status: 'applied' | 'notApplied' | 'unknown' | 'unsupported' }
+interface SavedCron { id: string; threadId: string; prompt: string; schedule: Schedule; registration: { sessionId: string; generation: number; requestId: string; jobId: string | null; state: 'pending' | 'registered' | 'unknown' | 'reconciled' } | null }
 interface Host { call<T>(command: string, args: Record<string, unknown>): Promise<T>; notify(ko: string, error?: boolean, en?: string): void }
 const LIMIT = 100;
 const states: Record<string, [string, string]> = { ready: ['예약됨', 'Scheduled'], pending: ['실행 접수 확인 중', 'Checking admission'], running: ['실행 중', 'Running'], finished: ['종료됨', 'Finished'], unknown: ['실행 상태 미확인', 'Execution unknown'], blockedUnsupported: ['실행 환경 미지원', 'Runtime unsupported'], blockedConnection: ['연결 확인 필요', 'Connection required'] };
@@ -22,12 +23,13 @@ export function createCronManager(host: Host) {
     <p class="cron-session"></p><p class="cron-lifetime"></p>
     <div class="cron-toolbar"><button class="cron-refresh quiet-button" type="button"></button><span class="cron-status" role="status" aria-live="polite"></span></div>
     <p class="cron-error inline-error" role="alert" hidden></p><p class="cron-unknown" role="status" hidden></p>
-    <section class="cron-jobs" aria-label="예약 작업"></section><p class="cron-limit" hidden></p>
+    <h3 class="cron-runtime-title"></h3><section class="cron-jobs" aria-label="예약 작업"></section><p class="cron-limit" hidden></p>
+    <h3 class="cron-saved-title"></h3><p class="cron-saved-help"></p><p class="cron-storage-error inline-error" role="alert" hidden></p><section class="cron-saved"></section>
     <form class="cron-form"><h3 class="cron-new-label"></h3><label><span class="cron-prompt-label"></span><textarea class="cron-prompt" rows="3" maxlength="65536" required></textarea></label>
     <div class="cron-schedule"><label><span class="cron-schedule-label"></span><select class="cron-kind"><option value="every"></option><option value="at"></option></select></label>
     <label class="cron-every"><span class="cron-interval-label"></span><span class="cron-interval-input"><input class="cron-amount" type="number" min="1" step="1" value="5" required><select class="cron-unit"><option value="1"></option><option value="60" selected></option><option value="3600"></option></select></span></label>
     <label class="cron-at" hidden><span class="cron-at-label"></span><input class="cron-time" type="datetime-local" step="1"></label></div>
-    <p class="cron-timing-help"></p><button class="cron-add primary-button" type="submit"></button></form>`;
+    <p class="cron-timing-help"></p><p class="cron-editing" hidden></p><div class="cron-job-actions"><button class="cron-save quiet-button" type="button"></button><button class="cron-add primary-button" type="submit"></button><button class="cron-new quiet-button" type="button" hidden></button></div></form>`;
   document.body.append(dialog);
   const $ = <T extends HTMLElement = HTMLElement>(selector: string) => dialog.querySelector<T>(selector)!;
   const prompt = $<HTMLTextAreaElement>('.cron-prompt');
@@ -41,6 +43,7 @@ export function createCronManager(host: Host) {
   let jobs: Job[] = []; let supported = false; let connected = false; let fresh = false; let hasMore = false;
   let canCancel = false;
   let knownList = false; let readingRequest = false;
+  let definitions: SavedCron[] = []; let storageReady = false; let editing: string | undefined; let savedSignature = ''; let savedRevision = 0;
   const rows = new Map<string, { signature: string; row: HTMLElement }>();
   const empty = document.createElement('p');
   const unresolved = new Map<string, string>();
@@ -54,10 +57,14 @@ export function createCronManager(host: Host) {
     const eligible = !!selected && available && supported && connected && fresh && !exiting && !uncertain() && unresolved.size < MAX_WORKSPACE_SESSIONS;
     const ready = eligible && !request;
     // 목록 읽기는 초안 편집을 중단하지 않는다. 실제 변경 전송만 단일 요청으로 제한한다.
-    for (const element of form.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>('input,select,textarea')) element.disabled = !eligible || (!!request && !readingRequest);
-    $<HTMLButtonElement>('.cron-add').disabled = !ready;
-    $<HTMLButtonElement>('.cron-refresh').disabled = !selected || !available || !!request || exiting;
+    const canStore = !!selected?.threadId && storageReady && !exiting;
+    for (const element of form.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>('input,select,textarea')) element.disabled = !canStore || (!!request && !readingRequest);
+    $<HTMLButtonElement>('.cron-add').disabled = !ready || !canStore;
+    $<HTMLButtonElement>('.cron-save').disabled = !canStore || !!request;
+    $<HTMLButtonElement>('.cron-new').disabled = !!request || exiting;
+    $<HTMLButtonElement>('.cron-refresh').disabled = !selected || !!request || exiting;
     for (const button of dialog.querySelectorAll<HTMLButtonElement>('.cron-job button')) button.disabled = !ready || button.dataset.allowed !== 'true';
+    for (const button of dialog.querySelectorAll<HTMLButtonElement>('.cron-saved button')) button.disabled = !!request || exiting || button.dataset.allowed !== 'true' || (button.dataset.runtime === 'true' && !ready);
     $('.cron-unknown').hidden = !uncertain();
     dialog.setAttribute('aria-busy', String(!!request));
   }
@@ -101,7 +108,84 @@ export function createCronManager(host: Host) {
     for (const row of desired) { if (row !== position) list.insertBefore(row, position); position = row.nextSibling; }
     if (!available) rows.clear();
     $('.cron-limit').hidden = !hasMore;
+    renderSaved();
     controls();
+  }
+  function renderSaved() {
+    const signature = JSON.stringify([getLanguage(), storageReady, savedRevision, definitions.map(d => d.schedule.type === 'at' && d.schedule.atUnixMs <= Date.now())]);
+    if (signature === savedSignature) return;
+    savedSignature = signature;
+    const list = $('.cron-saved'); list.replaceChildren();
+    if (!definitions.length) { const text = document.createElement('p'); bindText(text, storageReady ? '이 대화에 저장된 예약 정의가 없습니다.' : '저장 정의를 아직 확인하지 못했습니다.', storageReady ? 'No saved definitions for this conversation.' : 'Saved definitions have not been confirmed.'); list.append(text); }
+    for (const definition of definitions) {
+      const row = document.createElement('article'); row.className = 'cron-saved-job'; row.dataset.definitionId = definition.id;
+      const text = document.createElement('p'); text.className = 'cron-preview'; text.textContent = preview(definition.prompt);
+      const detail = document.createElement('small');
+      const receipt = definition.registration;
+      const label = receipt ? receipt.state === 'registered' ? t('CLI에 등록됨', 'Registered in CLI') : t('등록 결과 미확인 · 재전송 차단', 'Registration unresolved · retry blocked') : t('저장됨 · CLI에 미등록', 'Saved · not registered in CLI');
+      detail.textContent = `${label} · ${definition.schedule.type === 'every' ? t(`${definition.schedule.seconds}초 간격`, `Every ${definition.schedule.seconds} seconds`) : formatTime(definition.schedule.atUnixMs)}${receipt?.jobId ? ` · #${receipt.jobId}` : ''}`;
+      const actions = document.createElement('div'); actions.className = 'cron-job-actions';
+      const expired = definition.schedule.type === 'at' && definition.schedule.atUnixMs <= Date.now();
+      function action(ko: string, en: string, allowed: boolean, work: () => void, runtime = false) { const button = document.createElement('button'); button.type = 'button'; button.className = 'quiet-button'; bindText(button, ko, en); button.dataset.allowed = String(allowed); button.dataset.runtime = String(runtime); button.onclick = work; actions.append(button); }
+      action('이 CLI에 수동 등록', 'Register in this CLI', !receipt && !expired && definition.threadId === selected?.threadId, () => void registerSaved(definition), true);
+      action(expired ? '새 실행 시각 지정' : '원문·일정 편집', expired ? 'Choose a new time' : 'Edit full prompt and schedule', !receipt, () => {
+        editing = definition.id; prompt.value = definition.prompt; kind.value = definition.schedule.type;
+        if (definition.schedule.type === 'every') { amount.value = String(definition.schedule.seconds); unit.value = '1'; }
+        else { const date = new Date(definition.schedule.atUnixMs); time.value = new Date(date.getTime() - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 19); }
+        mode(); bindText($('.cron-editing'), '저장 정의를 편집 중입니다. 저장하면 같은 정의를 갱신합니다.', 'Editing the saved definition. Saving updates the same definition.'); $('.cron-editing').hidden = false; $('.cron-new').hidden = false; prompt.focus();
+      });
+      action('저장 정의 삭제', 'Delete saved definition', !receipt || receipt.state === 'registered', () => void deleteSaved(definition));
+      row.append(text, detail, actions);
+      if (expired) { const warning = document.createElement('p'); bindText(warning, '실행 시각이 지났습니다. 새 미래 시각을 저장한 뒤 등록하세요.', 'This time has passed. Save a new future time before registering.'); row.append(warning); }
+      list.append(row);
+    }
+  }
+  async function loadSaved(session: Session, version: number) {
+    if (!session.threadId) { storageReady = false; definitions = []; return; }
+    try {
+      const result = await host.call<SavedCron[]>('saved_cron_list', { threadId: session.threadId });
+      if (version !== epoch || !selected || key(selected) !== key(session)) return;
+      if (!Array.isArray(result) || result.some(item => !item || item.threadId !== session.threadId || typeof item.id !== 'string' || typeof item.prompt !== 'string' || !item.schedule)) throw Error('저장 예약 응답 형식 불일치');
+      definitions = result; savedRevision++; storageReady = true; $('.cron-storage-error').hidden = true;
+      const pending = result.find(item => item.registration && item.registration.sessionId === session.id && item.registration.generation === session.generation && ['pending', 'unknown'].includes(item.registration.state))?.registration;
+      if (pending) unresolved.set(key(session), pending.requestId);
+    } catch {
+      if (version !== epoch) return;
+      storageReady = false; bindText($('.cron-storage-error'), '저장 정의를 읽지 못했습니다. 새로고침하세요. 기존 저장 데이터는 덮어쓰지 않습니다.', 'Could not read saved definitions. Refresh to try again. Existing saved data is preserved.'); $('.cron-storage-error').hidden = false;
+    }
+  }
+  function resetDraft() { editing = undefined; prompt.value = ''; time.value = ''; $('.cron-editing').hidden = true; $('.cron-new').hidden = true; }
+  async function sendSaved(session: Session, definition: SavedCron, version: number) {
+    let applied = false;
+    try {
+      const result = await host.call<Reply>('saved_cron_register', { id: session.id, generation: session.generation, definitionId: definition.id, threadId: session.threadId });
+      if (version !== epoch) return;
+      fresh = false;
+      if (result.status === 'applied') { applied = true; status('저장한 정의를 CLI에 등록했습니다. 새로고침하여 현재 예약을 확인하세요.', 'The saved definition was registered in the CLI. Refresh to confirm its current state.'); }
+      else if (result.status === 'notApplied' || result.status === 'unsupported') error('CLI에 등록하지 못했습니다. 정의는 저장되어 있습니다. 연결과 지원 상태를 확인하세요.', 'Could not register in the CLI. The definition is saved. Check runtime support and connection.');
+      else error('등록 결과를 확인하지 못했습니다. 새로고침하여 확인하세요. 자동 재전송하지 않습니다.', 'Registration result is unknown. Refresh to check it. It will not be retried automatically.');
+    } catch {
+      if (version === epoch) { fresh = false; error('등록 결과를 확인하지 못했습니다. 정의는 저장되어 있습니다. 새로고침하여 확인하세요. 자동 재전송하지 않습니다.', 'Registration could not be confirmed. The definition is saved. Refresh to check it. It will not be retried automatically.'); }
+    }
+    await loadSaved(session, version);
+    return applied;
+  }
+  function registerSaved(definition: SavedCron) {
+    const session = selected; const version = epoch;
+    if (!session || !live(version) || !fresh || !supported || !connected || request || uncertain() || definition.registration || definition.threadId !== session.threadId || (definition.schedule.type === 'at' && definition.schedule.atUnixMs <= Date.now())) return Promise.resolve();
+    return track(async () => { if (!live(version)) return; await sendSaved(session, definition, version); if (version === epoch) render(); });
+  }
+  function deleteSaved(definition: SavedCron) {
+    const session = selected; const version = epoch; if (!session?.threadId || request || exiting || !storageReady || (definition.registration && definition.registration.state !== 'registered')) return Promise.resolve();
+    return track(async () => {
+      try {
+        await host.call('saved_cron_delete', { id: definition.id, threadId: session.threadId });
+        if (version !== epoch) return;
+        if (editing === definition.id) resetDraft();
+        status('저장 정의를 삭제했습니다. CLI에 이미 등록된 예약과 실행 중 회차는 유지됩니다.', 'Saved definition deleted. Existing CLI schedules and accepted runs continue.');
+        await loadSaved(session, version); render();
+      } catch { if (version === epoch) error('저장 정의를 삭제하지 못했습니다. 새로고침하여 상태를 확인하세요.', 'Could not delete the saved definition. Refresh to check its state.'); }
+    });
   }
   function validate(value: List) {
     if (!value || typeof value.supported !== 'boolean' || typeof value.connected !== 'boolean' || value.scope !== 'cliLifetime' || !Array.isArray(value.jobs)) throw Error('예약 응답 형식 불일치');
@@ -110,7 +194,7 @@ export function createCronManager(host: Host) {
     for (const job of value.jobs.slice(0, LIMIT)) { if (ids.has(job?.id)) throw Error('중복 예약 식별자'); ids.add(job?.id); }
     if (value.jobs.slice(0, LIMIT).some(job => !job || typeof job.id !== 'string' || !/^[1-9][0-9]{0,19}$/.test(job.id) || BigInt(job.id) > 18446744073709551615n || typeof job.promptPreview !== 'string' || typeof job.state !== 'string' || !Object.hasOwn(states, job.state) || typeof job.paused !== 'boolean' || typeof job.removed !== 'boolean' || (job.nextRunAt != null && (!Number.isSafeInteger(job.nextRunAt) || job.nextRunAt <= 0)) || (job.skipped != null && (!Number.isSafeInteger(job.skipped) || job.skipped < 0)) || !job.schedule || (job.schedule.type === 'every' ? !Number.isSafeInteger(job.schedule.seconds) || job.schedule.seconds <= 0 : job.schedule.type !== 'at' || !Number.isSafeInteger(job.schedule.atUnixMs) || job.schedule.atUnixMs <= 0))) throw Error('예약 목록 형식 불일치');
   }
-  function scheduleRefresh() { clearTimeout(timer); if (dialog.open && visible && !document.hidden && !exiting && available) timer = setTimeout(() => void refresh(), 5000); }
+  function scheduleRefresh() { clearTimeout(timer); if (dialog.open && visible && !document.hidden && !exiting && available) timer = setTimeout(() => void refresh(false), 5000); }
   function track(work: () => Promise<void>, preserveRowFocus = false) {
     if (request || exiting) return Promise.resolve();
     clearTimeout(timer);
@@ -127,9 +211,10 @@ export function createCronManager(host: Host) {
       scheduleRefresh();
     }); controls(); return request;
   }
-  function refresh() {
-    const session = selected; const version = epoch; if (!session || !available || !dialog.open || !visible || document.hidden) return Promise.resolve();
+  function refresh(reloadSaved = true) {
+    const session = selected; const version = epoch; if (!session || !dialog.open || !visible || document.hidden) return Promise.resolve();
     return track(async () => {
+      if (!available) { await loadSaved(session, version); if (version === epoch) render(); return; }
       if (!live(version) || !visible || document.hidden) return;
       try {
         const value = await rpc<List>(session, { type: 'list' });
@@ -137,14 +222,16 @@ export function createCronManager(host: Host) {
         validate(value); supported = value.supported; connected = value.connected; fresh = supported && connected;
         canCancel = fresh && value.supportsExpectedTurnInterrupt === true;
         if (fresh) { jobs = value.jobs.slice(0, LIMIT).map(job => ({ id: job.id, promptPreview: preview(job.promptPreview), state: job.state, paused: job.paused, removed: job.removed, nextRunAt: job.nextRunAt, skipped: job.skipped, schedule: job.schedule.type === 'every' ? { type: 'every', seconds: job.schedule.seconds } : { type: 'at', atUnixMs: job.schedule.atUnixMs } })); hasMore = value.hasMore === true || value.jobs.length > LIMIT; knownList = true; }
+        if (reloadSaved) await loadSaved(session, version);
         if (fresh && value.mutationState === 'clear' && value.reconciledRequestId === unresolved.get(key(session))) unresolved.delete(key(session));
+        if (!live(version)) return;
         $('.cron-error').hidden = true;
         if (!supported) status('이 실행 환경은 예약 관리 연결을 지원하지 않습니다.', 'This runtime does not support scheduled job management.');
         else if (!connected) status('예약 실행기 연결을 확인하지 못했습니다. 마지막 목록은 현재 상태가 아닐 수 있습니다.', 'The scheduler connection is unavailable. The last list may be out of date.');
         else status('예약 목록을 확인했습니다.', 'Job list confirmed.');
         render();
       } catch {
-        if (live(version)) { fresh = false; canCancel = false; error('예약 목록을 불러오지 못했습니다. 연결을 확인하고 새로고침하세요. 마지막 목록은 보존합니다.', 'Could not load scheduled jobs. Check the connection and refresh. The last list is preserved.'); controls(); }
+        if (live(version)) { fresh = false; canCancel = false; error('예약 목록을 불러오지 못했습니다. 연결을 확인하고 새로고침하세요. 마지막 목록은 보존합니다.', 'Could not load scheduled jobs. Check the connection and refresh. The last list is preserved.'); if (reloadSaved) await loadSaved(session, version); if (version === epoch) render(); }
       }
     }, true);
   }
@@ -182,30 +269,48 @@ export function createCronManager(host: Host) {
     });
   }
   function mode() { $('.cron-every').hidden = kind.value !== 'every'; $('.cron-at').hidden = kind.value !== 'at'; amount.required = kind.value === 'every'; time.required = kind.value === 'at'; }
-  form.addEventListener('submit', event => {
-    event.preventDefault();
+  function saveDraft(register: boolean) {
+    const session = selected; const version = epoch;
+    if (!session?.threadId || !storageReady || request || exiting || (register && (!live(version) || !supported || !connected || !fresh || uncertain()))) return;
     if (!prompt.value.trim() || prompt.value.includes('\0') || new TextEncoder().encode(prompt.value).byteLength > 64 * 1024) { error('작업 내용을 입력하세요. UTF-8 기준 64 KiB까지 등록할 수 있습니다.', 'Enter the task prompt, up to 64 KiB in UTF-8.'); return; }
     let schedule: Schedule;
     if (kind.value === 'every') { const seconds = Number(amount.value) * Number(unit.value); if (!Number.isSafeInteger(Number(amount.value)) || !Number.isSafeInteger(seconds) || seconds <= 0) { error('반복 간격은 0보다 큰 정수로 입력하세요.', 'Enter a positive whole-number interval.'); return; } schedule = { type: 'every', seconds }; }
     else if (kind.value === 'at') { const atUnixMs = new Date(time.value).getTime(); if (!Number.isSafeInteger(atUnixMs) || atUnixMs <= Date.now()) { error('미래의 실행 시각을 선택하세요.', 'Choose a future execution time.'); return; } schedule = { type: 'at', atUnixMs }; }
     else return;
-    void mutate({ type: 'add', schedule, prompt: prompt.value });
-  });
-  function clear() { epoch++; selected = undefined; available = false; jobs = []; rows.clear(); supported = false; connected = false; fresh = false; canCancel = false; hasMore = false; knownList = false; clearTimeout(timer); prompt.value = ''; time.value = ''; $('.cron-error').textContent = ''; $('.cron-error').hidden = true; status('', ''); render(); }
-  $('.cron-close').onclick = () => dialog.close(); dialog.addEventListener('close', clear);
+    const value = prompt.value; const definitionId = editing;
+    void track(async () => {
+      if (version !== epoch || !dialog.open) return;
+      try {
+        const definition = await host.call<SavedCron>('saved_cron_save', { id: definitionId ?? null, threadId: session.threadId, prompt: value, schedule });
+        if (version !== epoch) return;
+        await loadSaved(session, version);
+        if (register && live(version)) { if (await sendSaved(session, definition, version)) resetDraft(); else editing = definition.id; }
+        else { resetDraft(); status('예약 정의를 저장했습니다. CLI 등록과 실행은 수동으로 시작합니다.', 'Schedule definition saved. CLI registration is manual.'); }
+        if (version === epoch) render();
+      } catch { if (version === epoch) error('예약 정의를 저장하지 못했습니다. 등록 요청은 보내지 않았습니다. 작성 중인 내용은 보존합니다.', 'Could not save the definition. No registration request was sent. Your draft is preserved.'); }
+    });
+  }
+  form.addEventListener('submit', event => { event.preventDefault(); saveDraft(true); });
+  $('.cron-save').onclick = () => saveDraft(false);
+  $('.cron-new').onclick = () => resetDraft();
+  function clear() { epoch++; selected = undefined; available = false; jobs = []; definitions = []; storageReady = false; rows.clear(); supported = false; connected = false; fresh = false; canCancel = false; hasMore = false; knownList = false; clearTimeout(timer); resetDraft(); $('.cron-error').textContent = ''; $('.cron-error').hidden = true; $('.cron-storage-error').hidden = true; status('', ''); render(); }
+  $('.cron-close').onclick = () => dialog.close();
+  // A queued close from the previous opening must not clear a reopened dialog.
+  dialog.addEventListener('close', () => { if (!dialog.open) clear(); });
   $('.cron-refresh').onclick = () => void refresh(); kind.onchange = mode;
   document.addEventListener('visibilitychange', () => { clearTimeout(timer); if (!document.hidden && dialog.open && visible) void refresh(); });
   const labels: [string, string, string][] = [
     ['#cron-title', '예약 작업', 'Scheduled jobs'], ['.cron-refresh', '새로고침', 'Refresh'],
-    ['.cron-lifetime', '이 세션의 CLI 예약을 관리합니다. CLI가 종료되면 예약도 끝납니다. 앱이나 운영체제에 별도 예약을 만들지 않습니다.', 'Manage schedules owned by this session’s CLI. Schedules end when the CLI exits. No separate app or operating-system schedules are created.'],
+    ['.cron-lifetime', 'CLI가 종료되면 예약도 끝납니다. Desktop에 저장한 정의는 남으며, 같은 대화를 시작한 뒤 직접 다시 등록할 수 있습니다. 자동 등록·별도 실행기는 없습니다.', 'Schedules end when the CLI exits. Desktop definitions remain so you can manually register them after starting the same conversation. No automatic registration or separate scheduler.'],
+    ['.cron-runtime-title', '현재 CLI 예약', 'Current CLI schedules'], ['.cron-saved-title', 'Desktop 저장 정의', 'Desktop saved definitions'], ['.cron-saved-help', '전체 작업 원문과 일정을 이 앱에 저장합니다. 저장 정의 삭제는 현재 CLI 예약을 삭제하지 않습니다. CLI에서 만든 예약은 미리보기만 제공하므로 원문을 가져올 수 없습니다.', 'Full task prompts and schedules are saved in this app. Deleting a definition does not remove an existing CLI schedule. CLI-created jobs expose only a preview, so their full prompt cannot be imported.'], ['.cron-save', '정의만 저장', 'Save definition only'], ['.cron-new', '새 정의 작성', 'New definition'],
     ['.cron-unknown', '이 세션에 결과 미확인 요청이 있습니다. 원래 요청의 처리 여부가 확인될 때까지 변경을 제한합니다.', 'This session has an unresolved request. Changes remain blocked until the original request is reconciled.'],
-    ['.cron-new-label', '예약 등록', 'Add schedule'], ['.cron-prompt-label', '실행할 작업', 'Task prompt'], ['.cron-schedule-label', '실행 방식', 'Schedule type'], ['.cron-kind option[value="every"]', '반복', 'Recurring'], ['.cron-kind option[value="at"]', '한 번 실행', 'One time'], ['.cron-interval-label', '반복 간격', 'Interval'], ['.cron-unit option[value="1"]', '초', 'seconds'], ['.cron-unit option[value="60"]', '분', 'minutes'], ['.cron-unit option[value="3600"]', '시간', 'hours'], ['.cron-at-label', '실행 시각', 'Execution time'], ['.cron-timing-help', '실행 시각은 이 컴퓨터의 현지 시각입니다. 실행 중 작업이 있으면 해당 회차를 건너뛰며, 밀린 회차를 쌓아두지 않습니다.', 'Times use this computer’s local time. Busy sessions skip the occurrence; missed occurrences do not queue up.'], ['.cron-add', '예약 등록', 'Add schedule'], ['.cron-limit', '일부 예약만 표시합니다. 실행 환경의 목록 범위 제한을 확인하세요.', 'Only part of the job list is displayed. Check the runtime’s list limits.'],
+    ['.cron-new-label', '저장 후 CLI 등록', 'Save and register in CLI'], ['.cron-prompt-label', '실행할 작업', 'Task prompt'], ['.cron-schedule-label', '실행 방식', 'Schedule type'], ['.cron-kind option[value="every"]', '반복', 'Recurring'], ['.cron-kind option[value="at"]', '한 번 실행', 'One time'], ['.cron-interval-label', '반복 간격', 'Interval'], ['.cron-unit option[value="1"]', '초', 'seconds'], ['.cron-unit option[value="60"]', '분', 'minutes'], ['.cron-unit option[value="3600"]', '시간', 'hours'], ['.cron-at-label', '실행 시각', 'Execution time'], ['.cron-timing-help', '실행 시각은 이 컴퓨터의 현지 시각입니다. 실행 중 작업이 있으면 해당 회차를 건너뛰며, 밀린 회차를 쌓아두지 않습니다.', 'Times use this computer’s local time. Busy sessions skip the occurrence; missed occurrences do not queue up.'], ['.cron-add', '저장 후 CLI 등록', 'Save and register in CLI'], ['.cron-limit', '일부 예약만 표시합니다. 실행 환경의 목록 범위 제한을 확인하세요.', 'Only part of the job list is displayed. Check the runtime’s list limits.'],
   ];
   for (const [selector, ko, en] of labels) bindText($(selector), ko, en);
   bindAttribute($('.cron-close'), 'aria-label', '예약 작업 창 닫기', 'Close scheduled jobs'); bindAttribute($('.cron-jobs'), 'aria-label', '예약 작업 목록', 'Scheduled job list');
   onLanguageChange(render); mode(); controls();
   return {
-    async open(session: Session) { if (request || exiting) return; if (dialog.open) dialog.close(); clear(); selected = { ...session }; available = session.active; render(); dialog.showModal(); if (available) await refresh(); else status('실행 중인 세션에서 예약을 관리할 수 있습니다.', 'Start the session to manage its schedules.'); },
+    async open(session: Session) { if (request || exiting) return; if (dialog.open) dialog.close(); clear(); selected = { ...session }; available = session.active; render(); dialog.showModal(); await refresh(); if (!available) status('저장 정의는 관리할 수 있습니다. 같은 대화를 시작한 뒤 CLI에 수동 등록하세요.', 'Saved definitions can be managed. Start the same conversation to register them manually in its CLI.'); },
     updateSessions(sessions: Session[]) { const keys = new Set(sessions.filter(s => s.active).map(key)); for (const item of unresolved.keys()) if (!keys.has(item)) unresolved.delete(item); if (selected && !keys.has(key(selected))) { available = false; fresh = false; rows.clear(); clearTimeout(timer); status('원래 세션이 종료되거나 바뀌었습니다. 예약 상태는 미확인입니다.', 'The original session ended or changed. Schedule state is unknown.'); controls(); } },
     setVisible(value: boolean) { visible = value; clearTimeout(timer); if (visible && dialog.open && !document.hidden) void refresh(); },
     async beginExit() { exiting = true; if (dialog.open) dialog.close(); clearTimeout(timer); await request; controls(); },

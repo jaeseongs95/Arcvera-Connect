@@ -3,8 +3,7 @@
   "bundle": {
     "resources": {
       "../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md",
-      "../LICENSE": "LICENSE",
-      "target/release/opendiy-desktop-helper.exe": "opendiy-desktop-helper.exe"
+      "../LICENSE": "LICENSE"
     }
   }
 }

@@ -193,6 +193,18 @@ fn shared_reaper_handoff_during_observer_join_reports_unknown_for_stop_and_shutd
                         assert_eq!(request["params"],json!({"threadId":id}),"원래 대화의 수동 구독 외 변경은 허용하지 않는다");
                         json!({"thread":{"id":id,"cwd":server_cwd,"turns":[],"status":{"type":"active"}}})
                     },
+                    "thread/turns/list" => {
+                        assert_eq!(methods.iter().filter(|method|method.as_str()=="thread/subscribePassive").count(),1);
+                        assert_eq!(methods.iter().filter(|method|method.as_str()=="thread/turns/list").count(),1);
+                        assert_eq!(request["params"],json!({"threadId":id,"limit":1,"sortDirection":"desc","itemsView":"summary"}));
+                        json!({"data":[{"id":"active-fixture-turn","status":"inProgress"}],"nextCursor":null})
+                    },
+                    "thread/items/list" => {
+                        assert_eq!(methods.iter().filter(|method|method.as_str()=="thread/turns/list").count(),1);
+                        assert_eq!(methods.iter().filter(|method|method.as_str()=="thread/items/list").count(),1);
+                        assert_eq!(request["params"],json!({"threadId":id,"turnId":"active-fixture-turn","cursor":null,"limit":32,"sortDirection":"desc"}));
+                        json!({"data":[{"turnId":"active-fixture-turn","item":{"type":"reasoning","id":"fixture-metadata-item","summary":[],"content":[]},"startedAtMs":null,"completedAtMs":null}],"nextCursor":null,"backwardsCursor":null})
+                    },
                     "thread/read" => {
                         // 준비 중 running은 외부 starting으로 투영되며 관측자가
                         // 같은 상태를 재발행하지 않는다. 실제 PTY 활성화 뒤에만
@@ -205,7 +217,9 @@ fn shared_reaper_handoff_during_observer_join_reports_unknown_for_stop_and_shutd
                 };
                 ws.send(Message::Text(json!({"id":request["id"],"result":result}).to_string().into())).unwrap();
             }
-            if preparation { assert_eq!(methods, ["initialize", "initialized"], "사전 준비는 초기화만 하고 연결을 닫아야 한다"); }
+            // 준비는 initialize 응답 직후 proxy를 정리한다. 마지막 notification은
+            // background relay가 전달하기 전에 종료될 수 있지만 다른 RPC는 금지한다.
+            if preparation { assert!(methods == ["initialize"] || methods == ["initialize", "initialized"], "사전 준비는 initialize 1회와 선택적 initialized 1회만 순서대로 허용한다: {methods:?}"); }
             connections.push(methods);
             }
             connections
@@ -282,7 +296,9 @@ fn shared_reaper_handoff_during_observer_join_reports_unknown_for_stop_and_shutd
         assert!(engine.shutdown().is_err());
         assert!(!engine.inner.exiting.load(Ordering::Acquire));
         stage("재시도 반환");
-        assert_eq!(server.join().unwrap(), [vec!["initialize", "initialized"], vec!["initialize", "initialized", "thread/start", "thread/read", "thread/subscribePassive"]]);
+        let connections=server.join().unwrap();assert_eq!(connections.len(),2);
+        assert!(connections[0] == ["initialize"] || connections[0] == ["initialize", "initialized"], "준비 연결의 초기화 순서만 허용한다: {:?}",connections[0]);
+        assert_eq!(connections[1],vec!["initialize", "initialized", "thread/start", "thread/read", "thread/subscribePassive", "thread/turns/list", "thread/items/list"]);
         stage("server 회수");
         no_more_connections.set_nonblocking(true).unwrap();
         assert!(matches!(no_more_connections.accept(), Err(e) if e.kind()==std::io::ErrorKind::WouldBlock), "불명 요청을 다시 연결·전송하면 안 된다");

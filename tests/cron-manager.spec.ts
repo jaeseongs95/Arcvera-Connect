@@ -25,6 +25,7 @@ async function fixture(page: Page, options: { unsupported?: boolean; jobs?: numb
       calls: [] as any[], notices: [] as any[], completed: 0,
       holdRead: false, holdMutation: false, releaseRead: () => {}, releaseMutation: () => {},
       failRead: false, failMutation: false, reply: 'applied',
+      saved: [] as any[], storageCalls: [] as any[],
       snapshot: {
         supported: !unsupported, connected: !unsupported, scope: 'cliLifetime',
         supportsExpectedTurnInterrupt: true,
@@ -37,6 +38,27 @@ async function fixture(page: Page, options: { unsupported?: boolean; jobs?: numb
     };
     state.cronManager = createCronManager({
       async call(command: string, args: any) {
+        if (command.startsWith('saved_cron_')) {
+          data.storageCalls.push(structuredClone({ command, args }));
+          if (command === 'saved_cron_list') {
+            for (const saved of data.saved) if (saved.registration && data.snapshot.mutationState === 'clear' && data.snapshot.reconciledRequestId === saved.registration.requestId) saved.registration.state = 'reconciled';
+            return structuredClone(data.saved.filter(saved => saved.threadId === args.threadId));
+          }
+          if (command === 'saved_cron_save') {
+            const definition = { ...args, id: args.id ?? crypto.randomUUID(), registration: null };
+            const index = data.saved.findIndex(saved => saved.id === definition.id);
+            if (index < 0) data.saved.push(definition); else data.saved[index] = definition;
+            return structuredClone(definition);
+          }
+          if (command === 'saved_cron_delete') { data.saved = data.saved.filter(saved => saved.id !== args.id); return; }
+          if (command === 'saved_cron_register') {
+            const definition = data.saved.find(saved => saved.id === args.definitionId);
+            if (definition.registration) throw Error('중복 등록');
+            const requestId = crypto.randomUUID();
+            definition.registration = { sessionId: args.id, generation: args.generation, requestId, jobId: null, state: !data.failMutation && data.reply === 'applied' ? 'registered' : 'unknown' };
+            command = 'cron_request'; args = { id: args.id, generation: args.generation, request: { type: 'add', requestId, prompt: definition.prompt, schedule: definition.schedule } };
+          }
+        }
         if (command !== 'cron_request') throw Error('예약 이외의 호출');
         data.calls.push(structuredClone({ command, ...args }));
         const reading = args.request.type === 'list';

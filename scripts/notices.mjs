@@ -22,7 +22,7 @@ for (const [location] of Object.entries(lock.packages)) {
 }
 const metadata = JSON.parse(execFileSync('cargo', ['metadata', '--locked', '--format-version', '1', '--manifest-path', 'src-tauri/Cargo.toml'], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 }));
 for (const pkg of metadata.packages) {
-  if (!pkg.source) continue;
+  if (!pkg.source && pkg.name !== 'portable-pty') continue;
   include(pkg.name, pkg.version, pkg.license, path.dirname(pkg.manifest_path));
 }
 fs.writeFileSync('THIRD_PARTY_NOTICES.md', parts.join('\n\n') + '\n', 'utf8');
