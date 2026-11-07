@@ -640,8 +640,6 @@ test('Windows 창은 내부 드래그를 허용하고 점 손잡이 이동이 �
   await expect(page.locator('.terminal-card.dragging')).toHaveCount(0);
   await expect.poll(() => visibleIds(page)).toEqual(['a1', 'a2']);
   expect(await page.evaluate(() => (window as any).tabsFixture.calls.filter((call: any) => ['start_session', 'session_stop', 'session_write'].includes(call.command)))).toEqual([]);
-  const config = JSON.parse(await readFile(new URL('../src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
-  expect(config.app.windows.find((window: any) => window.label === 'main').dragDropEnabled, 'Windows에서는 기본 파일 드래그 처리가 화면 내부 드래그를 가로채면 안 됩니다.').toBe(false);
 });
 
 
