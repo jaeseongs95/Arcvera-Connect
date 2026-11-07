@@ -130,10 +130,60 @@ test('remote server injects browser flag, enforces token auth, and bridges sessi
   const projDir = path.join(tmpRoot, 'project-alpha');
   fs.mkdirSync(projDir, { recursive: true });
 
+  const rpcCalls: Array<{ method: string; params: any }> = [];
   const instance = createRemoteServer({
     workspaceDir: path.join(tmpRoot, 'workspace'),
     token: 'test-token-xyz',
-    embeddedOnly: true,
+    allowPathDiscovery: false,
+    spawnProcess: false,
+    rpcTransport: async (method: string, params: any) => {
+      rpcCalls.push({ method, params });
+      if (method === 'initialize') {
+        return {
+          userAgent: 'codex-app-server/test',
+          opendiyCapabilities: {
+            passiveSubscription: true,
+            userTurnStartIfIdle: true,
+            compactStartIfIdle: true,
+            historySummary: true,
+          },
+          supportsSubagentManagement: true,
+          supportsExpectedTurnInterrupt: true,
+        };
+      }
+      if (method === 'thread/start') {
+        return { thread: { id: 'rpc-thread-001', cwd: params.cwd } };
+      }
+      if (method === 'model/list') {
+        return { data: [{ id: 'runtime-model-1', label: 'Runtime Model 1', efforts: ['low', 'medium', 'high'] }], nextCursor: null };
+      }
+      if (method === 'thread/subscribePassive') {
+        return { subscribed: true };
+      }
+      if (method === 'turn/start') {
+        return {
+          turn: {
+            id: 'rpc-turn-001',
+            status: 'completed',
+            items: [
+              { id: 'u-1', role: 'user', text: params.input?.[0]?.text ?? '', status: 'completed' },
+              { id: 'a-1', role: 'assistant', text: 'app-server response', status: 'completed' },
+            ],
+          },
+        };
+      }
+      if (method === 'thread/read') {
+        return {
+          thread: {
+            id: params.threadId,
+            cwd: projDir,
+            tokenUsage: { totalTokens: 4096 },
+            modelContextWindow: 128000,
+          },
+        };
+      }
+      return {};
+    },
   });
 
   await new Promise<void>(resolve => instance.server.listen(0, '127.0.0.1', () => resolve()));

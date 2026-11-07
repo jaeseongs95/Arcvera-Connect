@@ -11,6 +11,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(__dirname, '..');
 const REMOTE_SCRIPT_TAG = '<script>window.__OPENDIY_REMOTE__=true;</script>';
 const MAX_BODY_BYTES = 16 * 1024 * 1024;
+const MAX_SSE_BUFFER_BYTES = 1024 * 1024;
 
 export function injectRemoteFlag(html) {
   if (html.includes('__OPENDIY_REMOTE__')) return html;
@@ -45,6 +46,10 @@ function findExecutableInPath(names) {
   return null;
 }
 
+function getCodexHome() {
+  return process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+}
+
 function resolveCodexBinary(savedPath, allowPathDiscovery = true) {
   if (savedPath) {
     try {
@@ -69,6 +74,21 @@ function resolveCodexBinary(savedPath, allowPathDiscovery = true) {
   if (!allowPathDiscovery) {
     return { savedPath: null, resolvedPath: null, source: 'unavailable', error: null };
   }
+  const codexHome = getCodexHome();
+  const exeName = process.platform === 'win32' ? 'codex.exe' : 'codex';
+  const managedCandidates = [
+    path.join(codexHome, 'packages', 'standalone', 'current', 'bin', exeName),
+    path.join(codexHome, 'packages', 'standalone', 'current', exeName),
+  ];
+  for (const candidate of managedCandidates) {
+    try {
+      if (fs.statSync(candidate).isFile()) {
+        return { savedPath: null, resolvedPath: candidate, source: 'managed', error: null };
+      }
+    } catch {
+      // Continue searching.
+    }
+  }
   const names = process.platform === 'win32'
     ? ['opendiy-codex-launcher.exe', 'codex.exe']
     : ['opendiy-codex-launcher', 'codex'];
@@ -76,7 +96,7 @@ function resolveCodexBinary(savedPath, allowPathDiscovery = true) {
   if (fromPath) {
     return { savedPath: null, resolvedPath: fromPath, source: 'path', error: null };
   }
-  return { savedPath: null, resolvedPath: null, source: 'unavailable', error: null };
+  return { savedPath: null, resolvedPath: null, source: 'unavailable', error: 'Codex 실행 파일을 찾을 수 없습니다.' };
 }
 
 function resolveAppServerBinary(savedServerPath, cliResolvedPath) {
@@ -111,17 +131,85 @@ function resolveAppServerBinary(savedServerPath, cliResolvedPath) {
         return { savedPath: null, resolvedPath: sibling, source: 'sibling', error: null, kind: 'standalone' };
       }
     } catch {
-      // Fall back to CLI embedded app-server.
+      // Fall back to CLI subcommand `app-server`.
     }
     return { savedPath: null, resolvedPath: cliResolvedPath, source: 'cli', error: null, kind: 'cli' };
   }
   return { savedPath: null, resolvedPath: null, source: 'unavailable', error: null, kind: 'cli' };
 }
 
+function readExecutableVersion(binPath) {
+  if (!binPath) return null;
+  try {
+    return execFileSync(binPath, ['--version'], { encoding: 'utf8', timeout: 5000, windowsHide: true }).trim();
+  } catch {
+    return null;
+  }
+}
+
+function scanSkillsInDir(baseDir, scope) {
+  const results = [];
+  if (!baseDir || !fs.existsSync(baseDir)) return results;
+  try {
+    for (const entry of fs.readdirSync(baseDir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const skillMd = path.join(baseDir, entry.name, 'SKILL.md');
+      if (!fs.existsSync(skillMd)) continue;
+      const content = fs.readFileSync(skillMd, 'utf8');
+      const nameMatch = /^name:\s*(.+)$/m.exec(content);
+      const descMatch = /^description:\s*(.+)$/m.exec(content);
+      results.push({
+        id: `${scope}:${entry.name}`,
+        name: (nameMatch ? nameMatch[1] : entry.name).trim(),
+        description: (descMatch ? descMatch[1] : '').trim(),
+        path: skillMd,
+        scope,
+        enabled: true,
+      });
+    }
+  } catch {
+    // Ignore unreadable skill directories.
+  }
+  return results;
+}
+
+function scanCodexExtensions(cwd) {
+  const codexHome = getCodexHome();
+  const skills = [
+    ...scanSkillsInDir(path.join(codexHome, 'skills'), 'user'),
+    ...(cwd ? scanSkillsInDir(path.join(cwd, '.codex', 'skills'), 'workspace') : []),
+  ];
+  const plugins = [];
+  const pluginsDir = path.join(codexHome, 'plugins');
+  if (fs.existsSync(pluginsDir)) {
+    try {
+      for (const entry of fs.readdirSync(pluginsDir, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        plugins.push({
+          id: entry.name,
+          name: entry.name,
+          enabled: true,
+          path: path.join(pluginsDir, entry.name),
+        });
+      }
+    } catch {
+      // Ignore unreadable plugin directories.
+    }
+  }
+  return {
+    plugins,
+    marketplace: [],
+    skills,
+    hooks: [],
+    warnings: [],
+  };
+}
+
 class AppServerBridge {
-  constructor(getSettings, onNotification) {
+  constructor(getSettings, onNotification, customTransport = null) {
     this.getSettings = getSettings;
     this.onNotification = onNotification;
+    this.customTransport = customTransport;
     this.proc = null;
     this.nextId = 1;
     this.pending = new Map();
@@ -130,7 +218,21 @@ class AppServerBridge {
     this.starting = null;
   }
 
+  isConnected() {
+    return Boolean(this.customTransport || (this.proc && this.initialized));
+  }
+
   async ensureStarted() {
+    if (this.customTransport) {
+      if (!this.initialized) {
+        this.serverInfo = (await this.customTransport('initialize', {
+          clientInfo: { name: 'opendiy-remote', title: 'OpenDIY Remote', version: '1.3.2' },
+          capabilities: { experimentalApi: true, requiredHumanApproval: true },
+        })) || {};
+        this.initialized = true;
+      }
+      return this.serverInfo;
+    }
     if (this.proc && this.initialized) return this.serverInfo;
     if (this.starting) return this.starting;
     this.starting = this._start().finally(() => {
@@ -140,27 +242,13 @@ class AppServerBridge {
   }
 
   async _start() {
-    const fallbackEmbedded = () => {
-      this.proc = null;
-      this.initialized = true;
-      this.serverInfo = {
-        userAgent: 'opendiy-remote-embedded/1.3.2',
-        opendiyCapabilities: {
-          passiveSubscription: true,
-          userTurnStartIfIdle: true,
-          compactStartIfIdle: true,
-          historySummary: true,
-        },
-        supportsSubagentManagement: true,
-        supportsExpectedTurnInterrupt: true,
-      };
-      return this.serverInfo;
-    };
-
     const settings = this.getSettings();
     const server = settings.appServer;
     if (!server.resolvedPath) {
-      return fallbackEmbedded();
+      this.proc = null;
+      this.initialized = false;
+      this.serverInfo = null;
+      return null;
     }
 
     try {
@@ -175,6 +263,7 @@ class AppServerBridge {
       child.on('error', () => {
         if (this.proc === child) {
           this.proc = null;
+          this.initialized = false;
         }
       });
 
@@ -217,14 +306,14 @@ class AppServerBridge {
       const initResult = await this.rawRequest('initialize', {
         clientInfo: { name: 'opendiy-remote', title: 'OpenDIY Remote', version: '1.3.2' },
         capabilities: { experimentalApi: true, requiredHumanApproval: true },
-      }, 5000);
+      }, 8000);
       this.sendNotification('initialized', {});
       this.initialized = true;
       this.serverInfo = initResult || {};
       return this.serverInfo;
-    } catch {
+    } catch (err) {
       this.shutdown();
-      return fallbackEmbedded();
+      throw err;
     }
   }
 
@@ -234,11 +323,15 @@ class AppServerBridge {
   }
 
   sendResponse(id, result) {
+    if (this.customTransport) return;
     if (!this.proc || !this.proc.stdin.writable) return;
     this.proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, result }) + '\n');
   }
 
   rawRequest(method, params = {}, timeoutMs = 15000) {
+    if (this.customTransport) {
+      return Promise.resolve(this.customTransport(method, params));
+    }
     if (!this.proc || !this.proc.stdin.writable) {
       return Promise.reject(new Error('Codex app-server가 실행 중이지 않습니다.'));
     }
@@ -255,8 +348,8 @@ class AppServerBridge {
 
   async request(method, params = {}, timeoutMs = 15000) {
     await this.ensureStarted();
-    if (!this.proc) {
-      return null;
+    if (!this.isConnected()) {
+      throw new Error('Codex app-server에 연결할 수 없습니다. 실행 파일 설정을 확인하세요.');
     }
     return this.rawRequest(method, params, timeoutMs);
   }
@@ -276,7 +369,10 @@ class AppServerBridge {
 
 export function createRemoteServer(options = {}) {
   const workspaceDir = path.resolve(
-    options.workspaceDir || process.env.AGENT_GRID_WORKSPACE_DIR || path.join(os.tmpdir(), 'opendiy-remote-workspace'),
+    options.workspaceDir ||
+      process.env.OPENDIY_REMOTE_DATA_DIR ||
+      process.env.AGENT_GRID_WORKSPACE_DIR ||
+      path.join(os.tmpdir(), 'opendiy-remote-workspace'),
   );
   const distDir = path.resolve(options.distDir || process.env.OPENDIY_REMOTE_DIST || path.join(ROOT_DIR, 'dist'));
   const rawToken = options.token ?? process.env.OPENDIY_REMOTE_TOKEN ?? '';
@@ -315,12 +411,11 @@ export function createRemoteServer(options = {}) {
     try {
       fs.writeFileSync(stateFile, JSON.stringify(state, null, 2), 'utf8');
     } catch {
-      // Ignore write errors in read-only test fixtures.
+      // Ignore write errors in read-only environments.
     }
   }
 
   const sseClients = new Set();
-  const MAX_SSE_BUFFER_BYTES = 1024 * 1024;
   function broadcast(event, payload) {
     const frame = `data: ${JSON.stringify({ event, payload })}\n\n`;
     for (const res of [...sseClients]) {
@@ -342,7 +437,7 @@ export function createRemoteServer(options = {}) {
   const pendingQuestions = new Map();
   let sessionSeq = 1;
 
-  const allowPathDiscovery = options.embeddedOnly !== true && process.env.OPENDIY_REMOTE_EMBEDDED !== '1';
+  const allowPathDiscovery = options.allowPathDiscovery !== false && process.env.OPENDIY_REMOTE_NO_PATH_DISCOVERY !== '1';
   function computeSettings() {
     const cli = resolveCodexBinary(state.codexSavedPath, allowPathDiscovery);
     const appServer = resolveAppServerBinary(state.appServerSavedPath, cli.resolvedPath);
@@ -355,9 +450,9 @@ export function createRemoteServer(options = {}) {
     };
   }
 
-  const appServerBridge = new AppServerBridge(computeSettings, notification => {
+  function handleServerNotification(notification) {
     for (const session of sessions.values()) {
-      const threadId = notification.params?.threadId || session.threadId;
+      const threadId = notification.params?.threadId || notification.params?.thread?.id || session.threadId;
       if (threadId && session.threadId === threadId) {
         session.events = session.events || [];
         session.eventSeq = (session.eventSeq || 0) + 1;
@@ -368,6 +463,9 @@ export function createRemoteServer(options = {}) {
           ...(notification.id !== undefined ? { requestId: String(notification.id), responded: false } : {}),
         };
         session.events.push(entry);
+        if (notification.method === 'item/agentMessage/delta' && notification.params?.delta) {
+          emitTerminalOutput(session, String(notification.params.delta));
+        }
         if (notification.id !== undefined) {
           pendingQuestions.set(`${session.id}:${notification.id}`, {
             sessionId: session.id,
@@ -381,7 +479,13 @@ export function createRemoteServer(options = {}) {
         }
       }
     }
-  });
+  }
+
+  const appServerBridge = new AppServerBridge(
+    computeSettings,
+    handleServerNotification,
+    options.rpcTransport || null,
+  );
 
   function emitTerminalOutput(session, text) {
     session.seq = (session.seq || 0) + 1;
@@ -407,10 +511,46 @@ export function createRemoteServer(options = {}) {
     };
   }
 
-  async function handleConversationRequest(session, request) {
-    const type = request?.type;
-    const threadId = session.threadId || `thread-${session.id}`;
-    session.threadId = threadId;
+  async function syncThreadFromServer(session) {
+    let threadId = session.threadId;
+    if (appServerBridge.isConnected() || options.rpcTransport || computeSettings().appServer.resolvedPath) {
+      try {
+        await appServerBridge.ensureStarted();
+        if (appServerBridge.isConnected()) {
+          if (!threadId) {
+            const started = await appServerBridge.request('thread/start', { cwd: session.cwd });
+            if (started?.thread?.id) {
+              threadId = String(started.thread.id);
+              session.threadId = threadId;
+            }
+          } else {
+            try {
+              const readRes = await appServerBridge.request('thread/read', { threadId, includeTurns: true });
+              if (readRes?.thread) {
+                state.threads[threadId] = {
+                  ...(state.threads[threadId] || {}),
+                  ...readRes.thread,
+                  id: threadId,
+                  cwd: readRes.thread.cwd || session.cwd,
+                };
+              }
+            } catch {
+              const started = await appServerBridge.request('thread/start', { cwd: session.cwd });
+              if (started?.thread?.id) {
+                threadId = String(started.thread.id);
+                session.threadId = threadId;
+              }
+            }
+          }
+        }
+      } catch {
+        // Preserve existing thread state if app-server is not yet reachable.
+      }
+    }
+    if (!threadId) {
+      threadId = crypto.randomUUID();
+      session.threadId = threadId;
+    }
     if (!state.threads[threadId]) {
       state.threads[threadId] = {
         id: threadId,
@@ -419,128 +559,199 @@ export function createRemoteServer(options = {}) {
         createdAt: Math.floor(Date.now() / 1000),
         updatedAt: Math.floor(Date.now() / 1000),
         model: null,
-        effort: 'medium',
-        modelContextWindow: 200000,
+        effort: null,
+        modelContextWindow: null,
+        usedTokens: 0,
         turns: [],
         memorySummary: null,
         readState: { firstUnread: null, revision: 'rev-1' },
       };
     }
-    const thread = state.threads[threadId];
+    return state.threads[threadId];
+  }
 
-    if (type === 'models') {
-      let models = [];
-      if (appServerBridge.proc) {
-        try {
-          const rpcRes = await appServerBridge.request('model/list', { cursor: request.cursor ?? null });
-          if (Array.isArray(rpcRes?.data)) models = rpcRes.data;
-        } catch {
-          models = [];
+  async function queryServerModels(cursor = null) {
+    try {
+      await appServerBridge.ensureStarted();
+      if (appServerBridge.isConnected()) {
+        const rpcRes = await appServerBridge.request('model/list', { cursor });
+        if (Array.isArray(rpcRes?.data)) {
+          return { models: rpcRes.data, nextCursor: rpcRes.nextCursor ?? null };
         }
       }
-      return { models, nextCursor: null };
+    } catch {
+      // Return empty model list when app-server is unavailable.
+    }
+    return { models: [], nextCursor: null };
+  }
+
+  async function handleConversationRequest(session, request) {
+    const type = request?.type;
+    const thread = await syncThreadFromServer(session);
+    const threadId = thread.id;
+
+    if (type === 'models') {
+      return queryServerModels(request.cursor ?? null);
     }
 
     if (type === 'attach' || type === 'refresh' || type === 'turns' || type === 'poll' || type === 'page' || !type) {
-      let models = [];
-      if (appServerBridge.proc) {
+      const { models } = await queryServerModels(null);
+      if (appServerBridge.isConnected()) {
         try {
-          const rpcRes = await appServerBridge.request('model/list', { cursor: null });
-          if (Array.isArray(rpcRes?.data)) models = rpcRes.data;
+          await appServerBridge.request('thread/subscribePassive', { threadId });
         } catch {
-          models = [];
+          // Passive subscription is optional depending on server version.
         }
       }
+      const caps = appServerBridge.serverInfo?.opendiyCapabilities || {};
       return {
         attached: true,
-        connected: true,
+        connected: appServerBridge.isConnected(),
         threadId,
-        model: thread.model,
-        effort: thread.effort,
+        model: thread.model ?? null,
+        effort: thread.effort ?? null,
         models,
         capabilities: {
-          passiveSubscription: true,
-          userTurnStartIfIdle: true,
-          compactStartIfIdle: true,
-          historySummary: true,
-          expectedTurnInterrupt: true,
+          passiveSubscription: Boolean(caps.passiveSubscription ?? true),
+          userTurnStartIfIdle: Boolean(caps.userTurnStartIfIdle ?? true),
+          compactStartIfIdle: Boolean(caps.compactStartIfIdle ?? true),
+          historySummary: Boolean(caps.historySummary ?? true),
+          expectedTurnInterrupt: Boolean(appServerBridge.serverInfo?.supportsExpectedTurnInterrupt ?? true),
         },
-        turns: thread.turns.slice(-20),
+        turns: Array.isArray(thread.turns) ? thread.turns.slice(-20) : [],
         nextCursor: null,
         events: session.events || [],
-        readState: thread.readState,
+        readState: thread.readState || { firstUnread: null, revision: 'rev-1' },
       };
     }
+
+    if (type === 'items') {
+      const turn = (thread.turns || []).find(t => t.id === request.turnId);
+      return {
+        turnId: request.turnId,
+        items: turn ? turn.items || [] : [],
+        nextCursor: null,
+      };
+    }
+
+    if (type === 'detail') {
+      const turn = (thread.turns || []).find(t => t.id === request.turnId);
+      const item = (turn?.items || []).find(i => i.id === request.itemId);
+      const fullText = String(item?.text ?? '');
+      const offset = Number(request.offset || 0);
+      return {
+        turnId: request.turnId,
+        itemId: request.itemId,
+        text: fullText.slice(offset, offset + 16384),
+        totalBytes: Buffer.byteLength(fullText, 'utf8'),
+        nextOffset: offset + 16384 < fullText.length ? offset + 16384 : null,
+      };
+    }
+
     if (type === 'detach' || type === 'handoffToTerminal') {
       return { attached: false };
     }
+
     if (type === 'send') {
       const text = String(request.text ?? request.prompt ?? '').trim();
-      const turnId = `turn-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-      const userEntry = { id: `item-u-${turnId}`, role: 'user', text, status: 'completed' };
-      let assistantText = `[OpenDIY Remote] "${text}" 수신 완료 (${session.cwd})`;
-      if (appServerBridge.proc) {
-        try {
-          const rpcRes = await appServerBridge.request('turn/start', {
-            threadId,
-            input: [{ type: 'text', text }],
-          });
-          if (rpcRes?.turn?.id) {
-            assistantText = `Codex turn 시작됨 (${rpcRes.turn.id})`;
+      if (!text) throw new Error('전송할 메시지를 입력하세요.');
+      const inputItems = [{ type: 'text', text }];
+      if (Array.isArray(request.attachments)) {
+        for (const att of request.attachments) {
+          if (att?.path) {
+            inputItems.push({ type: att.type === 'localImage' ? 'localImage' : 'file', path: String(att.path) });
           }
-        } catch (err) {
-          assistantText = `Codex 응답: ${err.message || err}`;
         }
       }
-      const agentEntry = { id: `item-a-${turnId}`, role: 'assistant', text: assistantText, status: 'completed' };
+
+      const rpcRes = await appServerBridge.request('turn/start', {
+        threadId,
+        input: inputItems,
+        ...(request.model ? { model: request.model } : {}),
+        ...(request.effort ? { effort: request.effort } : {}),
+      });
+
+      const turnId = String(rpcRes?.turn?.id || crypto.randomUUID());
+      const items = Array.isArray(rpcRes?.turn?.items)
+        ? rpcRes.turn.items
+        : [{ id: `item-u-${turnId}`, role: 'user', text, status: 'completed' }];
       const turn = {
         id: turnId,
-        status: 'completed',
+        status: String(rpcRes?.turn?.status || 'completed'),
         createdAt: Math.floor(Date.now() / 1000),
-        items: [userEntry, agentEntry],
+        items,
       };
+      thread.turns = thread.turns || [];
       thread.turns.push(turn);
       thread.updatedAt = Math.floor(Date.now() / 1000);
       persistState();
-      emitTerminalOutput(session, `\r\n> ${text}\r\n${assistantText}\r\n`);
       return {
         turnId,
-        status: 'completed',
+        status: turn.status,
         turns: thread.turns.slice(-20),
         items: turn.items,
       };
     }
+
     if (type === 'interrupt') {
-      return { interrupted: true };
+      const rpcRes = await appServerBridge.request('turn/interrupt', {
+        threadId,
+        ...(request.turnId ? { turnId: request.turnId } : {}),
+      });
+      return rpcRes || { interrupted: true };
     }
+
     if (type === 'compact') {
-      return { started: true, status: 'completed' };
+      const rpcRes = await appServerBridge.request('thread/compact/startIfIdle', { threadId });
+      return rpcRes || { started: true };
     }
+
     if (type === 'contextStatus') {
+      if (appServerBridge.isConnected()) {
+        try {
+          const readRes = await appServerBridge.request('thread/read', { threadId, includeTurns: false });
+          if (readRes?.thread) {
+            thread.usedTokens = Number(readRes.thread.tokenUsage?.totalTokens ?? thread.usedTokens ?? 0);
+            thread.modelContextWindow = readRes.thread.modelContextWindow ?? thread.modelContextWindow ?? null;
+          }
+        } catch {
+          // Use cached thread values if read fails.
+        }
+      }
       return {
-        supported: true,
-        usedTokens: 2048,
-        modelContextWindow: thread.modelContextWindow || 200000,
-        canCompactIfIdle: true,
-        idle: true,
+        supported: appServerBridge.isConnected(),
+        usedTokens: Number(thread.usedTokens || 0),
+        modelContextWindow: thread.modelContextWindow ?? null,
+        canCompactIfIdle: Boolean(appServerBridge.serverInfo?.opendiyCapabilities?.compactStartIfIdle ?? appServerBridge.isConnected()),
+        idle: session.state === 'idle',
       };
     }
+
     if (type === 'contextSettings') {
       return {
-        modelContextWindow: thread.modelContextWindow || 200000,
+        modelContextWindow: thread.modelContextWindow ?? null,
         minModelContextWindow: 16000,
         maxModelContextWindow: 1000000,
       };
     }
+
     if (type === 'setContextWindow') {
-      const nextWindow = Number(request.modelContextWindow);
-      if (!Number.isFinite(nextWindow) || nextWindow < 1024) {
+      const nextWindow = request.modelContextWindow === null ? null : Number(request.modelContextWindow);
+      if (nextWindow !== null && (!Number.isFinite(nextWindow) || nextWindow < 1024)) {
         throw new Error('유효한 컨텍스트 크기를 입력하세요.');
+      }
+      if (appServerBridge.isConnected()) {
+        await appServerBridge.request('thread/contextWindow/set', {
+          threadId,
+          modelContextWindow: nextWindow,
+          expectedModelContextWindow: request.expectedModelContextWindow ?? thread.modelContextWindow ?? null,
+        });
       }
       thread.modelContextWindow = nextWindow;
       persistState();
       return { modelContextWindow: thread.modelContextWindow };
     }
+
     if (type === 'respond') {
       const key = `${session.id}:${request.requestId}`;
       const pending = pendingQuestions.get(key);
@@ -550,7 +761,8 @@ export function createRemoteServer(options = {}) {
       }
       return { responded: true };
     }
-    return { ok: true };
+
+    throw new Error(`지원하지 않는 대화 요청 유형입니다: ${type}`);
   }
 
   async function dispatchCommand(command, args = {}) {
@@ -562,20 +774,23 @@ export function createRemoteServer(options = {}) {
         state.uiLanguage = lang;
         persistState();
         return {
-          show: lang === 'en' ? 'Open OpenDIY Desktop' : 'OpenDIY Desktop 열기',
+          show: lang === 'en' ? 'Open OpenDIY Remote' : 'OpenDIY Remote 열기',
           exit: lang === 'en' ? 'Exit…' : '종료…',
         };
       }
       case 'prepare_runtime': {
-        await appServerBridge.ensureStarted();
+        const settings = computeSettings();
+        if (settings.appServer.resolvedPath || options.rpcTransport) {
+          await appServerBridge.ensureStarted();
+        }
         return null;
       }
       case 'get_codex_settings':
         return computeSettings();
       case 'set_codex_executable': {
         const nextPath = args.path ? String(args.path).trim() : null;
-        if (nextPath && !fs.existsSync(nextPath)) {
-          throw new Error(`실행 파일을 찾을 수 없습니다: ${nextPath}`);
+        if (nextPath && (!path.isAbsolute(nextPath) || !fs.existsSync(nextPath) || !fs.statSync(nextPath).isFile())) {
+          throw new Error(`유효한 실행 파일 절대 경로가 아닙니다: ${nextPath}`);
         }
         state.codexSavedPath = nextPath || null;
         persistState();
@@ -583,8 +798,8 @@ export function createRemoteServer(options = {}) {
       }
       case 'set_app_server_executable': {
         const nextPath = args.path ? String(args.path).trim() : null;
-        if (nextPath && !fs.existsSync(nextPath)) {
-          throw new Error(`앱 서버 실행 파일을 찾을 수 없습니다: ${nextPath}`);
+        if (nextPath && (!path.isAbsolute(nextPath) || !fs.existsSync(nextPath) || !fs.statSync(nextPath).isFile())) {
+          throw new Error(`유효한 앱 서버 실행 파일 절대 경로가 아닙니다: ${nextPath}`);
         }
         state.appServerSavedPath = nextPath || null;
         persistState();
@@ -592,51 +807,62 @@ export function createRemoteServer(options = {}) {
       }
       case 'runtime_compatibility': {
         const settings = computeSettings();
-        let cliVersion = null;
-        if (settings.resolvedPath) {
-          try {
-            cliVersion = execFileSync(settings.resolvedPath, ['--version'], { encoding: 'utf8', timeout: 5000 }).trim();
-          } catch {
-            cliVersion = null;
-          }
+        const cliVersion = readExecutableVersion(settings.resolvedPath);
+        const selectedServerVersion = readExecutableVersion(settings.appServer.resolvedPath) || cliVersion;
+        if (settings.appServer.resolvedPath || options.rpcTransport) {
+          try { await appServerBridge.ensureStarted(); } catch {}
         }
+        const caps = appServerBridge.serverInfo?.opendiyCapabilities || {};
         return {
-          executable: settings.resolvedPath || 'opendiy-codex (embedded)',
-          cliVersion: cliVersion || 'opendiy-codex 0.167.0-r38',
-          selectedServerExecutable: settings.appServer.resolvedPath || 'codex-app-server',
-          selectedServerVersion: cliVersion || 'opendiy-codex 0.167.0-r38',
-          serverVersion: cliVersion || 'opendiy-codex 0.167.0-r38',
-          serverState: 'running',
-          subagents: true,
-          compactIfIdle: true,
-          expectedTurnInterrupt: true,
+          executable: settings.resolvedPath,
+          cliVersion,
+          selectedServerExecutable: settings.appServer.resolvedPath,
+          selectedServerVersion,
+          serverVersion: appServerBridge.serverInfo?.userAgent || selectedServerVersion,
+          serverState: appServerBridge.isConnected() ? 'running' : 'stopped',
+          subagents: Boolean(appServerBridge.serverInfo?.supportsSubagentManagement),
+          compactIfIdle: Boolean(caps.compactStartIfIdle),
+          expectedTurnInterrupt: Boolean(appServerBridge.serverInfo?.supportsExpectedTurnInterrupt),
         };
       }
       case 'runtime_pair_status':
       case 'runtime_transition_preview': {
         const settings = computeSettings();
+        const cliVersion = readExecutableVersion(settings.resolvedPath);
+        const selectedServerVersion = readExecutableVersion(settings.appServer.resolvedPath) || cliVersion;
+        const matched = Boolean(cliVersion && selectedServerVersion && cliVersion === selectedServerVersion);
         const pair = {
-          cliVersion: '0.167.0-r38',
-          selectedServerExecutable: settings.appServer.resolvedPath || 'codex-app-server',
-          selectedServerVersion: '0.167.0-r38',
-          managedCliExecutable: settings.resolvedPath || 'codex',
-          managedVersion: '0.167.0-r38',
-          runningVersion: '0.167.0-r38',
+          cliVersion,
+          selectedServerExecutable: settings.appServer.resolvedPath,
+          selectedServerVersion,
+          managedCliExecutable: settings.resolvedPath,
+          managedVersion: cliVersion,
+          runningVersion: appServerBridge.serverInfo?.userAgent || selectedServerVersion,
           socketPath: null,
-          state: 'matched',
-          message: null,
+          state: !cliVersion ? 'unavailable' : matched ? 'matched' : 'mismatched',
+          message: !cliVersion ? 'Codex 실행 파일을 찾을 수 없습니다.' : null,
         };
         if (command === 'runtime_pair_status') return pair;
         return {
           pair,
-          canApply: false,
-          reason: null,
-          fingerprint: 'remote-matched-v1',
-          packageRoot: null,
+          canApply: Boolean(settings.resolvedPath && !matched),
+          reason: matched ? null : '선택한 실행 파일로 서버 구성을 동기화할 수 있습니다.',
+          fingerprint: crypto.createHash('sha256').update(`${settings.resolvedPath || ''}:${cliVersion || ''}`).digest('hex'),
+          packageRoot: settings.resolvedPath ? path.dirname(settings.resolvedPath) : null,
         };
       }
-      case 'apply_runtime_transition':
+      case 'apply_runtime_transition': {
+        if (!args.confirmed) {
+          throw new Error('서버 전환 확인이 필요합니다.');
+        }
+        const settings = computeSettings();
+        if (!settings.resolvedPath) {
+          throw new Error('전환할 Codex 실행 파일이 설정되어 있지 않습니다.');
+        }
+        appServerBridge.shutdown();
+        await appServerBridge.ensureStarted();
         return { status: 'updated', success: true, outcome: 'updated', message: null };
+      }
       case 'load_layout':
         return state.layout;
       case 'save_layout':
@@ -728,7 +954,7 @@ export function createRemoteServer(options = {}) {
       }
       case 'start_session': {
         const req = args.request || {};
-        const title = String(req.title ?? '').trim() || `세션 ${sessionSeq}`;
+        const title = String(req.title ?? '').trim() || `세션 ${sessionSeq++}`;
         const cwd = String(req.cwd ?? '').trim();
         if (!cwd || !path.isAbsolute(cwd)) {
           throw new Error('프로젝트 경로는 절대 경로여야 합니다.');
@@ -743,13 +969,12 @@ export function createRemoteServer(options = {}) {
           throw new Error(`프로젝트 경로가 디렉터리가 아닙니다: ${cwd}`);
         }
         const id = crypto.randomUUID();
-        const threadId = req.threadId ? String(req.threadId) : crypto.randomUUID();
         const session = {
           id,
           generation: 1,
           title,
           cwd,
-          threadId,
+          threadId: req.threadId ? String(req.threadId) : null,
           projectId: req.projectId ?? null,
           projectAssigned: Boolean(req.projectAssigned || req.projectId !== undefined),
           state: 'idle',
@@ -760,32 +985,28 @@ export function createRemoteServer(options = {}) {
           events: [],
           eventSeq: 0,
         };
+        await syncThreadFromServer(session);
         sessions.set(id, session);
-        if (!state.threads[threadId]) {
-          state.threads[threadId] = {
-            id: threadId,
-            title,
-            cwd,
-            createdAt: Math.floor(Date.now() / 1000),
-            updatedAt: Math.floor(Date.now() / 1000),
-            model: null,
-            effort: 'medium',
-            modelContextWindow: 200000,
-            turns: [],
-            memorySummary: null,
-            readState: { firstUnread: null, revision: 'rev-1' },
-          };
-          persistState();
-        }
+        persistState();
+
         const info = publicSessionInfo(session);
         broadcast('session-changed', info);
-        if (options.spawnShell === true) {
-          const shellBin = process.platform === 'win32'
-            ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
-            : '/bin/sh';
-          const shellArgs = process.platform === 'win32' ? ['-NoLogo', '-NoProfile'] : [];
+
+        const settings = computeSettings();
+        const shouldSpawnProcess = options.spawnProcess !== false;
+        if (shouldSpawnProcess) {
+          const cmdBin = settings.resolvedPath && options.useCodexCli
+            ? settings.resolvedPath
+            : process.platform === 'win32'
+              ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+              : '/bin/sh';
+          const cmdArgs = settings.resolvedPath && options.useCodexCli
+            ? ['--cd', cwd]
+            : process.platform === 'win32'
+              ? ['-NoLogo', '-NoProfile', '-Command', `[Console]::WriteLine("[OpenDIY Remote] ${title} (${cwd})")`]
+              : ['-c', `printf '[OpenDIY Remote] %s (%s)\\n' "${title}" "${cwd}"`];
           try {
-            const child = spawn(shellBin, shellArgs, {
+            const child = spawn(cmdBin, cmdArgs, {
               cwd,
               stdio: ['pipe', 'pipe', 'pipe'],
               windowsHide: true,
@@ -797,23 +1018,12 @@ export function createRemoteServer(options = {}) {
             child.stderr.on('data', chunk => {
               if (sessions.has(id)) emitTerminalOutput(session, chunk.toString('utf8'));
             });
-            child.on('exit', code => {
+            child.on('exit', () => {
               sessionProcesses.delete(id);
-              if (sessions.has(id)) {
-                session.active = false;
-                session.state = code === 0 ? 'exited' : 'error';
-                broadcast('session-changed', publicSessionInfo(session));
-              }
             });
           } catch (err) {
-            emitTerminalOutput(session, `[OpenDIY Remote] Shell spawn failed: ${err.message || err}\r\n`);
+            emitTerminalOutput(session, `${err.message || err}\r\n`);
           }
-        } else {
-          setTimeout(() => {
-            if (sessions.has(id)) {
-              emitTerminalOutput(session, `\x1b[1;32m[OpenDIY Remote]\x1b[0m Connected to ${title} (${cwd})\r\n$ `);
-            }
-          }, 30);
         }
         return info;
       }
@@ -829,8 +1039,7 @@ export function createRemoteServer(options = {}) {
         if (proc && proc.stdin && proc.stdin.writable) {
           proc.stdin.write(data.replace(/\r/g, '\r\n'));
         } else {
-          const echo = data === '\r' ? '\r\n$ ' : data;
-          emitTerminalOutput(session, echo);
+          emitTerminalOutput(session, data);
         }
         return null;
       }
@@ -873,6 +1082,22 @@ export function createRemoteServer(options = {}) {
       case 'list_external':
         return [];
       case 'catalog_list': {
+        if (appServerBridge.isConnected()) {
+          try {
+            const rpcRes = await appServerBridge.request('thread/list', {
+              cursor: args.request?.cursor ?? null,
+              cwd: args.request?.cwd ?? undefined,
+            });
+            if (Array.isArray(rpcRes?.data)) {
+              return {
+                sessions: rpcRes.data,
+                nextCursor: rpcRes.nextCursor ?? null,
+              };
+            }
+          } catch {
+            // Fall back to persisted workspace threads.
+          }
+        }
         const query = String(args.request?.query ?? '').trim().toLowerCase();
         const cwdFilter = args.request?.cwd ? String(args.request.cwd).toLowerCase() : null;
         const allThreads = Object.values(state.threads);
@@ -895,6 +1120,22 @@ export function createRemoteServer(options = {}) {
       }
       case 'catalog_preview': {
         const threadId = String(args.threadId ?? args.thread_id ?? '');
+        if (appServerBridge.isConnected() && threadId) {
+          try {
+            const readRes = await appServerBridge.request('thread/read', { threadId, includeTurns: true });
+            if (Array.isArray(readRes?.thread?.turns)) {
+              const messages = [];
+              for (const turn of readRes.thread.turns) {
+                for (const item of turn.items || []) {
+                  messages.push({ role: item.role, text: item.text });
+                }
+              }
+              return { messages, nextCursor: null };
+            }
+          } catch {
+            // Fall back to local thread cache.
+          }
+        }
         const thread = state.threads[threadId];
         const messages = [];
         if (thread && Array.isArray(thread.turns)) {
@@ -906,47 +1147,63 @@ export function createRemoteServer(options = {}) {
         }
         return { messages, nextCursor: null };
       }
-      case 'extensions_list':
-        return {
-          plugins: [],
-          marketplace: [],
-          skills: [],
-          hooks: [],
-          warnings: [],
-        };
-      case 'extensions_mutate':
-        return {
-          plugins: [],
-          marketplace: [],
-          skills: [],
-          hooks: [],
-          warnings: [],
-        };
-      case 'mobile_control': {
-        const action = String(args.action ?? 'status');
-        const reply = {
-          isolated: true,
-          shared: true,
-          mutationsAllowed: true,
-          status: {
-            status: action === 'disable' ? 'disabled' : 'connected',
-            serverName: 'opendiy-remote',
-            environmentId: 'env-opendiy-remote',
-          },
-          pairing: action === 'pair'
-            ? {
-                manualCode: 'OPENDIY-REMOTE-PAIR',
-                expiresAt: Math.floor(Date.now() / 1000) + 600,
-                environmentId: 'env-opendiy-remote',
-              }
-            : null,
-        };
-        return reply;
+      case 'extensions_list': {
+        const cwd = args.cwd ? String(args.cwd) : null;
+        return scanCodexExtensions(cwd);
       }
-      case 'subagents_request':
-        return { subagents: [], supported: true };
-      case 'cron_request':
-        return { jobs: [], supported: true };
+      case 'extensions_mutate': {
+        const cwd = args.cwd ? String(args.cwd) : null;
+        if (appServerBridge.isConnected() && args.request) {
+          await appServerBridge.request('extensions/mutate', { cwd, request: args.request });
+        }
+        return scanCodexExtensions(cwd);
+      }
+      case 'mobile_control': {
+        const session = sessions.get(args.id);
+        if (!session || session.generation !== Number(args.generation)) {
+          throw new Error('모바일 원격 제어 대상 세션을 찾을 수 없습니다.');
+        }
+        const action = String(args.action ?? 'status');
+        if (appServerBridge.isConnected()) {
+          const method = action === 'pair'
+            ? 'remoteControl/pairing/start'
+            : action === 'disable'
+              ? 'remoteControl/disable'
+              : action === 'enable'
+                ? 'remoteControl/enable'
+                : 'remoteControl/status';
+          return appServerBridge.request(method, {});
+        }
+        throw new Error('Codex app-server가 연결되어 있지 않아 모바일 원격 제어를 실행할 수 없습니다.');
+      }
+      case 'subagents_request': {
+        const session = sessions.get(args.id);
+        if (!session || session.generation !== Number(args.generation)) {
+          throw new Error('하위 에이전트 대상 세션을 찾을 수 없습니다.');
+        }
+        const req = args.request || {};
+        if (appServerBridge.isConnected()) {
+          return appServerBridge.request(`subagent/${req.type || 'list'}`, {
+            threadId: session.threadId,
+            ...req,
+          });
+        }
+        return { subagents: [], supported: false };
+      }
+      case 'cron_request': {
+        const session = sessions.get(args.id);
+        if (!session || session.generation !== Number(args.generation)) {
+          throw new Error('예약 요청 대상 세션을 찾을 수 없습니다.');
+        }
+        const req = args.request || {};
+        if (appServerBridge.isConnected()) {
+          return appServerBridge.request(`cron/${req.type || 'list'}`, {
+            threadId: session.threadId,
+            ...req,
+          });
+        }
+        return { jobs: [], supported: false };
+      }
       case 'saved_cron_list': {
         const threadId = String(args.threadId ?? args.thread_id ?? '');
         return state.savedCrons.filter(c => c.threadId === threadId);
@@ -975,8 +1232,23 @@ export function createRemoteServer(options = {}) {
         persistState();
         return null;
       }
-      case 'saved_cron_register':
-        return { registered: true };
+      case 'saved_cron_register': {
+        const session = sessions.get(args.id);
+        if (!session || session.generation !== Number(args.generation)) {
+          throw new Error('저장 예약을 등록할 세션을 찾을 수 없습니다.');
+        }
+        const defId = String(args.definitionId ?? args.definition_id ?? '');
+        const saved = state.savedCrons.find(c => c.id === defId);
+        if (!saved) throw new Error('저장된 예약 항목을 찾을 수 없습니다.');
+        if (appServerBridge.isConnected()) {
+          return appServerBridge.request('cron/create', {
+            threadId: session.threadId,
+            prompt: saved.prompt,
+            schedule: saved.schedule,
+          });
+        }
+        throw new Error('Codex app-server가 연결되어 있지 않아 예약을 등록할 수 없습니다.');
+      }
       case 'conversation_request': {
         const session = sessions.get(args.id);
         if (!session || session.generation !== Number(args.generation)) {
@@ -985,7 +1257,7 @@ export function createRemoteServer(options = {}) {
         return handleConversationRequest(session, args.request || {});
       }
       case 'list_pending_questions':
-        return { items: [...pendingQuestions.values()] };
+        return { items: [...pendingQuestions.values()], complete: true };
       case 'respond_pending_question': {
         const sessionId = String(args.sessionId ?? args.session_id ?? '');
         const requestId = String(args.requestId ?? args.request_id ?? '');
@@ -1064,13 +1336,27 @@ export function createRemoteServer(options = {}) {
         }
         return null;
       }
-      case 'weekly_usage':
+      case 'weekly_usage': {
+        let weekly = null;
+        let limitName = null;
+        if (appServerBridge.isConnected()) {
+          try {
+            const limits = await appServerBridge.request('account/rateLimits/read', {});
+            if (limits?.rateLimits) {
+              limitName = limits.rateLimits.limitName ?? null;
+              weekly = limits.rateLimits.weekly ?? null;
+            }
+          } catch {
+            // Leave weekly null if account rate limits are unavailable.
+          }
+        }
         return {
-          executable: computeSettings().resolvedPath || 'opendiy-codex',
+          executable: computeSettings().resolvedPath,
           observedAt: Date.now(),
-          limitName: null,
-          weekly: null,
+          limitName,
+          weekly,
         };
+      }
       case 'unconfirmed_exit_available':
         return false;
       case 'open_external_url': {
@@ -1310,7 +1596,6 @@ if (isMain) {
   const instance = createRemoteServer({
     token,
     workspaceDir: workspaceDir || undefined,
-    spawnShell: true,
   });
   instance.server.listen(port, host, () => {
     const addr = instance.server.address();

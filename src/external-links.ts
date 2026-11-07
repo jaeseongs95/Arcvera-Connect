@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core';
+import { invoke } from './ipc/core';
 import type { ILink, Terminal } from '@xterm/xterm';
 
 const MAX_URL_LENGTH = 8192;

@@ -12,7 +12,29 @@ test('remote browser bridge renders REMOTE WORKSPACE and bridges project, sessio
   const remote = createRemoteServer({
     workspaceDir: path.join(tmpRoot, 'workspace'),
     token: 'e2e-secret-token',
-    embeddedOnly: true,
+    allowPathDiscovery: false,
+    rpcTransport: async (method: string, params: any) => {
+      if (method === 'initialize') {
+        return {
+          userAgent: 'codex-app-server/e2e',
+          opendiyCapabilities: {
+            passiveSubscription: true,
+            userTurnStartIfIdle: true,
+            compactStartIfIdle: true,
+            historySummary: true,
+          },
+          supportsSubagentManagement: true,
+          supportsExpectedTurnInterrupt: true,
+        };
+      }
+      if (method === 'thread/start') {
+        return { thread: { id: 'e2e-thread-1', cwd: params.cwd } };
+      }
+      if (method === 'model/list') {
+        return { data: [], nextCursor: null };
+      }
+      return {};
+    },
   });
 
   await new Promise<void>(resolve => remote.server.listen(0, '127.0.0.1', () => resolve()));
@@ -35,7 +57,7 @@ test('remote browser bridge renders REMOTE WORKSPACE and bridges project, sessio
     const card = page.locator('.terminal-card').first();
     await expect(card).toBeVisible();
     await expect(card.locator('.terminal-title')).toHaveText('원격 브라우저 세션');
-    await expect(card.locator('.xterm-rows')).toContainText('Connected to 원격 브라우저 세션');
+    await expect(card.locator('.xterm-rows')).toContainText('원격 브라우저 세션');
 
     expect(errors).toEqual([]);
   } finally {

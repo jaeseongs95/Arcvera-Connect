@@ -1,7 +1,7 @@
 import { isRemoteBrowser } from './remote-bridge';
 import { createAttachmentStorage } from './attachment-storage';
-import { invoke, isTauri } from '@tauri-apps/api/core';
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { invoke, isTauri } from './ipc/core';
+import { listen, type UnlistenFn } from './ipc/event';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { SearchAddon } from '@xterm/addon-search';
