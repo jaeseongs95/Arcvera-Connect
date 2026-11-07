@@ -1,127 +1,109 @@
 # OpenDIY Remote
 
-웹 브라우저로 여러 [OpenDIY Codex](https://github.com/jaeseongs95/opendiy-codex) CLI·앱 서버 세션을 원격에서 나란히 제어하는 작업 공간입니다.
-[OpenDIY Desktop](https://github.com/jaeseongs95/opendiy-desktop) UI를 그대로 웹 브라우저에서 실행하며, HTTP `/api/invoke` + SSE `/api/events` 브리지(`src/remote-bridge.ts`)를 통해 백엔드(`server/remote-server.mjs` 또는 네이티브 `--remote` 모드)와 통신합니다.
+웹 브라우저(PC, 태블릿, 모바일)에서 호스트 머신의 [OpenDIY Codex](https://github.com/jaeseongs95/opendiy-codex) CLI 및 앱 서버 세션을 원격으로 제어하는 독립 웹 작업 공간입니다.
+
+- **원본 프로젝트 무수정 연동**: [OpenDIY Codex](https://github.com/jaeseongs95/opendiy-codex)나 [OpenDIY Desktop](https://github.com/jaeseongs95/opendiy-desktop)을 개조하지 않고, 호스트에 설치된 `opendiy-codex` 실행 파일(`codex` / `opendiy-codex-launcher.exe`)과 표준 JSON-RPC 및 프로세스 스트림으로 연동합니다.
+- **OpenDIY Desktop 기반 웹 UI**: 다중 터미널·대화 그리드, 프로젝트별 그룹 관리, 실시간 터미널(`xterm.js`), 구조화 대화 화면, 질문·승인함(Question Inbox), 예약 작업(Cron), 서브에이전트 관리 UI를 브라우저에서 그대로 제공합니다.
+- **경량 순수 웹 아키텍처**: Tauri·WebView2 데스크톱 런타임 없이 Node.js HTTP/SSE 게이트웨이 서버(`server/remote-server.mjs`)와 브라우저 RPC 브리지(`src/remote-bridge.ts`)만으로 동작합니다.
 
 [English](README.md) | **한국어**
 
-[빠른 시작](#빠른-시작) · [원격 서버 실행](#원격-서버-실행) · [사용 가이드](docs/user-guide.ko.md) · [개발 가이드](docs/development.md)
+---
 
-## 원격 서버 실행 (가장 빠른 구축)
+## 아키텍처 개요
 
-Rust 컴파일 없이 Node.js만으로 즉시 브라우저 원격 제어 서버를 띄울 수 있습니다.
+```mermaid
+flowchart LR
+  Browser["웹 브라우저 (PC / 태블릿 / 모바일)<br/>OpenDIY Desktop 기반 Web UI + xterm.js"]
+  Gateway["OpenDIY Remote 서버 (Node.js HTTP + SSE)<br/>POST /api/invoke · GET /api/events<br/>SHA-256 Capability Token 인증"]
+  AppServer["OpenDIY Codex app-server<br/>JSON-RPC 2.0 (stdio / ws)"]
+  CLI["OpenDIY Codex CLI / 셸 세션<br/>실시간 표준 입출력 스트림"]
 
-```bash
-npm ci
-npm run build
-npm start -- --bind 127.0.0.1 --port 3210
+  Browser -- "HTTP POST /api/invoke<br/>SSE GET /api/events" --> Gateway
+  Gateway -- "JSON-RPC 2.0 (Origin 헤더 없는 서버 간 연결)" --> AppServer
+  Gateway -- "프로세스 생성 및 터미널 I/O 중계" --> CLI
 ```
 
-브라우저에서 `http://127.0.0.1:3210`을 열면 **OpenDIY Desktop** UI가 원격 작업 공간(`원격 작업 공간` / `REMOTE WORKSPACE`) 모드로 동작합니다.
+### 왜 별도의 원격 게이트웨이 서버가 필요한가?
+`opendiy-codex`의 `codex app-server` WebSocket 리스너는 보안상 브라우저의 `Origin` 헤더가 포함된 직접 연결을 `403 FORBIDDEN`으로 차단합니다. `OpenDIY Remote` 서버는:
+1. 브라우저에 정적 웹 UI(`dist/`)를 서빙하고 `window.__OPENDIY_REMOTE__ = true` 런타임 플래그를 주입합니다.
+2. 원격 브라우저 요청을 SHA-256 상수 시간(`timingSafeEqual`) 토큰 검증으로 인증합니다.
+3. 백엔드에서 호스트의 `opendiy-codex` `app-server` 및 세션 프로세스와 직접 통신하고, 출력 이벤트를 제한된 크기의 SSE 큐(`GET /api/events`)로 브라우저에 스트리밍합니다.
 
-### 주요 옵션 및 환경 변수
-
-| 옵션 / 환경 변수 | 기본값 | 설명 |
-| --- | --- | --- |
-| `--bind <addr>` / `OPENDIY_REMOTE_BIND` | `127.0.0.1` | 바인드 주소 (외부 접속 허용 시 `--token` 필수 권장) |
-| `--port <port>` / `OPENDIY_REMOTE_PORT` | `3210` | HTTP + SSE 리스닝 포트 |
-| `--token <secret>` / `OPENDIY_REMOTE_TOKEN` | (없음) | 접근 보호용 Bearer / `?token=` 인증 토큰 |
-| `OPENDIY_CODEX_BIN` | 자동 탐색 | 사용할 `codex` / `opendiy-codex` 실행 파일 경로 |
-| `OPENDIY_REMOTE_DATA_DIR` | `~/.opendiy-remote` | 원격 작업 공간 레이아웃·세션·프로젝트 저장 경로 |
-
-### 네이티브 Rust 헤드리스 원격 모드 (`--remote`)
-
-Windows ConPTY(`portable-pty`)와 SQLite 정본 엔진(`session::Engine`)을 그대로 사용하는 네이티브 원격 서버 모드도 지원합니다.
-
-```bash
-cargo run --manifest-path src-tauri/Cargo.toml -- --remote --bind 127.0.0.1:3210
-```
-
-![OpenDIY Desktop에서 프로젝트와 실행 중인 세션을 전환하는 모습](docs/loading-demo.gif)
-
-*2026-10-30 실제 사용 중 촬영한 원본 속도 영상입니다.
-사용 예시이며, 성능 비교나 최신 배포판의 실행 영상은 아닙니다.*
-
-## 지원하는 Codex
-
-Desktop과 Codex는 별도로 설치합니다. Desktop **1.2.0**의 문서상 지원 기준은 다음과 같습니다.
-
-| 실행 환경 | 지원 범위 |
-| --- | --- |
-| [OpenDIY Codex](https://github.com/jaeseongs95/opendiy-codex) R36 CLI와 같은 패키지의 R36 앱 서버 | 기본 터미널·세션 기능과, 필요한 지원이 확인된 확장 기능. R28을 포함한 이전 OpenDIY 버전은 지원 대상에서 제외합니다. |
-| [공식 Codex CLI](https://github.com/openai/codex) 0.166.0 | 기본 터미널·세션 기능. OpenDIY 확장 기능의 지원을 전제하지 않습니다. |
-
-확장 기능은 선택한 CLI와 연결된 서버의 실제 지원 여부, 연결 상태와 작업 상태에 따라 활성화됩니다.
-버전 번호만으로 기능 지원을 보장하지 않습니다.
-[실행 파일 선택과 서버 전환](docs/user-guide.ko.md#runtime)에서 자세히 설명합니다.
+---
 
 ## 빠른 시작
 
-1. **Codex를 설치하고 로그인합니다.** 위 표의 실행 환경을 사용하세요.
-   Desktop 배포 파일에는 Codex가 포함되어 있지 않으며, 앱이 내려받지도 않습니다.
-2. **Desktop을 설치하거나 압축을 풉니다.**
-   [릴리스](https://github.com/jaeseongs95/opendiy-desktop/releases/latest)에서 Windows x64 설치 파일이나
-   포터블 ZIP을 받으세요. Windows와 WebView2가 필요하며, 실행 파일은 서명되어 있지 않습니다.
-   포터블은 **ZIP 전체를 풀어** 사용하세요.
-   릴리스의 `SHA256SUMS.txt`와 다운로드한 파일의 해시를 대조할 수 있습니다.
-   설치한 앱 또는 `opendiy-desktop.exe`를 실행하세요.
-3. **CLI를 선택합니다.** **⚙ 설정 → 실행 파일 설정**에서 네이티브 `codex.exe` 또는 설치된
-   `opendiy-codex-launcher.exe`를 선택하세요. 서버 실행 파일은 자동으로 선택되며 별도 지정은 선택 사항입니다.
-   경로를 바꿔도 실행 중인 공유 서버를 교체하거나 열린 터미널을 재시작하지 않습니다.
-4. **프로젝트와 세션을 엽니다.** **프로젝트 가져오기**에서 기존 폴더를 선택한 뒤 이전 대화를
-   이어가거나 새 세션을 만드세요. 모델 선택·로그인·권한 질문은 CLI 화면에서 처리합니다.
-   CLI 입력란의 줄바꿈은 **Shift+Enter**입니다.
+### 1. 사전 준비
+- **Node.js 22 이상** (권장: Node.js 24)
+- 호스트 머신에 설치 및 로그인된 **[OpenDIY Codex](https://github.com/jaeseongs95/opendiy-codex)** (또는 공식 Codex CLI)
 
-기본 화면 언어는 한국어입니다. **설정 → 언어**에서 **한국어 / English**를 선택하면 앱과 트레이의
-언어가 바뀝니다. CLI 출력과 Windows 시스템 문구는 각자의 언어를 유지합니다.
+### 2. 설치 및 빌드
+```bash
+git clone https://github.com/jaeseongs95/opendiy-remote.git
+cd opendiy-remote
+npm ci
+npm run build
+```
 
-## 원하는 작업 찾기
+### 3. 원격 서버 실행
 
-| 하고 싶은 일 | 안내 |
-| --- | --- |
-| 세션을 묶고 프로젝트 순서나 격자를 바꾸기 | [프로젝트와 터미널](docs/user-guide.ko.md#projects) |
-| 저장된 대화 이어가기, 특정 세션 재시작 | [기록·복원·재시작](docs/user-guide.ko.md#restore) |
-| 대화 보기에서 질문·승인에 답하기 | [대화 보기와 질문함](docs/user-guide.ko.md#conversation) |
-| 설치된 플러그인 관리, 새 플러그인 찾기, 스킬 관리 | [플러그인과 스킬](docs/user-guide.ko.md#extensions) |
-| Hook 조회, 사용 설정과 신뢰 검토 | [Hook](docs/user-guide.ko.md#hooks) |
-| 직접 생성한 서브에이전트 조회·관리 | [서브에이전트](docs/user-guide.ko.md#subagents) |
-| 사용량 확인, 특정 세션의 컨텍스트 크기 조절, 압축, 작업 예약 | [컨텍스트](docs/user-guide.ko.md#context) · [예약](docs/user-guide.ko.md#schedules) |
-| 실행 중인 세션을 휴대전화와 연결 | [모바일 원격 제어](docs/user-guide.ko.md#mobile) |
-| 주간 사용량과 첨부 이미지 저장 공간 확인 | [사용량](docs/user-guide.ko.md#usage) · [저장 공간](docs/user-guide.ko.md#storage) |
+#### 로컬 루프백 실행 (기본값 `127.0.0.1:3210`)
+```bash
+npm start
+```
+브라우저에서 `http://127.0.0.1:3210`을 엽니다.
 
-## 종료·데이터·제약
+#### 외부 네트워크(LAN / Tailscale / 원격 기기) 접속 허용
+루프백(`127.0.0.1`, `localhost`, `::1`)이 아닌 주소로 바인딩할 때는 보안을 위해 `--token` 또는 `OPENDIY_REMOTE_TOKEN` 지정이 **필수**입니다(미지정 시 서버가 시작을 거부합니다).
 
-- **창을 닫으면 트레이로 숨겨집니다.** 완전히 종료하려면 **앱 종료**를 사용하고 앱이 소유한
-  프로세스의 정리를 확인하세요. 다음 실행에서는 저장된 대화 ID로 새 프로세스를 연결합니다.
-  이전 프로세스 ID를 되살리거나 지난 입력을 다시 보내지 않습니다.
-- Desktop이 작업 프로세스를 직접 실행하고 Windows Job으로 소유·정리합니다.
-  별도 Desktop helper 실행 파일은 필요하지 않습니다. Codex·셸·WebView2는 별도 프로세스로 실행됩니다.
-- 인증·설정·대화 기록은 Codex가 관리합니다. Desktop은 배치·프로젝트·세션 메타데이터·환경설정을
-  자체 SQLite에 저장하며, 그 데이터베이스에 Codex 인증 파일이나 터미널 전문을 복사하지 않습니다.
-  전송한 붙여넣기 이미지는 대화 기록에서 참조할 수 있어 별도로 보존합니다.
-- 화면과 입력 버퍼에는 상한이 있습니다. 모델 문맥을 잘라내는 제한이 아니며,
-  CLI 프로세스의 메모리 사용량 상한을 보장하지도 않습니다.
-- 휴대전화 실기 페어링·제어와 장시간 메모리 누수 시험은 아직 검증하지 않았습니다.
-  실제로 실행한 시험과 제약은 각 릴리스의 설명을 확인하세요.
+```bash
+npm start -- --bind 0.0.0.0:3210 --token "my-secret-access-token"
+```
+원격 기기의 브라우저에서 `http://<호스트-IP>:3210/?token=my-secret-access-token`으로 접속하면 토큰이 브라우저 `sessionStorage`에 저장되고 URL 쿼리에서 자동 제거됩니다.
 
-데이터 소유권, 재시도와 복구 동작은 [사용 가이드](docs/user-guide.ko.md)에 정리했습니다.
+---
 
-## 개발과 검증
+## CLI 옵션 및 환경 변수
 
-Tauri 2, Rust/portable-pty, TypeScript, Vite, xterm.js를 사용합니다.
-[개발 가이드](docs/development.md)에 준비 사항·빌드·패키징·진단 명령을 정리했습니다.
-Windows CI에서 검사와 패키징을 수행하지만, 빌드 성공만으로 GUI 동작이나 모든 CLI 조합의 호환성을
-입증하지는 않습니다.
+| CLI 옵션 | 환경 변수 | 기본값 | 설명 |
+| --- | --- | --- | --- |
+| `--bind <host[:port]>` | `OPENDIY_REMOTE_BIND` | `127.0.0.1:3210` | 바인드할 호스트(및 포트) 주소 |
+| `--host <host>` | `OPENDIY_REMOTE_HOST` | `127.0.0.1` | 바인드할 호스트 주소 |
+| `--port <port>` | `OPENDIY_REMOTE_PORT` | `3210` | HTTP + SSE 리스닝 포트 |
+| `--token <secret>` | `OPENDIY_REMOTE_TOKEN` | (없음) | 원격 접속 인증용 Bearer / `?token=` 비밀 토큰 (외부 바인드 시 필수) |
+| `--workspace <dir>` | `OPENDIY_REMOTE_DATA_DIR` | OS 임시/작업 경로 | 레이아웃·프로젝트·세션 메타데이터 저장 디렉터리(절대 경로) |
+| - | `OPENDIY_CODEX_BIN` | 자동 탐색 | 사용할 `codex` / `opendiy-codex-launcher` 실행 파일 절대 경로 |
+| - | `OPENDIY_REMOTE_DIST` | `./dist` | 서빙할 프런트엔드 빌드 산출물 디렉터리 경로 |
 
-과거 관측 자료와 그 범위는 [검증 안내](docs/development.md#verification)에서 확인할 수 있습니다.
-[문제 제보](https://github.com/jaeseongs95/opendiy-desktop/issues)에는 Desktop 버전, 선택한 CLI·서버 버전,
-재현 절차와 기대 결과·실제 결과를 적어 주세요. 인증 정보나 개인 대화 로그는 첨부하지 마세요.
+---
 
-## 라이선스와 방향
+## 개발 및 검증 명령
 
-독립적으로 구현한 [MIT 라이선스](LICENSE) 프로젝트입니다. Claudes의 다중 터미널 작업 흐름을
-제품 참고로 삼았으며, 해당 프로젝트의 코드·에셋·브랜딩을 포함하지 않습니다.
-[참고 프로젝트의 라이선스](https://github.com/paulallington/Claudes/blob/v1.9.82/LICENSE)를 확인할 수 있습니다.
+```bash
+# 의존성 설치
+npm ci
 
-장기 목표는 OpenDIY Desktop으로 ChatGPT 데스크톱 앱을 대체하는 것입니다.
-ChatGPT·Claude 데스크톱의 기능과 사용성을 참고하되, 현재 기능이 동등하다는 뜻은 아닙니다.
+# 단위 시험 (모델 불변조건 및 원격 서버 API·인증·명령 브리지 시험)
+npm test
+
+# 프로덕션 프런트엔드 빌드 (TypeScript 타입 검사 + Vite 번들링)
+npm run build
+
+# Playwright 브라우저 E2E 시험
+npm run test:e2e
+```
+
+---
+
+## 보안 및 데이터 격리 원칙
+
+- **Codex 인증·설정 무침해**: 인증 정보, 설정, 대화 이력의 정본은 호스트의 `opendiy-codex`가 소유하며, `opendiy-remote`는 인증 파일을 복제하거나 외부로 전송하지 않습니다.
+- **비루프백 무인증 바인드 차단**: 외부 네트워크 인터페이스(`0.0.0.0` 등)에 토큰 없이 바인드하면 즉시 종료 코드 `1`로 시작을 거부합니다.
+- **자원 상한 보호**: HTTP 요청 본문 상한(`16 MiB`)과 SSE 클라이언트당 송신 버퍼 상한(`1 MiB`)을 적용하여 느린 원격 클라이언트로 인한 서버 메모리 누적을 방지합니다.
+
+---
+
+## 라이선스
+
+[MIT License](LICENSE)

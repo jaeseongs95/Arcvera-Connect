@@ -320,9 +320,15 @@ export function createRemoteServer(options = {}) {
   }
 
   const sseClients = new Set();
+  const MAX_SSE_BUFFER_BYTES = 1024 * 1024;
   function broadcast(event, payload) {
     const frame = `data: ${JSON.stringify({ event, payload })}\n\n`;
     for (const res of [...sseClients]) {
+      if (res.writableEnded || res.destroyed || res.writableLength > MAX_SSE_BUFFER_BYTES) {
+        try { res.end(); } catch {}
+        sseClients.delete(res);
+        continue;
+      }
       try {
         res.write(frame);
       } catch {
@@ -412,7 +418,7 @@ export function createRemoteServer(options = {}) {
         cwd: session.cwd,
         createdAt: Math.floor(Date.now() / 1000),
         updatedAt: Math.floor(Date.now() / 1000),
-        model: 'gpt-5.4',
+        model: null,
         effort: 'medium',
         modelContextWindow: 200000,
         turns: [],
@@ -422,17 +428,36 @@ export function createRemoteServer(options = {}) {
     }
     const thread = state.threads[threadId];
 
-    if (type === 'attach' || type === 'refresh' || type === 'turns' || !type) {
+    if (type === 'models') {
+      let models = [];
+      if (appServerBridge.proc) {
+        try {
+          const rpcRes = await appServerBridge.request('model/list', { cursor: request.cursor ?? null });
+          if (Array.isArray(rpcRes?.data)) models = rpcRes.data;
+        } catch {
+          models = [];
+        }
+      }
+      return { models, nextCursor: null };
+    }
+
+    if (type === 'attach' || type === 'refresh' || type === 'turns' || type === 'poll' || type === 'page' || !type) {
+      let models = [];
+      if (appServerBridge.proc) {
+        try {
+          const rpcRes = await appServerBridge.request('model/list', { cursor: null });
+          if (Array.isArray(rpcRes?.data)) models = rpcRes.data;
+        } catch {
+          models = [];
+        }
+      }
       return {
         attached: true,
         connected: true,
         threadId,
         model: thread.model,
         effort: thread.effort,
-        models: [
-          { id: 'gpt-5.4', label: 'GPT-5.4', efforts: ['low', 'medium', 'high'] },
-          { id: 'o3', label: 'o3', efforts: ['low', 'medium', 'high'] },
-        ],
+        models,
         capabilities: {
           passiveSubscription: true,
           userTurnStartIfIdle: true,
@@ -743,7 +768,7 @@ export function createRemoteServer(options = {}) {
             cwd,
             createdAt: Math.floor(Date.now() / 1000),
             updatedAt: Math.floor(Date.now() / 1000),
-            model: 'gpt-5.4',
+            model: null,
             effort: 'medium',
             modelContextWindow: 200000,
             turns: [],
@@ -1249,11 +1274,10 @@ export function createRemoteServer(options = {}) {
 
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isMain) {
-  let host = process.env.OPENDIY_REMOTE_HOST || '127.0.0.1';
+  let host = process.env.OPENDIY_REMOTE_BIND || process.env.OPENDIY_REMOTE_HOST || '127.0.0.1';
   let port = Number(process.env.OPENDIY_REMOTE_PORT || 3210);
   let token = process.env.OPENDIY_REMOTE_TOKEN || '';
-  let workspaceDir = process.env.AGENT_GRID_WORKSPACE_DIR || '';
-  let forceNodeFallback = process.env.OPENDIY_REMOTE_NODE_FALLBACK === '1';
+  let workspaceDir = process.env.OPENDIY_REMOTE_DATA_DIR || process.env.AGENT_GRID_WORKSPACE_DIR || '';
 
   const argv = process.argv.slice(2);
   for (let i = 0; i < argv.length; i++) {
@@ -1274,8 +1298,6 @@ if (isMain) {
       token = argv[++i];
     } else if (argv[i] === '--workspace' && argv[i + 1]) {
       workspaceDir = argv[++i];
-    } else if (argv[i] === '--node-fallback') {
-      forceNodeFallback = true;
     }
   }
 
@@ -1285,34 +1307,14 @@ if (isMain) {
     process.exit(1);
   }
 
-  const exeName = process.platform === 'win32' ? 'opendiy-desktop.exe' : 'opendiy-desktop';
-  const nativeCandidates = [
-    path.join(ROOT_DIR, 'src-tauri', 'target', 'release', exeName),
-    path.join(ROOT_DIR, 'src-tauri', 'target', 'debug', exeName),
-  ];
-  const nativeBin = !forceNodeFallback ? nativeCandidates.find(p => fs.existsSync(p)) : null;
-
-  if (nativeBin) {
-    const nativeArgs = ['--remote', '--bind', `${host}:${port}`, '--dist', path.join(ROOT_DIR, 'dist')];
-    if (token) nativeArgs.push('--token', token);
-    const child = spawn(nativeBin, nativeArgs, {
-      stdio: 'inherit',
-      env: {
-        ...process.env,
-        ...(workspaceDir ? { AGENT_GRID_WORKSPACE_DIR: path.resolve(workspaceDir) } : {}),
-      },
-    });
-    child.on('exit', code => process.exit(code ?? 0));
-  } else {
-    const instance = createRemoteServer({
-      token,
-      workspaceDir: workspaceDir || undefined,
-      spawnShell: true,
-    });
-    instance.server.listen(port, host, () => {
-      const addr = instance.server.address();
-      const actualPort = typeof addr === 'object' && addr ? addr.port : port;
-      console.log(`OpenDIY Remote web server listening on http://${host}:${actualPort}`);
-    });
-  }
+  const instance = createRemoteServer({
+    token,
+    workspaceDir: workspaceDir || undefined,
+    spawnShell: true,
+  });
+  instance.server.listen(port, host, () => {
+    const addr = instance.server.address();
+    const actualPort = typeof addr === 'object' && addr ? addr.port : port;
+    console.log(`OpenDIY Remote web server listening on http://${host}:${actualPort}`);
+  });
 }

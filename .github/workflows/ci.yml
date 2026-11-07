@@ -1,0 +1,40 @@
+name: CI
+on:
+  push:
+    branches: [main, 'feat/**', 'fix/**']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - run: npx playwright install chromium
+      - name: Source module fixtures E2E
+        run: npm run test:e2e
+        env:
+          AGENT_GRID_SOURCE_FIXTURES_ONLY: '1'
+      - name: Packaged application E2E
+        run: npm run test:e2e
+        env:
+          AGENT_GRID_BUNDLED_FRONTEND_TEST: '1'
+          AGENT_GRID_TEST_OUTPUT: test-results-bundled
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-validation-evidence
+          path: |
+            test-results/
+            test-results-bundled/
+          if-no-files-found: warn
+          retention-days: 14
