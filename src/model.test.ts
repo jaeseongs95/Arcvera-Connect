@@ -109,3 +109,102 @@ test('delayed preparation snapshots cannot disable an activated session in the s
   assert.equal(updateSession(preparing, { ...preparing, threadId: 'resolved-thread' }).threadId, 'resolved-thread');
   assert.equal(updateSession(preparing, { ...base, state: 'idle' }).state, 'idle');
 });
+
+test('remote server injects browser flag, enforces token auth, and bridges session/conversation RPC + SSE', async () => {
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const crypto = await import('node:crypto');
+  const { injectRemoteFlag, verifyToken, createRemoteServer } = await import('../server/remote-server.mjs');
+
+  const html = injectRemoteFlag('<!doctype html><html><head><title>OpenDIY</title></head><body></body></html>');
+  assert.equal(html.includes('window.__OPENDIY_REMOTE__=true'), true);
+  assert.equal(injectRemoteFlag(html), html);
+
+  const secretHash = crypto.createHash('sha256').update('secret-123', 'utf8').digest();
+  assert.equal(verifyToken(null, ''), true);
+  assert.equal(verifyToken(secretHash, 'secret-123'), true);
+  assert.equal(verifyToken(secretHash, 'wrong-token'), false);
+
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'opendiy-remote-unit-'));
+  const projDir = path.join(tmpRoot, 'project-alpha');
+  fs.mkdirSync(projDir, { recursive: true });
+
+  const instance = createRemoteServer({
+    workspaceDir: path.join(tmpRoot, 'workspace'),
+    token: 'test-token-xyz',
+    embeddedOnly: true,
+  });
+
+  await new Promise<void>(resolve => instance.server.listen(0, '127.0.0.1', () => resolve()));
+  const addr = instance.server.address() as { port: number };
+  const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+  try {
+    const healthRes = await fetch(`${baseUrl}/api/health`);
+    assert.equal(healthRes.status, 200);
+    assert.deepEqual(await healthRes.json(), { ok: true, service: 'opendiy-remote' });
+
+    const unauthRes = await fetch(`${baseUrl}/api/invoke`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ command: 'get_ui_language', args: {} }),
+    });
+    assert.equal(unauthRes.status, 401);
+
+    const invoke = async (command: string, args: Record<string, unknown> = {}) => {
+      const res = await fetch(`${baseUrl}/api/invoke`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer test-token-xyz',
+        },
+        body: JSON.stringify({ command, args }),
+      });
+      const payload = (await res.json()) as { ok: boolean; result?: any; error?: string };
+      if (!res.ok || !payload.ok) throw new Error(payload.error || `HTTP ${res.status}`);
+      return payload.result;
+    };
+
+    assert.equal(await invoke('get_ui_language'), 'ko');
+    const imported = await invoke('import_project', { cwd: projDir });
+    assert.equal(imported.name, 'project-alpha');
+    assert.equal(typeof imported.createdAt, 'number');
+
+    const started = await invoke('start_session', {
+      request: { title: '원격 테스트 세션', cwd: projDir, projectId: imported.id, projectAssigned: true },
+    });
+    assert.equal(started.title, '원격 테스트 세션');
+    assert.equal(started.projectId, imported.id);
+
+    const attached = await invoke('conversation_request', {
+      id: started.id,
+      generation: started.generation,
+      request: { type: 'attach' },
+    });
+    assert.equal(attached.attached, true);
+    assert.equal(attached.connected, true);
+
+    const sent = await invoke('conversation_request', {
+      id: started.id,
+      generation: started.generation,
+      request: { type: 'send', text: '원격 브리지 점검' },
+    });
+    assert.equal(sent.status, 'completed');
+    assert.equal(sent.turns.length, 1);
+
+    const chosenFolder = await invoke('choose_project_folder', { path: projDir });
+    assert.equal(chosenFolder, projDir);
+    const chosenProj = await invoke('choose_project', { cwd: projDir });
+    assert.equal(chosenProj.id, imported.id);
+    assert.equal(await invoke('open_external_url', { url: 'https://github.com/jaeseongs95/opendiy-remote' }), null);
+    await assert.rejects(() => invoke('open_external_url', { url: 'javascript:alert(1)' }));
+
+    await invoke('session_stop', { id: started.id, generation: started.generation });
+    const remaining = await invoke('list_sessions');
+    assert.equal(remaining.length, 0);
+  } finally {
+    await instance.close();
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});

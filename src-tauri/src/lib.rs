@@ -11,6 +11,7 @@ mod owned_worker;
 mod project;
 pub mod process_job;
 mod owned_tui_control;
+pub mod remote_server;
 mod session;
 pub mod self_test;
 mod storage;

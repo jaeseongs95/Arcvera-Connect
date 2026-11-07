@@ -10,7 +10,7 @@ const sourceFixtures = [
   'context-capabilities', 'context-controls', 'conversation-integration',
   'conversation', 'cron-manager', 'external-links', 'link-drag',
   'project-management', 'project-switch-scroll', 'project-tabs',
-  'question-center-limits', 'question-center', 'saved-cron', 'startup-runtime',
+  'question-center-limits', 'question-center', 'remote-bridge', 'saved-cron', 'startup-runtime',
   'subagent-manager', 'terminal-flow', 'weekly-usage',
 ].map(name => `**/${name}.spec.ts`);
 

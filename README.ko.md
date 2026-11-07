@@ -1,13 +1,41 @@
-# OpenDIY Desktop
+# OpenDIY Remote
 
-여러 Codex CLI 세션을 나란히 사용하는 Windows 작업 공간입니다.
-대화를 프로젝트별로 묶고, 터미널 격자의 크기를 조절하고, 저장된 작업을 이어갈 수 있습니다.
+웹 브라우저로 여러 [OpenDIY Codex](https://github.com/jaeseongs95/opendiy-codex) CLI·앱 서버 세션을 원격에서 나란히 제어하는 작업 공간입니다.
+[OpenDIY Desktop](https://github.com/jaeseongs95/opendiy-desktop) UI를 그대로 웹 브라우저에서 실행하며, HTTP `/api/invoke` + SSE `/api/events` 브리지(`src/remote-bridge.ts`)를 통해 백엔드(`server/remote-server.mjs` 또는 네이티브 `--remote` 모드)와 통신합니다.
 
 [English](README.md) | **한국어**
 
-[다운로드](https://github.com/jaeseongs95/opendiy-desktop/releases/latest) ·
-[빠른 시작](#빠른-시작) · [사용 가이드](docs/user-guide.ko.md) ·
-[개발 가이드](docs/development.md)
+[빠른 시작](#빠른-시작) · [원격 서버 실행](#원격-서버-실행) · [사용 가이드](docs/user-guide.ko.md) · [개발 가이드](docs/development.md)
+
+## 원격 서버 실행 (가장 빠른 구축)
+
+Rust 컴파일 없이 Node.js만으로 즉시 브라우저 원격 제어 서버를 띄울 수 있습니다.
+
+```bash
+npm ci
+npm run build
+npm start -- --bind 127.0.0.1 --port 3210
+```
+
+브라우저에서 `http://127.0.0.1:3210`을 열면 **OpenDIY Desktop** UI가 원격 작업 공간(`원격 작업 공간` / `REMOTE WORKSPACE`) 모드로 동작합니다.
+
+### 주요 옵션 및 환경 변수
+
+| 옵션 / 환경 변수 | 기본값 | 설명 |
+| --- | --- | --- |
+| `--bind <addr>` / `OPENDIY_REMOTE_BIND` | `127.0.0.1` | 바인드 주소 (외부 접속 허용 시 `--token` 필수 권장) |
+| `--port <port>` / `OPENDIY_REMOTE_PORT` | `3210` | HTTP + SSE 리스닝 포트 |
+| `--token <secret>` / `OPENDIY_REMOTE_TOKEN` | (없음) | 접근 보호용 Bearer / `?token=` 인증 토큰 |
+| `OPENDIY_CODEX_BIN` | 자동 탐색 | 사용할 `codex` / `opendiy-codex` 실행 파일 경로 |
+| `OPENDIY_REMOTE_DATA_DIR` | `~/.opendiy-remote` | 원격 작업 공간 레이아웃·세션·프로젝트 저장 경로 |
+
+### 네이티브 Rust 헤드리스 원격 모드 (`--remote`)
+
+Windows ConPTY(`portable-pty`)와 SQLite 정본 엔진(`session::Engine`)을 그대로 사용하는 네이티브 원격 서버 모드도 지원합니다.
+
+```bash
+cargo run --manifest-path src-tauri/Cargo.toml -- --remote --bind 127.0.0.1:3210
+```
 
 ![OpenDIY Desktop에서 프로젝트와 실행 중인 세션을 전환하는 모습](docs/loading-demo.gif)
 

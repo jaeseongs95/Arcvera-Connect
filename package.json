@@ -7,6 +7,8 @@
     "dev": "vite --host 127.0.0.1",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview --host 127.0.0.1",
+    "start": "node server/remote-server.mjs",
+    "remote": "node server/remote-server.mjs",
     "test": "node --test src/model.test.ts",
     "test:e2e": "playwright test",
     "tauri": "tauri"

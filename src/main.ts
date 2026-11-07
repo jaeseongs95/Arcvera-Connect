@@ -1,3 +1,4 @@
+import { isRemoteBrowser } from './remote-bridge';
 import { createAttachmentStorage } from './attachment-storage';
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
@@ -138,7 +139,7 @@ const markupLabels: Record<string, [string, string]> = {
   "설정 열기": ["설정 열기", "Open settings"],
   "설정 닫기": ["설정 닫기", "Close settings"],
   "언어": ["언어", "Language"],
-  "LOCAL WORKSPACE": ["로컬 작업 공간", "LOCAL WORKSPACE"],
+  "LOCAL WORKSPACE": isRemoteBrowser() ? ["원격 작업 공간", "REMOTE WORKSPACE"] : ["로컬 작업 공간", "LOCAL WORKSPACE"],
   "알림 보기": ["알림 보기", "View notifications"],
   "앱 종료": ["앱 종료", "Exit app"],
   "세션 불러오기": ["세션 불러오기", "Load sessions"],

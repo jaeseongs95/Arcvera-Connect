@@ -1,13 +1,42 @@
-# OpenDIY Desktop
+# OpenDIY Remote
 
-A Windows workspace for running Codex CLI sessions side by side. Group conversations
-by project, arrange terminals in a resizable grid and return to saved work.
+A browser-accessible remote workspace for running [OpenDIY Codex](https://github.com/jaeseongs95/opendiy-codex) CLI and app-server sessions side by side, powered by the [OpenDIY Desktop](https://github.com/jaeseongs95/opendiy-desktop) UI.
+Group conversations by project, arrange terminals in a resizable grid, and control sessions remotely from any modern browser over HTTP (`/api/invoke`) + SSE (`/api/events`).
 
 **English** | [한국어](README.ko.md)
 
-[Download](https://github.com/jaeseongs95/opendiy-desktop/releases/latest) ·
-[Quick start](#quick-start) · [User guide](docs/user-guide.md) ·
+[Remote server quickstart](#remote-server-quickstart) · [Quick start](#quick-start) · [User guide](docs/user-guide.md) ·
 [Development](docs/development.md)
+
+## Remote server quickstart
+
+Start the browser-based remote control server immediately with Node.js (zero Rust compile required):
+
+```bash
+npm ci
+npm run build
+npm start -- --bind 127.0.0.1 --port 3210
+```
+
+Open `http://127.0.0.1:3210` in your browser to access the full **OpenDIY Desktop** workspace in `REMOTE WORKSPACE` mode.
+
+### Options & environment variables
+
+| Option / Env | Default | Description |
+| --- | --- | --- |
+| `--bind <addr>` / `OPENDIY_REMOTE_BIND` | `127.0.0.1` | Bind address (combine with `--token` when exposing to LAN/WAN) |
+| `--port <port>` / `OPENDIY_REMOTE_PORT` | `3210` | HTTP + SSE listening port |
+| `--token <secret>` / `OPENDIY_REMOTE_TOKEN` | (none) | Optional Bearer / `?token=` secret for authentication |
+| `OPENDIY_CODEX_BIN` | auto-detected | Path to `codex` / `opendiy-codex` executable |
+| `OPENDIY_REMOTE_DATA_DIR` | `~/.opendiy-remote` | Directory for persisted layout, projects, and session metadata |
+
+### Native Rust headless remote mode (`--remote`)
+
+You can also run the native Rust `session::Engine` (Windows ConPTY + SQLite) in headless remote server mode:
+
+```bash
+cargo run --manifest-path src-tauri/Cargo.toml -- --remote --bind 127.0.0.1:3210
+```
 
 ![Switching projects and running sessions in OpenDIY Desktop](docs/loading-demo.gif)
 
