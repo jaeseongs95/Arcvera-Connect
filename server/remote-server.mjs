@@ -400,7 +400,7 @@ class AppServerBridge {
     if (this.customTransport) {
       if (!this.initialized) {
         this.serverInfo = (await this.customTransport('initialize', {
-          clientInfo: { name: 'opendiy-remote', title: 'OpenDIY Remote', version: '1.3.2' },
+          clientInfo: { name: 'opendiy-remote', title: 'OpenDIY Remote', version: '1.0.0' },
           capabilities: { experimentalApi: true, requiredHumanApproval: true },
         })) || {};
         this.initialized = true;
@@ -479,7 +479,7 @@ class AppServerBridge {
       });
 
       const initResult = await this.rawRequest('initialize', {
-        clientInfo: { name: 'opendiy-remote', title: 'OpenDIY Remote', version: '1.3.2' },
+        clientInfo: { name: 'opendiy-remote', title: 'OpenDIY Remote', version: '1.0.0' },
         capabilities: { experimentalApi: true, requiredHumanApproval: true },
       }, 8000);
       this.sendNotification('initialized', {});
