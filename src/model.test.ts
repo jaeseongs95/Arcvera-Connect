@@ -115,7 +115,22 @@ test('remote server injects browser flag, enforces token auth, and bridges sessi
   const os = await import('node:os');
   const path = await import('node:path');
   const crypto = await import('node:crypto');
-  const { injectRemoteFlag, verifyToken, createRemoteServer, startHostConnector } = await import('../server/remote-server.mjs');
+  const {
+    injectRemoteFlag,
+    verifyToken,
+    createRemoteServer,
+    startHostConnector,
+    normalizeRelayBaseUrl,
+    RELAY_COMMAND_ALLOWLIST,
+    RELAY_BLOCKED_COMMANDS,
+    RELAY_EVENT_ALLOWLIST,
+  } = await import('../server/remote-server.mjs');
+
+  assert.equal(normalizeRelayBaseUrl('wss://relay.example.com/'), 'https://relay.example.com');
+  assert.equal(normalizeRelayBaseUrl('ws://127.0.0.1:3210/api/relay/stream'), 'http://127.0.0.1:3210');
+  assert.equal(RELAY_COMMAND_ALLOWLIST.includes('start_session'), true);
+  assert.equal(RELAY_BLOCKED_COMMANDS.includes('complete_exit'), true);
+  assert.equal(RELAY_EVENT_ALLOWLIST.includes('session-output'), true);
 
   const html = injectRemoteFlag('<!doctype html><html><head><title>OpenDIY</title></head><body></body></html>');
   assert.equal(html.includes('window.__OPENDIY_REMOTE__=true'), true);
@@ -339,7 +354,7 @@ test('remote server injects browser flag, enforces token auth, and bridges sessi
 
     let registeredHostId = '';
     const connector = startHostConnector({
-      relayUrl,
+      relayUrl: `ws://127.0.0.1:${relayPort}`,
       hostSecret: 'relay-host-secret',
       workspaceDir: path.join(tmpRoot, 'host-workspace'),
       allowPathDiscovery: false,
@@ -376,7 +391,47 @@ test('remote server injects browser flag, enforces token auth, and bridges sessi
     assert.equal(relayInvokePayload.ok, true);
     assert.equal(relayInvokePayload.result, 'ko');
 
+    // Blocked command (e.g. complete_exit) must be rejected by relay allowlist
+    const blockedCmdRes = await fetch(`${relayUrl}/api/invoke`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer relay-client-token',
+      },
+      body: JSON.stringify({ command: 'complete_exit', args: {} }),
+    });
+    assert.equal(blockedCmdRes.status, 400);
+    const blockedCmdPayload = (await blockedCmdRes.json()) as { ok: boolean; error?: string };
+    assert.equal(blockedCmdPayload.ok, false);
+
+    // Duplicate/late reqId reply is handled idempotently (200 OK, ignored: true)
+    const dupReplyRes = await fetch(`${relayUrl}/api/relay/reply`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-OpenDIY-Host-Id': registeredHostId,
+        'X-OpenDIY-Host-Secret': 'relay-host-secret',
+      },
+      body: JSON.stringify({ reqId: 'unknown-or-settled-req-id', ok: true, result: null }),
+    });
+    assert.equal(dupReplyRes.status, 200);
+    assert.deepEqual(await dupReplyRes.json(), { ok: true, ignored: true });
+
+    // Disallowed event name is rejected with 400 EVENT_NOT_ALLOWED
+    const badEventRes = await fetch(`${relayUrl}/api/relay/event`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-OpenDIY-Host-Id': registeredHostId,
+        'X-OpenDIY-Host-Secret': 'relay-host-secret',
+      },
+      body: JSON.stringify({ event: 'arbitrary-untrusted-event', payload: {} }),
+    });
+    assert.equal(badEventRes.status, 400);
+
     await connector.close();
+    const healthAfterClose = (await (await fetch(`${relayUrl}/api/health`)).json()) as { hostConnected: boolean };
+    assert.equal(healthAfterClose.hostConnected, false);
     await relayInstance.close();
 
     const chosenFolder = await invoke('choose_project_folder', { path: projDir });

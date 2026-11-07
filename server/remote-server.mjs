@@ -18,6 +18,102 @@ const MAX_AUTH_FAILURES = 5;
 const AUTH_WINDOW_MS = 60 * 1000;
 const AUTH_LOCKOUT_MS = 5 * 60 * 1000;
 
+export const RELAY_PROTOCOL_VERSION = '1.0.0';
+export const RELAY_INVOKE_TIMEOUT_MS = 30 * 1000;
+
+export const RELAY_COMMAND_ALLOWLIST = Object.freeze([
+  'get_ui_language',
+  'set_ui_language',
+  'prepare_runtime',
+  'get_codex_settings',
+  'runtime_compatibility',
+  'runtime_pair_status',
+  'runtime_transition_preview',
+  'load_layout',
+  'save_layout',
+  'list_projects',
+  'import_project',
+  'create_project',
+  'rename_project',
+  'set_project_favorite',
+  'delete_project',
+  'reorder_project',
+  'start_session',
+  'list_sessions',
+  'session_write',
+  'session_resize',
+  'session_stop',
+  'session_output_ack',
+  'move_session_to_project',
+  'list_external',
+  'catalog_list',
+  'catalog_preview',
+  'extensions_list',
+  'extensions_mutate',
+  'mobile_control',
+  'subagents_request',
+  'cron_request',
+  'saved_cron_list',
+  'saved_cron_save',
+  'saved_cron_delete',
+  'saved_cron_register',
+  'conversation_request',
+  'list_pending_questions',
+  'respond_pending_question',
+  'choose_conversation_attachments',
+  'conversation_attachment_storage',
+  'stage_conversation_image',
+  'cleanup_conversation_attachment',
+  'weekly_usage',
+  'choose_project_folder',
+  'choose_skill_folder',
+  'choose_project',
+]);
+
+export const RELAY_BLOCKED_COMMANDS = Object.freeze([
+  'complete_exit',
+  'unconfirmed_exit_available',
+  'set_codex_executable',
+  'set_app_server_executable',
+  'choose_codex_executable',
+  'choose_app_server_executable',
+  'apply_runtime_transition',
+  'open_external_url',
+]);
+
+export const RELAY_EVENT_ALLOWLIST = Object.freeze([
+  'session-output',
+  'session-changed',
+  'host-connection-changed',
+  'runtime-updated',
+]);
+
+const RELAY_COMMAND_SET = new Set(RELAY_COMMAND_ALLOWLIST);
+const RELAY_EVENT_SET = new Set(RELAY_EVENT_ALLOWLIST);
+
+export function normalizeRelayBaseUrl(rawUrl) {
+  const trimmed = String(rawUrl ?? '').trim();
+  if (!trimmed) {
+    throw new Error('연결할 중계 서버 주소(--connect <url> 또는 OPENDIY_REMOTE_RELAY_URL)를 지정하세요.');
+  }
+  const normalizedScheme = trimmed
+    .replace(/^wss:\/\//i, 'https://')
+    .replace(/^ws:\/\//i, 'http://');
+  let parsed;
+  try {
+    parsed = new URL(normalizedScheme);
+  } catch {
+    throw new Error(`유효하지 않은 중계 서버 URL입니다: ${trimmed}`);
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(`지원하지 않는 중계 서버 프로토콜입니다 (${parsed.protocol}): http://, https://, ws://, wss:// 만 허용됩니다.`);
+  }
+  parsed.search = '';
+  parsed.hash = '';
+  parsed.pathname = parsed.pathname.replace(/\/api\/relay(?:\/.*)?$/i, '').replace(/\/+$/, '');
+  return parsed.toString().replace(/\/+$/, '');
+}
+
 export function injectRemoteFlag(html) {
   if (html.includes('__OPENDIY_REMOTE__')) return html;
   const headIdx = html.indexOf('<head>');
@@ -642,7 +738,13 @@ export function createRemoteServer(options = {}) {
     }
   }
 
-  function invokeRelayHost(command, args = {}, timeoutMs = 30000) {
+  function invokeRelayHost(command, args = {}, timeoutMs = RELAY_INVOKE_TIMEOUT_MS) {
+    if (command === 'unconfirmed_exit_available') {
+      return Promise.resolve(false);
+    }
+    if (!RELAY_COMMAND_SET.has(command)) {
+      return Promise.reject(new Error(`원격 중계에서 허용되지 않는 명령입니다: ${command}`));
+    }
     if (!activeHostLease || !activeHostLease.streamRes || activeHostLease.streamRes.writableEnded) {
       return Promise.reject(new Error('연결된 로컬 PC 호스트가 없습니다. 작업용 PC에서 호스트 연결(--connect)을 먼저 실행하세요.'));
     }
@@ -2052,6 +2154,14 @@ export function createRemoteServer(options = {}) {
           }));
           return;
         }
+        if (activeHostLease && activeHostLease.hostId === requestedHostId) {
+          if (activeHostLease.keepAlive) clearInterval(activeHostLease.keepAlive);
+          try {
+            if (activeHostLease.streamRes && activeHostLease.streamRes !== res) {
+              activeHostLease.streamRes.end();
+            }
+          } catch {}
+        }
         res.writeHead(200, {
           'Content-Type': 'text/event-stream; charset=utf-8',
           'Cache-Control': 'no-cache, no-transform',
@@ -2073,7 +2183,7 @@ export function createRemoteServer(options = {}) {
           connectedAt: Date.now(),
           pendingCalls,
         };
-        res.write(`data: ${JSON.stringify({ type: 'registered', hostId: requestedHostId })}\n\n`);
+        res.write(`data: ${JSON.stringify({ type: 'registered', hostId: requestedHostId, protocolVersion: RELAY_PROTOCOL_VERSION })}\n\n`);
         broadcast('host-connection-changed', { connected: true });
         res.on('close', () => {
           clearInterval(keepAlive);
@@ -2090,15 +2200,19 @@ export function createRemoteServer(options = {}) {
           return;
         }
         readJsonBody(req, res, body => {
-          const entry = activeHostLease?.pendingCalls.get(String(body.reqId || ''));
-          if (entry) {
-            activeHostLease.pendingCalls.delete(String(body.reqId));
-            clearTimeout(entry.timer);
-            if (body.ok) entry.resolve(body.result);
-            else entry.reject(new Error(String(body.error || '호스트 명령 실행 실패')));
+          const reqId = String(body.reqId || '');
+          const entry = activeHostLease?.pendingCalls.get(reqId);
+          if (!entry) {
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: true, ignored: true }));
+            return;
           }
+          activeHostLease.pendingCalls.delete(reqId);
+          clearTimeout(entry.timer);
+          if (body.ok) entry.resolve(body.result);
+          else entry.reject(new Error(String(body.error || '호스트 명령 실행 실패')));
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-          res.end(JSON.stringify({ ok: true }));
+          res.end(JSON.stringify({ ok: true, ignored: false }));
         });
         return;
       }
@@ -2111,12 +2225,29 @@ export function createRemoteServer(options = {}) {
           return;
         }
         readJsonBody(req, res, body => {
-          if (typeof body.event === 'string') {
-            broadcast(body.event, body.payload);
+          const eventName = typeof body.event === 'string' ? body.event.trim() : '';
+          if (!RELAY_EVENT_SET.has(eventName)) {
+            res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ ok: false, code: 'EVENT_NOT_ALLOWED', error: `허용되지 않은 중계 이벤트입니다: ${eventName}` }));
+            return;
           }
+          broadcast(eventName, body.payload);
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ ok: true }));
         });
+        return;
+      }
+
+      if (req.method === 'POST' && pathname === '/api/relay/disconnect') {
+        const hostId = String(req.headers['x-opendiy-host-id'] || '');
+        if (!activeHostLease || activeHostLease.hostId !== hostId) {
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, released: false }));
+          return;
+        }
+        releaseHostLease(hostId);
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: true, released: true }));
         return;
       }
     }
@@ -2243,11 +2374,8 @@ export function createRemoteServer(options = {}) {
  * 0 inbound ports open, streaming over an outbound connection to the 1:1 Relay Server.
  */
 export function startHostConnector(options = {}) {
-  const relayUrl = String(options.relayUrl || process.env.OPENDIY_REMOTE_RELAY_URL || '').trim().replace(/\/+$/, '');
+  const relayUrl = normalizeRelayBaseUrl(options.relayUrl || process.env.OPENDIY_REMOTE_RELAY_URL || '');
   const hostSecret = String(options.hostSecret ?? process.env.OPENDIY_REMOTE_HOST_SECRET ?? process.env.OPENDIY_REMOTE_TOKEN ?? '').trim();
-  if (!relayUrl) {
-    throw new Error('연결할 중계 서버 주소(--connect <url> 또는 OPENDIY_REMOTE_RELAY_URL)를 지정하세요.');
-  }
   const hostId = options.hostId || crypto.randomUUID();
   const localRuntime = createRemoteServer({
     ...options,
@@ -2257,6 +2385,16 @@ export function startHostConnector(options = {}) {
   let stopped = false;
   let activeReq = null;
   let reconnectTimer = null;
+  const inFlightReqIds = new Set();
+  const completedReqIds = new Map(); // reqId -> { ok, result, error }
+
+  function recordCompletedReply(reqId, replyPayload) {
+    if (completedReqIds.size >= 256) {
+      const oldestKey = completedReqIds.keys().next().value;
+      if (oldestKey !== undefined) completedReqIds.delete(oldestKey);
+    }
+    completedReqIds.set(reqId, replyPayload);
+  }
 
   function postJson(endpointPath, payload) {
     return new Promise((resolve, reject) => {
@@ -2288,11 +2426,11 @@ export function startHostConnector(options = {}) {
     });
   }
 
-  // Forward local SSE broadcasts (terminal-output, session-changed) to the relay
+  // Forward allowed local SSE broadcasts (session-output, session-changed) to the relay
   const origBroadcast = localRuntime.broadcast;
   localRuntime.broadcast = (event, payload) => {
     origBroadcast(event, payload);
-    if (!stopped) {
+    if (!stopped && RELAY_EVENT_SET.has(event)) {
       postJson('/api/relay/event', { event, payload }).catch(() => {});
     }
   };
@@ -2333,15 +2471,46 @@ export function startHostConnector(options = {}) {
               return;
             }
             if (msg.type === 'invoke' && msg.reqId) {
+              const reqId = String(msg.reqId);
+              if (inFlightReqIds.has(reqId)) {
+                return;
+              }
+              if (completedReqIds.has(reqId)) {
+                const cached = completedReqIds.get(reqId);
+                await postJson('/api/relay/reply', cached).catch(() => {});
+                return;
+              }
+              const command = String(msg.command || '');
+              if (!RELAY_COMMAND_SET.has(command)) {
+                const denied = {
+                  reqId,
+                  ok: false,
+                  error: `호스트에서 허용되지 않은 원격 명령입니다: ${command}`,
+                };
+                recordCompletedReply(reqId, denied);
+                await postJson('/api/relay/reply', denied).catch(() => {});
+                return;
+              }
+              inFlightReqIds.add(reqId);
               try {
-                const result = await localRuntime.dispatchCommand(msg.command, msg.args || {});
-                await postJson('/api/relay/reply', { reqId: msg.reqId, ok: true, result });
+                const result = await localRuntime.dispatchCommand(command, msg.args || {});
+                const reply = { reqId, ok: true, result };
+                recordCompletedReply(reqId, reply);
+                if (!stopped) {
+                  await postJson('/api/relay/reply', reply);
+                }
               } catch (err) {
-                await postJson('/api/relay/reply', {
-                  reqId: msg.reqId,
+                const reply = {
+                  reqId,
                   ok: false,
                   error: String(err.message || err),
-                });
+                };
+                recordCompletedReply(reqId, reply);
+                if (!stopped) {
+                  await postJson('/api/relay/reply', reply);
+                }
+              } finally {
+                inFlightReqIds.delete(reqId);
               }
             }
           } catch {
@@ -2368,14 +2537,17 @@ export function startHostConnector(options = {}) {
 
   return {
     hostId,
+    relayUrl,
     localRuntime,
     close: async () => {
       stopped = true;
       if (reconnectTimer) clearTimeout(reconnectTimer);
+      inFlightReqIds.clear();
       if (activeReq) {
         try { activeReq.destroy(); } catch {}
         activeReq = null;
       }
+      await postJson('/api/relay/disconnect', {}).catch(() => {});
       await localRuntime.close();
     },
   };
