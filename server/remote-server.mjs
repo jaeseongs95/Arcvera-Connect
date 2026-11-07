@@ -1003,11 +1003,16 @@ export function createRemoteServer(options = {}) {
           const cmdArgs = settings.resolvedPath && options.useCodexCli
             ? ['--cd', cwd]
             : process.platform === 'win32'
-              ? ['-NoLogo', '-NoProfile', '-Command', `[Console]::WriteLine("[OpenDIY Remote] ${title} (${cwd})")`]
-              : ['-c', `printf '[OpenDIY Remote] %s (%s)\\n' "${title}" "${cwd}"`];
+              ? ['-NoLogo', '-NoProfile', '-Command', '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; [Console]::WriteLine("[OpenDIY Remote] " + $env:OPENDIY_SESSION_TITLE + " (" + $env:OPENDIY_SESSION_CWD + ")")']
+              : ['-c', 'printf "[OpenDIY Remote] %s (%s)\\n" "$OPENDIY_SESSION_TITLE" "$OPENDIY_SESSION_CWD"'];
           try {
             const child = spawn(cmdBin, cmdArgs, {
               cwd,
+              env: {
+                ...process.env,
+                OPENDIY_SESSION_TITLE: title,
+                OPENDIY_SESSION_CWD: cwd,
+              },
               stdio: ['pipe', 'pipe', 'pipe'],
               windowsHide: true,
             });
