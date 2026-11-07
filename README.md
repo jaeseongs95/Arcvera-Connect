@@ -1,44 +1,54 @@
 # OpenDIY Remote
 
-A standalone, browser-accessible remote control workspace for running and managing [OpenDIY Codex](https://github.com/jaeseongs95/opendiy-codex) CLI and app-server sessions from any modern web browser (desktop, tablet, or mobile).
+A security-first, self-hosted **1:1 remote control web workspace** for running and managing [OpenDIY Codex](https://github.com/jaeseongs95/opendiy-codex) CLI and app-server sessions on your local workstation from any modern web browser (desktop, tablet, or mobile).
 
-- **Zero Modification to Upstream Projects**: Connects to an unmodified [OpenDIY Codex](https://github.com/jaeseongs95/opendiy-codex) installation (`codex` / `opendiy-codex-launcher.exe`) via standard JSON-RPC and process streams, while adopting the multi-session workspace UI of [OpenDIY Desktop](https://github.com/jaeseongs95/opendiy-desktop).
+- **Zero Modification to Upstream Projects**: Connects to an unmodified [OpenDIY Codex](https://github.com/jaeseongs95/opendiy-codex) installation (`codex` / `opendiy-codex-launcher.exe`) via standard JSON-RPC 2.0 and live process streams, while providing the multi-session workspace UI of [OpenDIY Desktop](https://github.com/jaeseongs95/opendiy-desktop).
+- **1-Owner-Per-Relay Security Architecture**: Deploy a lightweight, stateless relay (`--mode=relay`) on your own VPS (e.g., AWS Lightsail) and connect your workstation outbound (`--connect`). Keeps **zero inbound ports open on your local PC**, enforces a **Single-Host Lock**, separates host/browser secrets, and blocks brute-force attempts.
 - **Full Workspace UI in the Browser**: Group sessions by project, arrange live `xterm.js` terminals and structured conversation views in a resizable grid, answer approval/question prompts from the Question Inbox, and manage scheduled tasks (Cron) and subagents remotely.
-- **Pure Web Architecture**: Runs with a zero-dependency Node.js HTTP + SSE gateway server (`server/remote-server.mjs`) and a browser IPC bridge (`src/remote-bridge.ts`)—no Tauri or WebView2 desktop runtime required.
 
 **English** | [한국어](README.ko.md)
 
 ---
 
-## Architecture Overview
+## Architecture Overview (1:1 Self-Hosted Relay & Direct Mode)
+
+### 1. 1:1 Self-Hosted Relay Mode (Recommended for External Access)
 
 ```mermaid
 flowchart LR
-  Browser["Web Browser (PC / Tablet / Mobile)<br/>OpenDIY Desktop-based Web UI + xterm.js"]
-  Gateway["OpenDIY Remote Server (Node.js HTTP + SSE)<br/>POST /api/invoke · GET /api/events<br/>SHA-256 Capability Token Auth"]
-  AppServer["OpenDIY Codex app-server<br/>JSON-RPC 2.0 (stdio / ws)"]
-  CLI["OpenDIY Codex CLI / Shell Sessions<br/>Live Terminal I/O Stream"]
+  subgraph LocalPC["1. User's Workstation (0 Inbound Ports Open)"]
+    Codex["Unmodified OpenDIY Codex<br/>(app-server + local shell/files)"]
+    Connector["OpenDIY Remote Host Connector<br/>(--connect https://my-relay)"]
+    Codex <--> Connector
+  end
 
-  Browser -- "HTTP POST /api/invoke<br/>SSE GET /api/events" --> Gateway
-  Gateway -- "JSON-RPC 2.0 (Server-to-server without browser Origin)" --> AppServer
-  Gateway -- "Process spawn & terminal I/O relay" --> CLI
+  subgraph VPS["2. User's Personal VPS / AWS Lightsail (--mode=relay)"]
+    Relay["Stateless 1:1 Relay Gateway<br/>Single-Host Lock + Rate-Limit<br/>(No code or API keys stored)"]
+  end
+
+  subgraph Client["3. User's Remote Device"]
+    Browser["Web Browser<br/>(Laptop / Tablet / Mobile)"]
+  end
+
+  Connector -- "① Outbound tunnel (HOST_SECRET auth)<br/>Additional hosts rejected (409)" --> Relay
+  Browser <-->|"② CLIENT_TOKEN auth (HttpOnly cookie)<br/>POST /api/invoke · SSE /api/events"| Relay
 ```
 
-### Why a Dedicated Remote Gateway Server?
-`opendiy-codex`'s `codex app-server` WebSocket listener rejects browser connections carrying an `Origin` header (`403 FORBIDDEN`) to prevent cross-origin localhost attacks. `OpenDIY Remote` bridges this safely:
-1. Serves the built frontend (`dist/`) and injects `window.__OPENDIY_REMOTE__ = true`.
-2. Authenticates browser requests using constant-time SHA-256 token verification (`crypto.timingSafeEqual`).
-3. Communicates with the host's `opendiy-codex` `app-server` and CLI sessions on the backend, streaming real-time events to browsers over bounded SSE channels (`GET /api/events`).
+- **Relay Server (VPS / AWS Lightsail `\$5/mo` plan, etc.)**: Does **not** require `opendiy-codex` or your project files. Only deploy the built `dist/` assets and `server/remote-server.mjs` running in `--mode=relay`.
+- **Workstation PC**: Run `node server/remote-server.mjs --connect <relay-url>` on the machine where `opendiy-codex` and your source code live. It establishes an outbound connection to your relay so no router port-forwarding is needed.
+
+### 2. Single-Machine Direct Mode (LAN / Tailscale / Remote Dev Host)
+When the web server and `opendiy-codex` run on the same machine, run in the default `--mode=direct` without a separate relay.
 
 ---
 
 ## Quick Start
 
-### 1. Prerequisites
+### Prerequisites
 - **Node.js 22+** (Node.js 24 recommended)
-- **[OpenDIY Codex](https://github.com/jaeseongs95/opendiy-codex)** (or official Codex CLI) installed and signed in on the host machine
+- **[OpenDIY Codex](https://github.com/jaeseongs95/opendiy-codex)** (or official Codex CLI) installed and signed in on your workstation
 
-### 2. Install & Build
+### Build
 ```bash
 git clone https://github.com/jaeseongs95/opendiy-remote.git
 cd opendiy-remote
@@ -46,21 +56,44 @@ npm ci
 npm run build
 ```
 
-### 3. Start the Remote Server
+---
+
+### Scenario A: Using a VPS (e.g., AWS Lightsail) as a 1:1 Dedicated Relay
+
+#### Step 1 — Start the Relay on Your VPS (No `codex` binary required)
+Only `dist/`, `server/remote-server.mjs`, and `package.json` are needed on the VPS:
+```bash
+node server/remote-server.mjs \
+  --mode relay \
+  --bind 0.0.0.0:3210 \
+  --token "my-browser-access-token" \
+  --host-secret "my-pc-connector-secret"
+```
+
+#### Step 2 — Connect Your Workstation PC to the Relay
+On your workstation where `opendiy-codex` is installed:
+```bash
+node server/remote-server.mjs \
+  --connect http://<relay-ip-or-domain>:3210 \
+  --host-secret "my-pc-connector-secret"
+```
+
+#### Step 3 — Open in Any Browser
+Visit `http://<relay-ip-or-domain>:3210/?token=my-browser-access-token`. The token is automatically stored in an `HttpOnly; SameSite=Strict` cookie and `sessionStorage` and stripped from the URL bar.
+
+---
+
+### Scenario B: Running Directly on One Machine (`direct` mode)
 
 #### Local Loopback (Default `127.0.0.1:3210`)
 ```bash
 npm start
 ```
-Open `http://127.0.0.1:3210` in your browser.
 
-#### LAN / Tailscale / Remote Device Access
-Binding to a non-loopback address (`0.0.0.0` or a LAN IP) **requires** `--token` or `OPENDIY_REMOTE_TOKEN` (the server refuses to start without authentication on non-loopback interfaces):
-
+#### LAN / Tailscale Access
 ```bash
 npm start -- --bind 0.0.0.0:3210 --token "my-secret-access-token"
 ```
-Open `http://<host-ip>:3210/?token=my-secret-access-token` in your remote browser. The token is stored in `sessionStorage` and automatically stripped from the URL bar.
 
 ---
 
@@ -68,13 +101,26 @@ Open `http://<host-ip>:3210/?token=my-secret-access-token` in your remote browse
 
 | CLI Flag | Environment Variable | Default | Description |
 | --- | --- | --- | --- |
+| `--mode <direct\|relay>` | `OPENDIY_REMOTE_MODE` | `direct` | `direct` (local execution) or `relay` (stateless 1:1 relay server) |
+| `--connect <url>` | `OPENDIY_REMOTE_RELAY_URL` | (none) | Outbound relay URL to connect from the workstation PC |
+| `--host-secret <secret>` | `OPENDIY_REMOTE_HOST_SECRET` | defaults to `--token` | Shared secret authenticating the workstation connector to the relay |
 | `--bind <host[:port]>` | `OPENDIY_REMOTE_BIND` | `127.0.0.1:3210` | Host (and optional port) to bind |
 | `--host <host>` | `OPENDIY_REMOTE_HOST` | `127.0.0.1` | Host address to bind |
 | `--port <port>` | `OPENDIY_REMOTE_PORT` | `3210` | HTTP + SSE listening port |
-| `--token <secret>` | `OPENDIY_REMOTE_TOKEN` | (none) | Bearer / `?token=` secret for remote authentication (required for non-loopback binds) |
+| `--token <secret>` | `OPENDIY_REMOTE_TOKEN` | (none) | Browser authentication token (required for non-loopback binds) |
 | `--workspace <dir>` | `OPENDIY_REMOTE_DATA_DIR` | OS temp/work dir | Absolute directory path for persisted layout, projects, and session metadata |
 | - | `OPENDIY_CODEX_BIN` | auto-detected | Absolute path to the `codex` / `opendiy-codex-launcher` executable |
 | - | `OPENDIY_REMOTE_DIST` | `./dist` | Directory path of built frontend assets to serve |
+
+---
+
+## Security Model (Security-First 1:1 Relay)
+
+1. **Zero Inbound Ports on Workstation**: Your workstation initiates an outbound connection (`--connect`) to the relay, keeping local firewall inbound ports closed.
+2. **Single-Host Lock**: Each relay instance accepts only one active workstation connection. Any second host registration attempt while a host is connected is rejected with `409 Conflict`.
+3. **Constant-Time Token Verification & Brute-Force Lockout**: Tokens and host secrets are hashed with SHA-256 and compared via `crypto.timingSafeEqual`. Repeated authentication failures (5+ attempts) trigger an IP lockout (`429 Too Many Requests`).
+4. **Stateless Relay**: In `--mode=relay`, the server never stores your source code, workspace state, OpenAI API keys, or `~/.codex` credentials on disk.
+5. **Bounded Resource Buffers**: Enforces a `16 MiB` HTTP request body limit and a `1 MiB` per-client SSE write buffer cap.
 
 ---
 
@@ -84,7 +130,7 @@ Open `http://<host-ip>:3210/?token=my-secret-access-token` in your remote browse
 # Install dependencies
 npm ci
 
-# Run unit & remote server integration tests
+# Run unit, 1:1 relay/connector, and remote server integration tests
 npm test
 
 # Type-check and build production web bundle
@@ -93,14 +139,6 @@ npm run build
 # Run Playwright browser E2E tests
 npm run test:e2e
 ```
-
----
-
-## Security & Data Isolation
-
-- **Codex Owns Credentials & Config**: Authentication files, configuration, and conversation history remain owned by `opendiy-codex` on the host. `opendiy-remote` never copies or exposes credential files.
-- **Fail-Closed Non-Loopback Binding**: Starting the server on a non-loopback address without `--token` / `OPENDIY_REMOTE_TOKEN` exits immediately with code `1`.
-- **Bounded Resource Buffers**: Enforces a `16 MiB` HTTP request body limit and a `1 MiB` per-client SSE write buffer cap to prevent slow remote clients from exhausting host memory.
 
 ---
 

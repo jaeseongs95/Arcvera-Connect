@@ -115,7 +115,7 @@ test('remote server injects browser flag, enforces token auth, and bridges sessi
   const os = await import('node:os');
   const path = await import('node:path');
   const crypto = await import('node:crypto');
-  const { injectRemoteFlag, verifyToken, createRemoteServer } = await import('../server/remote-server.mjs');
+  const { injectRemoteFlag, verifyToken, createRemoteServer, startHostConnector } = await import('../server/remote-server.mjs');
 
   const html = injectRemoteFlag('<!doctype html><html><head><title>OpenDIY</title></head><body></body></html>');
   assert.equal(html.includes('window.__OPENDIY_REMOTE__=true'), true);
@@ -193,7 +193,7 @@ test('remote server injects browser flag, enforces token auth, and bridges sessi
   try {
     const healthRes = await fetch(`${baseUrl}/api/health`);
     assert.equal(healthRes.status, 200);
-    assert.deepEqual(await healthRes.json(), { ok: true, service: 'opendiy-remote' });
+    assert.deepEqual(await healthRes.json(), { ok: true, service: 'opendiy-remote', mode: 'direct', hostConnected: true });
 
     const unauthRes = await fetch(`${baseUrl}/api/invoke`, {
       method: 'POST',
@@ -242,6 +242,142 @@ test('remote server injects browser flag, enforces token auth, and bridges sessi
     });
     assert.equal(sent.status, 'completed');
     assert.equal(sent.turns.length, 1);
+
+    const modelsReply = await invoke('conversation_request', {
+      id: started.id,
+      generation: started.generation,
+      request: { type: 'models' },
+    });
+    assert.equal(Array.isArray(modelsReply.data), true);
+    assert.equal(modelsReply.data.length, 1);
+
+    const pageReply = await invoke('conversation_request', {
+      id: started.id,
+      generation: started.generation,
+      request: { type: 'page' },
+    });
+    assert.equal(Array.isArray(pageReply.data), true);
+    assert.equal(pageReply.data.length, 1);
+
+    const itemsReply = await invoke('conversation_request', {
+      id: started.id,
+      generation: started.generation,
+      request: { type: 'items', turnId: pageReply.data[0].id },
+    });
+    assert.equal(Array.isArray(itemsReply.data), true);
+    assert.equal(itemsReply.data[0].turnId, pageReply.data[0].id);
+    assert.equal(typeof itemsReply.data[0].item.type, 'string');
+    assert.equal(typeof itemsReply.data[0].item.id, 'string');
+
+    const ctxStatus = await invoke('conversation_request', {
+      id: started.id,
+      generation: started.generation,
+      request: { type: 'contextStatus' },
+    });
+    assert.equal(ctxStatus.connected, true);
+    assert.equal(ctxStatus.tokenUsageFresh, true);
+    assert.equal(ctxStatus.tokenUsage.last.totalTokens, 4096);
+    assert.equal(ctxStatus.tokenUsage.modelContextWindow, 128000);
+    assert.equal(ctxStatus.passiveSubscriptionSupported, true);
+    assert.equal(ctxStatus.subagentsSupported, true);
+    assert.equal(ctxStatus.cronSupported, true);
+    assert.equal(ctxStatus.compactSupported, true);
+
+    const ctxSettings = await invoke('conversation_request', {
+      id: started.id,
+      generation: started.generation,
+      request: { type: 'contextSettings' },
+    });
+    assert.equal(ctxSettings.supported, true);
+    assert.equal(ctxSettings.canChange, true);
+
+    const extSnap = await invoke('extensions_list', { cwd: projDir });
+    assert.equal(Array.isArray(extSnap.errors), true);
+    assert.equal(typeof extSnap.skillDestinations, 'object');
+    assert.equal(Array.isArray(extSnap.plugins.installed), true);
+    assert.equal(Array.isArray(extSnap.hooks.items), true);
+
+    const cronList = await invoke('cron_request', {
+      id: started.id,
+      generation: started.generation,
+      request: { type: 'list' },
+    });
+    assert.equal(cronList.scope, 'cliLifetime');
+    assert.equal(cronList.connected, true);
+    assert.equal(Array.isArray(cronList.jobs), true);
+
+    const subagentList = await invoke('subagents_request', {
+      id: started.id,
+      generation: started.generation,
+      request: { type: 'list' },
+    });
+    assert.equal(subagentList.connected, true);
+    assert.equal(Array.isArray(subagentList.agents), true);
+    assert.equal(typeof subagentList.parentRuntimeId, 'string');
+
+    const mobileReply = await invoke('mobile_control', {
+      id: started.id,
+      generation: started.generation,
+      action: 'status',
+    });
+    assert.equal(typeof mobileReply.isolated, 'boolean');
+    assert.equal(typeof mobileReply.mutationsAllowed, 'boolean');
+    assert.equal(typeof mobileReply.status?.status, 'string');
+
+    // Verify 1:1 Single-Owner Relay Hub + Outbound Host Connector
+    const relayInstance = createRemoteServer({
+      mode: 'relay',
+      workspaceDir: path.join(tmpRoot, 'relay-workspace'),
+      token: 'relay-client-token',
+      hostSecret: 'relay-host-secret',
+      allowPathDiscovery: false,
+      spawnProcess: false,
+    });
+    await new Promise<void>(resolve => relayInstance.server.listen(0, '127.0.0.1', () => resolve()));
+    const relayPort = (relayInstance.server.address() as { port: number }).port;
+    const relayUrl = `http://127.0.0.1:${relayPort}`;
+
+    let registeredHostId = '';
+    const connector = startHostConnector({
+      relayUrl,
+      hostSecret: 'relay-host-secret',
+      workspaceDir: path.join(tmpRoot, 'host-workspace'),
+      allowPathDiscovery: false,
+      spawnProcess: false,
+      autoReconnect: false,
+      onRegistered: ({ hostId }: { hostId: string }) => {
+        registeredHostId = hostId;
+      },
+    });
+    for (let i = 0; i < 30 && !registeredHostId; i++) {
+      await new Promise(r => setTimeout(r, 50));
+    }
+    assert.equal(Boolean(registeredHostId), true);
+
+    // Second host attempting to attach to the 1:1 relay must be rejected with 409 Single-Host Lock
+    const duplicateHostRes = await fetch(`${relayUrl}/api/relay/stream`, {
+      headers: {
+        'X-OpenDIY-Host-Id': 'intruder-host-id',
+        'X-OpenDIY-Host-Secret': 'relay-host-secret',
+      },
+    });
+    assert.equal(duplicateHostRes.status, 409);
+
+    // Client invoking via the relay hits the connected local host
+    const relayInvokeRes = await fetch(`${relayUrl}/api/invoke`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer relay-client-token',
+      },
+      body: JSON.stringify({ command: 'get_ui_language', args: {} }),
+    });
+    const relayInvokePayload = (await relayInvokeRes.json()) as { ok: boolean; result?: any };
+    assert.equal(relayInvokePayload.ok, true);
+    assert.equal(relayInvokePayload.result, 'ko');
+
+    await connector.close();
+    await relayInstance.close();
 
     const chosenFolder = await invoke('choose_project_folder', { path: projDir });
     assert.equal(chosenFolder, projDir);

@@ -8,6 +8,8 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview --host 127.0.0.1",
     "start": "node server/remote-server.mjs",
+    "relay": "node server/remote-server.mjs --mode relay",
+    "connect": "node server/remote-server.mjs --connect",
     "remote": "node server/remote-server.mjs",
     "test": "node --test src/model.test.ts",
     "test:e2e": "playwright test"

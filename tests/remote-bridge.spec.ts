@@ -58,6 +58,12 @@ test('remote browser bridge renders REMOTE WORKSPACE and bridges project, sessio
     await expect(card).toBeVisible();
     await expect(card.locator('.terminal-title')).toHaveText('원격 브라우저 세션');
     await expect(card.locator('.xterm-rows')).toContainText('원격 브라우저 세션');
+    await expect(card.locator('.conversation-toggle')).toBeVisible();
+    await expect(card.locator('.subagents-open')).toBeVisible();
+
+    await card.locator('.conversation-toggle').click();
+    await expect(card.locator('.conversation-host')).toBeVisible();
+    await expect(card.locator('.conversation-status')).toContainText('연결됨');
 
     expect(errors).toEqual([]);
   } finally {
