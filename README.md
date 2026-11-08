@@ -63,7 +63,7 @@ npm run build
 #### Option 1 — One-Click VPS Install (Ubuntu / Debian)
 Run a single command on your fresh Ubuntu/Debian VPS to install Node.js 22+, download the pre-built release bundle, register the `systemd` service (`opendiy-remote.service`), and generate random access credentials automatically:
 ```bash
-curl -fsSL https://github.com/jaeseongs95/opendiy-remote/releases/download/v1.0.1/install-relay.sh | bash
+curl -fsSL https://github.com/jaeseongs95/opendiy-remote/releases/download/v1.1.0/install-relay.sh | bash
 ```
 
 #### Option 2 — Manual Relay Startup (No `codex` binary required)
@@ -77,8 +77,12 @@ node server/remote-server.mjs \
 ```
 
 #### Step 2 — Connect Your Workstation PC to the Relay
-On your workstation where `opendiy-codex` is installed:
+On your workstation where `opendiy-codex` is installed (when Google OAuth is enabled on the relay, `--host-secret` is optional and the connector will automatically open your browser for Google OAuth sign-in and cache the token locally):
 ```bash
+# Google OAuth mode (recommended — opens browser login automatically on first run):
+node server/remote-server.mjs --connect https://<relay-domain>
+
+# Or with explicit host secret:
 node server/remote-server.mjs \
   --connect http://<relay-ip-or-domain>:3210 \
   --host-secret "my-pc-connector-secret"

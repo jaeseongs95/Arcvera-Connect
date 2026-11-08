@@ -63,7 +63,7 @@ npm run build
 #### 방법 1 — 원클릭 간편 설치 스크립트 (Ubuntu / Debian 깡통 서버 권장)
 새로 만든 Ubuntu/Debian 서버 터미널에서 아래 한 줄만 실행하면 Node.js 22 설치, 릴리즈 빌드 번들 다운로드, `systemd` 자동 재시작 서비스(`opendiy-remote.service`) 등록, 난수 토큰·비밀키 생성 및 출력까지 자동으로 완료됩니다:
 ```bash
-curl -fsSL https://github.com/jaeseongs95/opendiy-remote/releases/download/v1.0.1/install-relay.sh | bash
+curl -fsSL https://github.com/jaeseongs95/opendiy-remote/releases/download/v1.1.0/install-relay.sh | bash
 ```
 
 #### 방법 2 — 수동으로 중계 서버(VPS)에서 실행 (`codex` 설치 불필요)
@@ -77,7 +77,12 @@ node server/remote-server.mjs \
 ```
 
 #### 2단계 — 내 작업용 PC에서 중계 서버로 연결 (`opendiy-codex`가 설치된 PC)
+중계 서버에 Google OAuth가 설정되어 있으면 `--host-secret` 없이 실행할 수 있으며, 최초 1회 자동으로 브라우저가 열려 Google 계정 로그인 후 로컬에 인증 토큰을 캐시합니다:
 ```bash
+# Google OAuth 방식 (권장 — --host-secret 불필요, 최초 실행 시 브라우저 로그인):
+node server/remote-server.mjs --connect https://<중계서버-도메인>
+
+# 또는 비밀키 직접 지정 방식:
 node server/remote-server.mjs \
   --connect http://<중계서버-IP-또는-도메인>:3210 \
   --host-secret "내-PC-연결용-비밀키"

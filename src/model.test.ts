@@ -895,3 +895,248 @@ test('TerminalInputQueue coalesces rapid typing bursts over high-RTT links into 
   assert.equal(queue.size, 0);
   assert.equal(queue.byteLength, 0);
 });
+
+test('Host Connector OAuth login flow (--connect without --host-secret), slash_commands_list, catalog_list filtering, and Korean wide-char backspace', async () => {
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const { createRemoteServer, startHostConnector } = await import('../server/remote-server.mjs');
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'opendiy-oauth-slash-catalog-'));
+  const projA = path.join(tmpRoot, 'proj-alpha');
+  const projJeoneon = path.join(tmpRoot, '전언');
+  fs.mkdirSync(projA, { recursive: true });
+  fs.mkdirSync(projJeoneon, { recursive: true });
+
+  const codexHome = path.join(tmpRoot, '.codex');
+  const skillsDir = path.join(codexHome, 'skills', 'my-custom-skill');
+  fs.mkdirSync(skillsDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(skillsDir, 'SKILL.md'),
+    '---\nname: my-custom-skill\ndescription: Custom test skill for slash palette\n---\n# Skill\n',
+    'utf8',
+  );
+
+  // Create state_5.sqlite with >100 recent threads in projA and 1 older thread in projJeoneon
+  const { DatabaseSync } = await import('node:sqlite');
+  const stateDbPath = path.join(codexHome, 'state_5.sqlite');
+  const sdb = new DatabaseSync(stateDbPath);
+  sdb.exec(`
+    CREATE TABLE threads (
+      id TEXT PRIMARY KEY,
+      rollout_path TEXT,
+      created_at INTEGER,
+      updated_at INTEGER,
+      cwd TEXT,
+      title TEXT,
+      name TEXT,
+      first_user_message TEXT,
+      archived INTEGER DEFAULT 0
+    );
+  `);
+  const insertStmt = sdb.prepare(
+    'INSERT INTO threads (id, rollout_path, created_at, updated_at, cwd, title, name, first_user_message, archived) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)',
+  );
+  for (let i = 1; i <= 120; i++) {
+    insertStmt.run(
+      `thread-alpha-${i}`,
+      '',
+      1790000000 + i,
+      1794000000 + i,
+      `\\\\?\\${projA}`,
+      `Alpha task ${i}`,
+      null,
+      `Alpha prompt ${i}`,
+    );
+  }
+  // Older thread in '전언' project (rank > 80 so old LIMIT 80 bug would drop it!)
+  insertStmt.run(
+    'thread-jeoneon-target',
+    '',
+    1780000000,
+    1785000000,
+    `\\\\?\\${projJeoneon}`,
+    'Automation: 전체 Dot 답변 폴더 감시\nMultiple lines should be trimmed to single line',
+    '전체 Dot 답변 폴더 감시',
+    '첫 메시지',
+  );
+  sdb.close();
+
+  // Mock Google OAuth token & userinfo HTTP server
+  const http = await import('node:http');
+  const mockGoogleServer = http.createServer((req, res) => {
+    if (req.url === '/token' && req.method === 'POST') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ access_token: 'mock-google-access-token' }));
+      return;
+    }
+    if (req.url === '/userinfo') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ email: 'owner@example.com', email_verified: true }));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  await new Promise<void>(resolve => mockGoogleServer.listen(0, '127.0.0.1', resolve));
+  const googleAddr = mockGoogleServer.address() as { port: number };
+  const googleBase = `http://127.0.0.1:${googleAddr.port}`;
+
+  const prevCodexHome = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = codexHome;
+
+  const relayInstance = createRemoteServer({
+    mode: 'relay',
+    workspaceDir: path.join(tmpRoot, 'relay-ws'),
+    googleClientId: 'mock-client-id',
+    googleClientSecret: 'mock-client-secret',
+    allowedEmail: 'owner@example.com',
+    googleOAuthTokenUrl: `${googleBase}/token`,
+    googleOAuthUserInfoUrl: `${googleBase}/userinfo`,
+    allowPathDiscovery: false,
+  });
+
+  let connector: any = null;
+  try {
+    const relayPort = await new Promise<number>(resolve => {
+      relayInstance.server.listen(0, '127.0.0.1', () => {
+        const addr = relayInstance.server.address();
+        resolve(typeof addr === 'object' && addr ? addr.port : 0);
+      });
+    });
+    const relayBase = `http://127.0.0.1:${relayPort}`;
+
+    // Start Host Connector WITHOUT --host-secret, intercepting onOAuthPrompt to simulate user completing Google OAuth in browser
+    let openedAuthUrl = '';
+    let registeredPromiseResolve!: () => void;
+    const registeredPromise = new Promise<void>(resolve => {
+      registeredPromiseResolve = resolve;
+    });
+    const oauthCachePath = path.join(tmpRoot, 'host-oauth-token.json');
+    connector = startHostConnector({
+      relayUrl: relayBase,
+      hostSecret: '',
+      oauthCacheFile: oauthCachePath,
+      oauthPollIntervalMs: 150,
+      openBrowser: false,
+      silent: true,
+      workspaceDir: path.join(tmpRoot, 'host-ws'),
+      codexHomeDir: codexHome,
+      spawnProcess: false,
+      allowPathDiscovery: false,
+      onRegistered: () => {
+        registeredPromiseResolve();
+      },
+      onOAuthPrompt: ({ loginUrl }: { loginUrl: string }) => {
+        openedAuthUrl = loginUrl;
+        void (async () => {
+          // 1. Follow /auth/google?cli_session=... to get Google redirect URL with server-side state nonce
+          const step1 = await fetch(loginUrl, { redirect: 'manual' });
+          assert.equal(step1.status, 302);
+          const loc = new URL(step1.headers.get('location')!);
+          const stateParam = loc.searchParams.get('state')!;
+          assert.equal(Boolean(stateParam), true);
+          // 2. Call /auth/google/callback?code=mock-code&state=...
+          const step2 = await fetch(
+            `${relayBase}/auth/google/callback?code=mock-code&state=${encodeURIComponent(stateParam)}`,
+          );
+          assert.equal(step2.status, 200);
+          const html = await step2.text();
+          assert.equal(html.includes('로컬 PC 호스트 인증 완료'), true);
+        })();
+      },
+    });
+
+    await registeredPromise;
+    assert.equal(openedAuthUrl.includes('/auth/google?cli_session='), true);
+    assert.equal(fs.existsSync(oauthCachePath), true);
+    const cachedTokenMap = JSON.parse(fs.readFileSync(oauthCachePath, 'utf8'));
+    const cachedTokenData = cachedTokenMap[relayBase];
+    assert.equal(Boolean(cachedTokenData?.token?.startsWith('oauth.')), true);
+
+    const relayInvoke = async (cmd: string, args: Record<string, unknown> = {}) => {
+      const res = await fetch(`${relayBase}/api/invoke`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${cachedTokenData.token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ command: cmd, args }),
+      });
+      const body = await res.json();
+      assert.equal(res.status, 200);
+      assert.equal(body.ok, true);
+      return body.result;
+    };
+
+    // 1. Verify catalog_list finds '전언' session even when >100 newer sessions exist in another project
+    const catalogJeoneon = await relayInvoke('catalog_list', {
+      request: { cwd: projJeoneon, query: '' },
+    });
+    assert.equal(catalogJeoneon.sessions.length, 1);
+    assert.equal(catalogJeoneon.sessions[0].id, 'thread-jeoneon-target');
+    assert.equal(catalogJeoneon.sessions[0].title, '전체 Dot 답변 폴더 감시');
+
+    // 2. Verify slash_commands_list returns built-in slash commands + custom skill
+    const slashRes = await relayInvoke('slash_commands_list', { cwd: projJeoneon });
+    assert.equal(Array.isArray(slashRes.commands), true);
+    assert.equal(slashRes.commands.some((c: any) => c.command === '/compact'), true);
+    assert.equal(slashRes.commands.some((c: any) => c.command === '/status'), true);
+    assert.equal(slashRes.commands.some((c: any) => c.command === '/my-custom-skill' && c.category === 'skill'), true);
+
+    // 3. Start a session and test Korean wide-char backspace + /status slash command in session_write
+    const started = await relayInvoke('start_session', {
+      request: { title: '한글 및 슬래시 테스트', cwd: projJeoneon, threadId: 'thread-jeoneon-target' },
+    });
+    assert.equal(started.lineBufferedInput, true);
+
+    const sseController = new AbortController();
+    const sseRes = await fetch(`${relayBase}/api/events`, {
+      headers: { Authorization: `Bearer ${cachedTokenData.token}` },
+      signal: sseController.signal,
+    });
+    const reader = sseRes.body!.getReader();
+    const decoder = new TextDecoder();
+    let sseBuf = '';
+    const pump = (async () => {
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          sseBuf += decoder.decode(value, { stream: true });
+        }
+      } catch {}
+    })();
+
+    // Type '가나' then Backspace ('\u007f') -> should erase wide char with '\b \b\b \b'
+    await relayInvoke('session_write', {
+      id: started.id,
+      generation: started.generation,
+      data: '가나\u007f',
+    });
+    for (let i = 0; i < 15 && !sseBuf.includes('\\b \\b\\b \\b'); i++) {
+      await new Promise(r => setTimeout(r, 30));
+    }
+    assert.equal(sseBuf.includes('\\b \\b\\b \\b'), true);
+
+    // Clear line with Ctrl+C and execute /status
+    await relayInvoke('session_write', {
+      id: started.id,
+      generation: started.generation,
+      data: '\u0003/status\r',
+    });
+    for (let i = 0; i < 20 && !sseBuf.includes('세션 상태'); i++) {
+      await new Promise(r => setTimeout(r, 30));
+    }
+    assert.equal(sseBuf.includes('세션 상태'), true);
+
+    sseController.abort();
+    await pump;
+  } finally {
+    if (prevCodexHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = prevCodexHome;
+    if (connector) await connector.close();
+    await relayInstance.close();
+    await new Promise<void>(resolve => mockGoogleServer.close(() => resolve()));
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});

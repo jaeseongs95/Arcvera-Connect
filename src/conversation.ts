@@ -605,11 +605,163 @@ export function createConversation(options: ConversationOptions) {
     contentVersion++; items = []; itemsDirty = false; turnPage = []; pendingRequests = []; selectedTurn = ''; nextItems = ''; nextTurns = ''; loading = false; requestSignature = '';
     renderItems(); renderTurns(); renderRequests(); updateControls();
   }
-  $('.conversation-compose').addEventListener('submit', event => { event.preventDefault(); void send(); }, events);
-  input.addEventListener('input', updateControls, events);
+  interface SlashItem { command: string; description: string; category?: string; action?: string }
+  let slashCommands: SlashItem[] = [
+    { command: '/compact', description: '대화 컨텍스트를 요약·압축합니다', category: 'command', action: 'compact' },
+    { command: '/status', description: '현재 세션·모델·토큰 사용량 상태를 표시합니다', category: 'command', action: 'status' },
+    { command: '/model', description: '사용 가능한 모델 목록 또는 모델 변경 (/model <이름>)', category: 'command', action: 'model' },
+    { command: '/diff', description: '현재 작업 폴더의 Git 변경 사항을 확인합니다', category: 'command', action: 'diff' },
+    { command: '/review', description: '현재 Git 변경 사항에 대한 코드 리뷰를 요청합니다', category: 'command', action: 'review' },
+    { command: '/clear', description: '대화 표시 화면을 새로 고칩니다', category: 'command', action: 'clear' },
+    { command: '/help', description: '사용 가능한 슬래시 명령어와 스킬 목록을 표시합니다', category: 'command', action: 'help' },
+  ];
+  let slashCommandsLoaded = false;
+  let slashSelectedIdx = 0;
+  let compositionEndedAt = 0;
+  const slashMenu = document.createElement('div');
+  slashMenu.className = 'slash-command-menu';
+  slashMenu.setAttribute('role', 'listbox');
+  slashMenu.setAttribute('aria-label', '슬래시 명령어 목록');
+  slashMenu.hidden = true;
+  $('.conversation-compose').prepend(slashMenu);
+
+  async function ensureSlashLoaded() {
+    if (slashCommandsLoaded || disposed) return;
+    slashCommandsLoaded = true;
+    try {
+      const res = await rpc({ type: 'slashCommands' });
+      if (!disposed && Array.isArray(res?.commands) && res.commands.length > 0) {
+        slashCommands = res.commands;
+        renderSlashPalette();
+      }
+    } catch {
+      // Keep default commands if server does not return custom skills.
+    }
+  }
+
+  function filteredSlashCommands(): SlashItem[] {
+    const val = input.value;
+    if (!val.startsWith('/') || val.includes('\n')) return [];
+    const firstSpace = val.indexOf(' ');
+    if (firstSpace !== -1) return [];
+    const q = val.toLowerCase();
+    return slashCommands.filter(c => c.command.toLowerCase().startsWith(q) || c.description.toLowerCase().includes(q.slice(1))).slice(0, 16);
+  }
+
+  function applySlashItem(item: SlashItem) {
+    slashMenu.hidden = true;
+    if (item.action === 'compact') {
+      input.value = '';
+      updateControls();
+      void compact();
+      return;
+    }
+    if (item.action === 'clear') {
+      input.value = '';
+      updateControls();
+      void loadPage();
+      return;
+    }
+    if (item.category === 'skill') {
+      input.value = `${item.command} `;
+      updateControls();
+      input.focus();
+      return;
+    }
+    input.value = item.command;
+    updateControls();
+    void send();
+  }
+
+  function renderSlashPalette() {
+    const list = filteredSlashCommands();
+    if (!list.length || input.disabled) {
+      slashMenu.hidden = true;
+      return;
+    }
+    if (slashSelectedIdx >= list.length) slashSelectedIdx = 0;
+    if (slashSelectedIdx < 0) slashSelectedIdx = list.length - 1;
+    slashMenu.replaceChildren();
+    list.forEach((item, idx) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = `slash-command-item${idx === slashSelectedIdx ? ' selected' : ''}`;
+      const nameEl = document.createElement('span');
+      nameEl.className = 'slash-command-name';
+      nameEl.textContent = item.command;
+      const descEl = document.createElement('span');
+      descEl.className = 'slash-command-desc';
+      descEl.textContent = item.description;
+      const badgeEl = document.createElement('span');
+      badgeEl.className = 'slash-command-badge';
+      badgeEl.textContent = item.category === 'skill' ? 'SKILL' : 'CMD';
+      btn.append(nameEl, descEl, badgeEl);
+      btn.onmousedown = event => {
+        event.preventDefault();
+        applySlashItem(item);
+      };
+      slashMenu.append(btn);
+    });
+    slashMenu.hidden = false;
+  }
+
+  $('.conversation-compose').addEventListener('submit', event => { event.preventDefault(); slashMenu.hidden = true; void send(); }, events);
+  input.addEventListener('input', () => {
+    updateControls();
+    if (input.value.startsWith('/')) {
+      void ensureSlashLoaded();
+      renderSlashPalette();
+    } else {
+      slashMenu.hidden = true;
+    }
+  }, events);
   input.addEventListener('compositionstart', () => { composing = true; }, events);
-  input.addEventListener('compositionend', () => { composing = false; }, events);
-  input.addEventListener('keydown', event => { if (event.key === 'Enter' && !event.shiftKey && !event.isComposing && !composing && event.keyCode !== 229) { event.preventDefault(); void send(); } }, events);
+  input.addEventListener('compositionend', () => { composing = false; compositionEndedAt = performance.now(); }, events);
+  input.addEventListener('keydown', event => {
+    if (event.isComposing || composing || event.keyCode === 229 || performance.now() - compositionEndedAt < 35) return;
+    if (!slashMenu.hidden) {
+      const list = filteredSlashCommands();
+      if (list.length > 0) {
+        if (event.key === 'ArrowDown') {
+          event.preventDefault();
+          slashSelectedIdx = (slashSelectedIdx + 1) % list.length;
+          renderSlashPalette();
+          return;
+        }
+        if (event.key === 'ArrowUp') {
+          event.preventDefault();
+          slashSelectedIdx = (slashSelectedIdx - 1 + list.length) % list.length;
+          renderSlashPalette();
+          return;
+        }
+        if (event.key === 'Tab') {
+          event.preventDefault();
+          const chosen = list[slashSelectedIdx] ?? list[0];
+          if (chosen) {
+            input.value = `${chosen.command} `;
+            slashMenu.hidden = true;
+            updateControls();
+          }
+          return;
+        }
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          slashMenu.hidden = true;
+          return;
+        }
+        if (event.key === 'Enter' && !event.shiftKey) {
+          const chosen = list[slashSelectedIdx] ?? list[0];
+          if (chosen && chosen.command.toLowerCase() !== input.value.trim().toLowerCase()) {
+            event.preventDefault();
+            applySlashItem(chosen);
+            return;
+          }
+          slashMenu.hidden = true;
+        }
+      }
+    }
+    if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); slashMenu.hidden = true; void send(); }
+  }, events);
   search.addEventListener('input', () => { if (!searchComposing) { searchQuery = search.value.trim().toLocaleLowerCase(); selectedMatch = ''; updateSearch(); } }, events);
   search.addEventListener('compositionstart', () => { searchComposing = true; }, events);
   search.addEventListener('compositionend', () => { searchComposing = false; searchQuery = search.value.trim().toLocaleLowerCase(); selectedMatch = ''; updateSearch(); }, events);

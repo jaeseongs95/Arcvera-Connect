@@ -179,6 +179,12 @@ test('mobile viewport (390x844) renders dedicated mobile UI with slide-over draw
     const secondCardBox = await page.locator('.terminal-card:visible').boundingBox();
     expect(secondCardBox).not.toBeNull();
     expect(secondCardBox!.height).toBeGreaterThan(300);
+
+    // D-0005: Mobile touch swipe on .terminal-host scrolls xterm viewport smoothly
+    const touchAction = await page.locator('.terminal-card:visible .terminal-host').evaluate(
+      el => getComputedStyle(el).touchAction,
+    );
+    expect(touchAction).toBe('pan-y');
   } finally {
     await remote.close();
     fs.rmSync(tmpRoot, { recursive: true, force: true });
@@ -428,6 +434,43 @@ test('relay + host connector mode renders mirrored desktop terminal rollout on i
     await page.keyboard.type('원격 입력 테스트');
     await page.keyboard.press('Enter');
     await expect(card.locator('.xterm-rows')).toContainText('E2E 릴레이 응답: 원격 입력 테스트');
+
+    // D-0004: Typing '/' in remote terminal opens the slash command autocomplete menu and executes '/status'
+    await card.locator('.xterm-helper-textarea').focus();
+    await page.keyboard.type('/stat');
+    const slashMenu = card.locator('.slash-command-menu');
+    await expect(slashMenu).toBeVisible();
+    await expect(slashMenu.locator('.slash-command-name', { hasText: '/status' })).toBeVisible();
+    await page.keyboard.press('Enter');
+    await expect(slashMenu).toBeHidden();
+    await expect(card.locator('.xterm-rows')).toContainText('세션 상태:');
+
+    // D-0007: Korean IME composition (compositionstart -> compositionupdate -> compositionend) does not duplicate intermediate jamo
+    const helperTextarea = card.locator('.xterm-helper-textarea');
+    await helperTextarea.evaluate((el: HTMLTextAreaElement) => {
+      el.focus();
+      el.dispatchEvent(new CompositionEvent('compositionstart', { data: '' }));
+      el.dispatchEvent(new CompositionEvent('compositionupdate', { data: 'ㅎ' }));
+      el.dispatchEvent(new CompositionEvent('compositionupdate', { data: '하' }));
+      el.dispatchEvent(new CompositionEvent('compositionupdate', { data: '한' }));
+      el.value = '한';
+      el.dispatchEvent(new CompositionEvent('compositionend', { data: '한' }));
+      el.dispatchEvent(new InputEvent('input', { data: '한', isComposing: false }));
+    });
+    await page.keyboard.type('글');
+    await page.keyboard.press('Enter');
+    await expect(card.locator('.xterm-rows')).toContainText('E2E 릴레이 응답: 한글');
+
+    // D-0006: Session Library ('세션 불러오기') dialog loads sessions for selected project without hanging
+    await page.locator('#catalog-open').click();
+    const catalogDialog = page.locator('#catalog-dialog');
+    await expect(catalogDialog).toBeVisible();
+    await expect(catalogDialog.locator('#catalog-project option', { hasText: '개발자' })).toHaveCount(1);
+    await catalogDialog.locator('#catalog-project').selectOption({ label: '개발자' });
+    await expect(catalogDialog.locator('.catalog-row')).toHaveCount(1);
+    await expect(catalogDialog.locator('#catalog-list-status')).toContainText('1개 세션');
+    await catalogDialog.locator('#catalog-close').click();
+    await expect(catalogDialog).toBeHidden();
   } finally {
     await connector.close();
     await relay.close();

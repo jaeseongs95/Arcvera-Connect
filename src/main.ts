@@ -34,7 +34,29 @@ function stateLabels(state: string): [string, string] { return states[state] ?? 
 const sessions = new Map<string, Session>();
 interface QueuedInput { data: string; generation: number; selectionVersion: number }
 interface QueuedResize { generation: number; selectionVersion: number; cols: number; rows: number }
-const terminals = new Map<string, { terminal: Terminal; fit: FitAddon; search: SearchAddon; card: HTMLElement; observer: ResizeObserver; links: ReturnType<typeof installTerminalExternalLinks>; input: TerminalInputQueue<QueuedInput>; resize: TerminalResizeQueue<QueuedResize>; inputWarning: boolean; localLineBuffer: string; resizeTimer?: ReturnType<typeof setTimeout> }>();
+interface SlashCommandItem { command: string; description: string; category?: string; action?: string; skillPath?: string }
+interface TerminalView {
+  terminal: Terminal;
+  fit: FitAddon;
+  search: SearchAddon;
+  card: HTMLElement;
+  observer: ResizeObserver;
+  links: ReturnType<typeof installTerminalExternalLinks>;
+  input: TerminalInputQueue<QueuedInput>;
+  resize: TerminalResizeQueue<QueuedResize>;
+  inputWarning: boolean;
+  localLineBuffer: string;
+  composing: boolean;
+  compositionText: string;
+  lastCommittedComposition: string;
+  lastCommittedAt: number;
+  slashMenu: HTMLElement;
+  slashItems: SlashCommandItem[];
+  slashSelectedIndex: number;
+  slashLoadedCwd?: string;
+  resizeTimer?: ReturnType<typeof setTimeout>;
+}
+const terminals = new Map<string, TerminalView>();
 const conversations = new Map<string, ReturnType<typeof createConversation>>();
 const conversationOwners = new Set<string>();
 const contextControls = new Map<string, ReturnType<typeof createContextControls>>();
@@ -88,6 +110,95 @@ let nativeWindowVisible = true;
 
 const remoteMode = isRemoteBrowser();
 if (remoteMode) document.title = 'OpenDIY Remote';
+if (typeof document !== 'undefined' && document.head && !document.getElementById('opendiy-remote-ui-styles')) {
+  const extraStyle = document.createElement('style');
+  extraStyle.id = 'opendiy-remote-ui-styles';
+  extraStyle.textContent = `
+    .terminal-card { position: relative; }
+    .terminal-host, .terminal-host .xterm, .terminal-host .xterm-viewport, .terminal-host .xterm-screen {
+      touch-action: pan-y;
+      -webkit-overflow-scrolling: touch;
+    }
+    .conversation-messages, .conversation-requests, #catalog-list, #catalog-selected {
+      touch-action: pan-y;
+      -webkit-overflow-scrolling: touch;
+      overscroll-behavior: contain;
+    }
+    .slash-command-menu {
+      position: absolute;
+      left: 12px;
+      right: 12px;
+      bottom: 32px;
+      max-height: 220px;
+      overflow-y: auto;
+      background: #1a202c;
+      border: 1px solid #5a4b7c;
+      border-radius: 8px;
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.65);
+      z-index: 45;
+      padding: 6px;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      touch-action: pan-y;
+      -webkit-overflow-scrolling: touch;
+    }
+    .conversation-compose { position: relative; }
+    .conversation-compose .slash-command-menu {
+      left: 0;
+      right: 0;
+      bottom: calc(100% + 6px);
+    }
+    .slash-command-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      width: 100%;
+      padding: 7px 10px;
+      border-radius: 5px;
+      text-align: left;
+      font-size: 11px;
+      color: #dce1eb;
+      background: transparent;
+      border: 0;
+      cursor: pointer;
+    }
+    .slash-command-item:hover, .slash-command-item.selected {
+      background: #322846;
+      color: #f0e8ff;
+    }
+    .slash-command-name {
+      font-family: "Cascadia Code", Consolas, monospace;
+      font-weight: 600;
+      color: #c4b5fd;
+      white-space: nowrap;
+    }
+    .slash-command-desc {
+      flex: 1;
+      color: #9aa6be;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 10px;
+    }
+    .slash-command-badge {
+      font-size: 9px;
+      padding: 1px 5px;
+      border-radius: 4px;
+      background: #283044;
+      color: #8eaafb;
+      white-space: nowrap;
+    }
+    @media (max-width: 768px) {
+      .terminal-card:not([hidden]) { min-height: 0 !important; }
+      .terminal-host { min-height: 0 !important; }
+      .conversation-host { overflow-y: auto !important; }
+      .conversation-messages { min-height: 120px !important; }
+    }
+  `;
+  document.head.append(extraStyle);
+}
 if (native) $('#app').hidden = true;
 $('#app').setAttribute('aria-busy', 'true');
 $('#app').innerHTML = `
@@ -519,25 +630,203 @@ function refreshInputState(id: string) {
 function inputError(error: unknown) {
   return error instanceof InputQueueError ? new UiError(error.reason === 'message' ? '한 번에 64KiB 이하로 입력하세요. 이 입력은 전송하지 않았습니다.' : error.reason === 'full' ? '입력 전송 대기열이 가득 찼습니다. 이 입력은 전송하지 않았습니다. 완료 후 다시 시도하세요.' : '대기 중 프로젝트 또는 세션 상태가 변경되어 전송하지 않았습니다.', error.reason === 'message' ? 'Input must be at most 64KiB per operation. This input was not sent.' : error.reason === 'full' ? 'The input queue is full. This input was not sent. Retry after pending writes finish.' : 'Not sent because the project or session state changed while queued.') : error;
 }
+function isWideTerminalChar(ch: string): boolean {
+  if (!ch) return false;
+  const cp = ch.codePointAt(0) ?? 0;
+  return (
+    (cp >= 0x1100 && cp <= 0x115f) ||
+    (cp >= 0x2e80 && cp <= 0xa4cf && cp !== 0x303f) ||
+    (cp >= 0xac00 && cp <= 0xd7a3) ||
+    (cp >= 0xf900 && cp <= 0xfaff) ||
+    (cp >= 0xfe10 && cp <= 0xfe6f) ||
+    (cp >= 0xff00 && cp <= 0xff60) ||
+    (cp >= 0xffe0 && cp <= 0xffe6)
+  );
+}
+function terminalDisplayCells(str: string): number {
+  let width = 0;
+  for (const ch of Array.from(str)) width += isWideTerminalChar(ch) ? 2 : 1;
+  return width;
+}
+function terminalEraseCells(cells: number): string {
+  return cells > 0 ? '\b \b'.repeat(cells) : '';
+}
+
+const DEFAULT_SLASH_COMMANDS: SlashCommandItem[] = [
+  { command: '/compact', description: '대화 컨텍스트를 요약·압축합니다', category: 'command', action: 'compact' },
+  { command: '/status', description: '현재 세션·모델·토큰 사용량 상태를 표시합니다', category: 'command', action: 'status' },
+  { command: '/model', description: '사용 가능한 모델 목록 또는 모델 변경 (/model <이름>)', category: 'command', action: 'model' },
+  { command: '/diff', description: '현재 작업 폴더의 Git 변경 사항(git status / diff)을 확인합니다', category: 'command', action: 'diff' },
+  { command: '/review', description: '현재 Git 변경 사항에 대한 코드 리뷰를 요청합니다', category: 'command', action: 'review' },
+  { command: '/clear', description: '터미널 화면을 지웁니다', category: 'command', action: 'clear' },
+  { command: '/conversation', description: '대화 보기 / 터미널 보기를 전환합니다', category: 'ui', action: 'conversation' },
+  { command: '/subagents', description: '서브에이전트 관리 창을 엽니다', category: 'ui', action: 'subagents' },
+  { command: '/cron', description: '예약 작업(Cron) 관리 창을 엽니다', category: 'ui', action: 'cron' },
+  { command: '/help', description: '사용 가능한 슬래시 명령어와 스킬 목록을 표시합니다', category: 'command', action: 'help' },
+];
+
+async function ensureSlashCommandsLoaded(id: string) {
+  const session = sessions.get(id);
+  const view = terminals.get(id);
+  if (!session || !view) return;
+  if (view.slashLoadedCwd === session.cwd && view.slashItems.length > 0) return;
+  view.slashLoadedCwd = session.cwd;
+  try {
+    const res = await call<{ commands?: SlashCommandItem[] }>('slash_commands_list', { id: session.id, cwd: session.cwd });
+    if (Array.isArray(res?.commands) && res.commands.length > 0) {
+      view.slashItems = res.commands;
+      renderSlashMenu(id);
+    }
+  } catch {
+    if (!view.slashItems.length) view.slashItems = [...DEFAULT_SLASH_COMMANDS];
+  }
+}
+
+function getFilteredSlashItems(view: TerminalView): SlashCommandItem[] {
+  const buf = view.localLineBuffer;
+  if (!buf.startsWith('/')) return [];
+  const firstSpace = buf.indexOf(' ');
+  if (firstSpace !== -1) return [];
+  const q = buf.toLowerCase();
+  const source = view.slashItems.length > 0 ? view.slashItems : DEFAULT_SLASH_COMMANDS;
+  return source.filter(item => item.command.toLowerCase().startsWith(q) || item.description.toLowerCase().includes(q.slice(1))).slice(0, 20);
+}
+
+function hideSlashMenu(id: string) {
+  const view = terminals.get(id);
+  if (!view) return;
+  view.slashMenu.hidden = true;
+}
+
+function applySlashCommandSelection(id: string, item: SlashCommandItem) {
+  const session = sessions.get(id);
+  const view = terminals.get(id);
+  if (!session || !view) return;
+  const oldCells = terminalDisplayCells(view.localLineBuffer) + terminalDisplayCells(view.compositionText);
+  view.localLineBuffer = '';
+  view.compositionText = '';
+  if (oldCells > 0) view.terminal.write(terminalEraseCells(oldCells));
+  hideSlashMenu(id);
+
+  if (item.action === 'clear') {
+    view.terminal.write('\x1b[2J\x1b[H\x1b[38;5;141m›\x1b[0m ');
+    return;
+  }
+  if (item.action === 'conversation') {
+    view.card.querySelector<HTMLButtonElement>('.conversation-toggle')?.click();
+    return;
+  }
+  if (item.action === 'subagents') {
+    view.card.querySelector<HTMLButtonElement>('.subagents-open')?.click();
+    return;
+  }
+  if (item.action === 'cron') {
+    view.card.querySelector<HTMLButtonElement>('.cron-open')?.click();
+    return;
+  }
+  if (item.category === 'skill') {
+    const nextBuf = `${item.command} `;
+    view.localLineBuffer = nextBuf;
+    view.terminal.write(nextBuf);
+    return;
+  }
+  view.terminal.write(`${item.command}\r\n`);
+  void view.input.enqueue({ data: `${item.command}\r`, generation: session.generation, selectionVersion: projectSelectionVersion }).catch(() => {});
+}
+
+function renderSlashMenu(id: string) {
+  const view = terminals.get(id);
+  if (!view || !remoteMode) return;
+  const filtered = getFilteredSlashItems(view);
+  if (filtered.length === 0) {
+    view.slashMenu.hidden = true;
+    return;
+  }
+  if (view.slashSelectedIndex >= filtered.length) view.slashSelectedIndex = 0;
+  if (view.slashSelectedIndex < 0) view.slashSelectedIndex = filtered.length - 1;
+  view.slashMenu.replaceChildren();
+  filtered.forEach((item, idx) => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = `slash-command-item${idx === view.slashSelectedIndex ? ' selected' : ''}`;
+    const nameEl = document.createElement('span');
+    nameEl.className = 'slash-command-name';
+    nameEl.textContent = item.command;
+    const descEl = document.createElement('span');
+    descEl.className = 'slash-command-desc';
+    descEl.textContent = item.description;
+    const badgeEl = document.createElement('span');
+    badgeEl.className = 'slash-command-badge';
+    badgeEl.textContent = item.category === 'skill' ? 'SKILL' : item.category === 'ui' ? 'UI' : 'CMD';
+    btn.append(nameEl, descEl, badgeEl);
+    btn.onmousedown = event => {
+      event.preventDefault();
+      applySlashCommandSelection(id, item);
+      view.terminal.focus();
+    };
+    view.slashMenu.append(btn);
+  });
+  view.slashMenu.hidden = false;
+  const selectedEl = view.slashMenu.children[view.slashSelectedIndex] as HTMLElement | undefined;
+  selectedEl?.scrollIntoView({ block: 'nearest' });
+}
+
 function sendInput(id: string, data: string) {
   const session = sessions.get(id); const view = terminals.get(id);
   if (!session || !view || !canType(id) || conversationOwners.has(id)) return;
   if (remoteMode && session.lineBufferedInput) {
+    if (view.composing && !data.includes('\r') && !data.includes('\n') && !data.includes('\u0003')) {
+      return;
+    }
+    if (
+      view.lastCommittedComposition &&
+      data === view.lastCommittedComposition &&
+      performance.now() - view.lastCommittedAt < 180
+    ) {
+      view.lastCommittedComposition = '';
+      return;
+    }
     let localEcho = '';
     let dispatchPayload = '';
-    for (const ch of data) {
+    for (const ch of Array.from(data)) {
       if (ch === '\u0003') {
         view.localLineBuffer = '';
+        view.compositionText = '';
+        hideSlashMenu(id);
         dispatchPayload += '\u0003';
       } else if (ch === '\u007f' || ch === '\b') {
-        if (view.localLineBuffer.length > 0) {
-          view.localLineBuffer = Array.from(view.localLineBuffer).slice(0, -1).join('');
-          localEcho += '\b \b';
+        const chars = Array.from(view.localLineBuffer);
+        if (chars.length > 0) {
+          const popped = chars.pop()!;
+          view.localLineBuffer = chars.join('');
+          localEcho += terminalEraseCells(isWideTerminalChar(popped) ? 2 : 1);
         }
       } else if (ch === '\r' || ch === '\n') {
         const line = view.localLineBuffer;
         view.localLineBuffer = '';
+        view.compositionText = '';
+        hideSlashMenu(id);
         localEcho += '\r\n';
+        const trimmedLine = line.trim();
+        if (trimmedLine === '/clear') {
+          view.terminal.write('\x1b[2J\x1b[H\x1b[38;5;141m›\x1b[0m ');
+          return;
+        }
+        if (trimmedLine === '/conversation') {
+          view.terminal.write(localEcho);
+          view.card.querySelector<HTMLButtonElement>('.conversation-toggle')?.click();
+          return;
+        }
+        if (trimmedLine === '/subagents') {
+          view.terminal.write(localEcho);
+          view.card.querySelector<HTMLButtonElement>('.subagents-open')?.click();
+          return;
+        }
+        if (trimmedLine === '/cron') {
+          view.terminal.write(localEcho);
+          view.card.querySelector<HTMLButtonElement>('.cron-open')?.click();
+          return;
+        }
         dispatchPayload += `${line}\r`;
       } else if (ch >= ' ') {
         view.localLineBuffer += ch;
@@ -546,6 +835,12 @@ function sendInput(id: string, data: string) {
     }
     if (localEcho) {
       view.terminal.write(localEcho);
+    }
+    if (view.localLineBuffer.startsWith('/')) {
+      void ensureSlashCommandsLoaded(id);
+      renderSlashMenu(id);
+    } else {
+      hideSlashMenu(id);
     }
     if (!dispatchPayload) return;
     data = dispatchPayload;
@@ -637,12 +932,157 @@ function createTerminal(session: Session) {
     if (!current || value.selectionVersion !== projectSelectionVersion || current.generation !== value.generation || !canType(session.id)) return;
     await call('session_resize', { id: session.id, generation: value.generation, cols: value.cols, rows: value.rows });
   }, error => notifyError('터미널 크기 변경 실패', 'Could not resize terminal', error));
-  terminals.set(session.id, { terminal, fit, search, card, observer, links, input, resize, inputWarning: false, localLineBuffer: '' });
+  const slashMenu = document.createElement('div');
+  slashMenu.className = 'slash-command-menu';
+  slashMenu.setAttribute('role', 'listbox');
+  slashMenu.setAttribute('aria-label', '슬래시 명령어 목록');
+  slashMenu.hidden = true;
+  card.append(slashMenu);
+  const viewObj: TerminalView = {
+    terminal,
+    fit,
+    search,
+    card,
+    observer,
+    links,
+    input,
+    resize,
+    inputWarning: false,
+    localLineBuffer: '',
+    composing: false,
+    compositionText: '',
+    lastCommittedComposition: '',
+    lastCommittedAt: 0,
+    slashMenu,
+    slashItems: [...DEFAULT_SLASH_COMMANDS],
+    slashSelectedIndex: 0,
+  };
+  terminals.set(session.id, viewObj);
   refreshInputState(session.id);
   mountConversation(session);
   terminal.onData(data => sendInput(session.id, data));
   terminal.onResize(() => queueResize(session.id));
+
+  const termHost = card.querySelector<HTMLElement>('.terminal-host')!;
+  const xtermTextarea = termHost.querySelector<HTMLTextAreaElement>('textarea.xterm-helper-textarea');
+  if (xtermTextarea) {
+    xtermTextarea.addEventListener('compositionstart', () => {
+      const current = sessions.get(session.id);
+      if (!remoteMode || !current?.lineBufferedInput || !canType(session.id) || conversationOwners.has(session.id)) return;
+      viewObj.composing = true;
+      viewObj.compositionText = '';
+    });
+    xtermTextarea.addEventListener('compositionupdate', (event: CompositionEvent) => {
+      const current = sessions.get(session.id);
+      if (!remoteMode || !current?.lineBufferedInput || !canType(session.id) || conversationOwners.has(session.id)) return;
+      viewObj.composing = true;
+      const nextText = String(event.data ?? '');
+      const prevCells = terminalDisplayCells(viewObj.compositionText);
+      viewObj.compositionText = nextText;
+      if (prevCells > 0 || nextText) {
+        terminal.write(terminalEraseCells(prevCells) + nextText);
+      }
+    });
+    xtermTextarea.addEventListener('compositionend', (event: CompositionEvent) => {
+      const current = sessions.get(session.id);
+      if (!remoteMode || !current?.lineBufferedInput || !canType(session.id) || conversationOwners.has(session.id)) {
+        viewObj.composing = false;
+        viewObj.compositionText = '';
+        return;
+      }
+      const prevCells = terminalDisplayCells(viewObj.compositionText);
+      const committed = String(event.data ?? '');
+      viewObj.composing = false;
+      viewObj.compositionText = '';
+      viewObj.lastCommittedComposition = committed;
+      viewObj.lastCommittedAt = performance.now();
+      if (prevCells > 0 || committed) {
+        terminal.write(terminalEraseCells(prevCells) + committed);
+      }
+      if (committed) {
+        viewObj.localLineBuffer += committed;
+        if (viewObj.localLineBuffer.startsWith('/')) {
+          void ensureSlashCommandsLoaded(session.id);
+          renderSlashMenu(session.id);
+        } else {
+          hideSlashMenu(session.id);
+        }
+      }
+    });
+  }
+
+  let touchLastY = 0;
+  let touchRemainder = 0;
+  let touchActive = false;
+  termHost.addEventListener('touchstart', (event: TouchEvent) => {
+    if (event.touches.length === 1) {
+      touchLastY = event.touches[0].clientY;
+      touchRemainder = 0;
+      touchActive = true;
+    } else {
+      touchActive = false;
+    }
+  }, { passive: true });
+  termHost.addEventListener('touchmove', (event: TouchEvent) => {
+    if (!touchActive || event.touches.length !== 1) return;
+    const currentY = event.touches[0].clientY;
+    const dy = touchLastY - currentY + touchRemainder;
+    const lineHeightPx = 18;
+    const lines = dy > 0 ? Math.floor(dy / lineHeightPx) : Math.ceil(dy / lineHeightPx);
+    if (lines !== 0) {
+      terminal.scrollLines(lines);
+      touchRemainder = dy - lines * lineHeightPx;
+      touchLastY = currentY;
+      if (event.cancelable) event.preventDefault();
+    }
+  }, { passive: false });
+  termHost.addEventListener('touchend', () => { touchActive = false; touchRemainder = 0; }, { passive: true });
+  termHost.addEventListener('touchcancel', () => { touchActive = false; touchRemainder = 0; }, { passive: true });
+
   terminal.attachCustomKeyEventHandler(event => {
+    if (event.type === 'keydown' && !viewObj.slashMenu.hidden && !event.isComposing && event.keyCode !== 229) {
+      const filtered = getFilteredSlashItems(viewObj);
+      if (filtered.length > 0) {
+        if (event.key === 'ArrowDown') {
+          event.preventDefault();
+          viewObj.slashSelectedIndex = (viewObj.slashSelectedIndex + 1) % filtered.length;
+          renderSlashMenu(session.id);
+          return false;
+        }
+        if (event.key === 'ArrowUp') {
+          event.preventDefault();
+          viewObj.slashSelectedIndex = (viewObj.slashSelectedIndex - 1 + filtered.length) % filtered.length;
+          renderSlashMenu(session.id);
+          return false;
+        }
+        if (event.key === 'Tab') {
+          event.preventDefault();
+          const chosen = filtered[viewObj.slashSelectedIndex] ?? filtered[0];
+          if (chosen) {
+            const oldCells = terminalDisplayCells(viewObj.localLineBuffer);
+            const completed = `${chosen.command} `;
+            viewObj.localLineBuffer = completed;
+            terminal.write(terminalEraseCells(oldCells) + completed);
+            hideSlashMenu(session.id);
+          }
+          return false;
+        }
+        if (event.key === 'Enter' && !event.shiftKey) {
+          event.preventDefault();
+          const chosen = filtered[viewObj.slashSelectedIndex] ?? filtered[0];
+          if (chosen && chosen.command.toLowerCase() !== viewObj.localLineBuffer.trim().toLowerCase()) {
+            applySlashCommandSelection(session.id, chosen);
+            return false;
+          }
+          hideSlashMenu(session.id);
+        }
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          hideSlashMenu(session.id);
+          return false;
+        }
+      }
+    }
     // Let the browser dispatch xterm's native copy/paste events, rather than
     // translating Ctrl+C/Ctrl+V to CLI control characters. Unselected Ctrl+C
     // still interrupts the CLI; paste keeps xterm's bracketed-paste handling.

@@ -71,6 +71,7 @@ export const RELAY_COMMAND_ALLOWLIST = Object.freeze([
   'choose_skill_folder',
   'choose_project',
   'list_directory',
+  'slash_commands_list',
 ]);
 
 export const RELAY_BLOCKED_COMMANDS = Object.freeze([
@@ -831,7 +832,7 @@ function readCodexRolloutSummary(threadId, customCodexHome = null) {
         const modelLabel = out.model ? out.model.replace(/^gpt-6\.1-sol$/i, 'GPT-6.1-Sol') : 'Codex';
         const effortLabel = out.effort || 'high';
         const winK = Math.round((out.modelContextWindow || 380000) / 1000);
-        const tailLines = terminalLines.slice(-60);
+        const tailLines = terminalLines.slice(-250);
         tailLines.push('');
         tailLines.push('\x1b[38;5;141m›\x1b[0m \x1b[90mAsk Codex to do anything\x1b[0m');
         tailLines.push(
@@ -1153,13 +1154,14 @@ export function createRemoteServer(options = {}) {
     .createHash('sha256')
     .update(rawToken.trim() || rawHostSecret.trim() || googleClientSecret || crypto.randomBytes(32))
     .digest();
-  const oauthStates = new Map(); // state -> expiresAtUnixMs
+  const oauthStates = new Map(); // state -> { exp: number, cliSessionId: string | null }
+  const cliOAuthSessions = new Map(); // cliSessionId -> { status: 'pending' | 'authenticated', token?: string, email?: string, exp: number }
 
-  function signOAuthSessionToken(email) {
+  function signOAuthSessionToken(email, ttlMs = 7 * 24 * 60 * 60 * 1000) {
     const payload = Buffer.from(
       JSON.stringify({
         email: String(email).toLowerCase(),
-        exp: Date.now() + 7 * 24 * 60 * 60 * 1000,
+        exp: Date.now() + ttlMs,
       }),
       'utf8',
     ).toString('base64url');
@@ -1188,7 +1190,57 @@ export function createRemoteServer(options = {}) {
 
   function isClientCredentialValid(provided) {
     if (verifyOAuthSessionToken(provided)) return true;
+    if (!tokenSha256 && googleOAuthEnabled) return false;
     return verifyToken(tokenSha256, provided);
+  }
+
+  function isHostCredentialValid(provided) {
+    if (verifyOAuthSessionToken(provided)) return true;
+    if (!hostSecretSha256 && googleOAuthEnabled) return false;
+    return verifyToken(hostSecretSha256, provided);
+  }
+
+  function renderCliOAuthSuccessPage(email) {
+    const safeEmail = String(email).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return `<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OpenDIY Remote — 호스트 커넥터 인증 완료</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+      background: #0b0f17; color: #e5e7eb; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      padding: 20px;
+    }
+    .card {
+      width: 100%; max-width: 420px; background: #151c28; border: 1px solid #263248;
+      border-radius: 14px; padding: 28px 24px; box-shadow: 0 20px 50px rgba(0,0,0,0.5); text-align: center;
+    }
+    .badge {
+      display: inline-flex; align-items: center; justify-content: center; width: 48px; height: 48px;
+      border-radius: 50%; background: rgba(52, 211, 153, 0.16); color: #34d399; font-size: 24px; margin-bottom: 14px;
+    }
+    h1 { margin: 0 0 8px; font-size: 19px; font-weight: 700; color: #f9fafb; }
+    p { margin: 0 0 18px; font-size: 13.5px; color: #9ca3af; line-height: 1.55; }
+    .btn {
+      display: inline-block; width: 100%; padding: 11px 14px; border-radius: 8px;
+      background: #2563eb; color: #fff; font-size: 14px; font-weight: 600; text-decoration: none;
+    }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <div class="badge" aria-hidden="true">✓</div>
+    <h1>로컬 PC 호스트 인증 완료</h1>
+    <p><strong>${safeEmail}</strong> 계정으로 로컬 PC(Host Connector)가 인증되었습니다.<br/>터미널 창에서 자동으로 중계 서버 연결이 시작됩니다. 이 탭을 닫으거나 원격 작업 공간으로 이동하세요.</p>
+    <a class="btn" href="/">원격 작업 공간 열기</a>
+  </main>
+</body>
+</html>`;
   }
 
   function renderAuthGatePage({ errorMsg = '' } = {}) {
@@ -2125,9 +2177,45 @@ export function createRemoteServer(options = {}) {
       return { attached: false };
     }
 
+    if (type === 'slashCommands') {
+      return buildSlashCommandsList(session.cwd);
+    }
+
     if (type === 'send') {
-      const text = String(request.text ?? request.prompt ?? '').trim();
+      let text = String(request.text ?? request.prompt ?? '').trim();
       if (!text) throw new Error('전송할 메시지를 입력하세요.');
+      if (text.startsWith('/')) {
+        const slashRes = await executeServerSlashCommand(session, text, { emitToTerminal: !sessionProcesses.has(session.id) });
+        if (slashRes.handled) {
+          const turnId = `slash-${crypto.randomUUID()}`;
+          const turnItems = [
+            normalizeConversationItem({ id: `u-${turnId}`, type: 'userMessage', role: 'user', text, status: 'completed' }, 0, turnId),
+            ...(slashRes.outputText
+              ? [normalizeConversationItem({ id: `a-${turnId}`, type: 'agentMessage', role: 'assistant', text: slashRes.outputText, status: 'completed' }, 1, turnId)]
+              : []),
+          ];
+          const turn = {
+            id: turnId,
+            status: 'completed',
+            createdAt: Math.floor(Date.now() / 1000),
+            items: turnItems,
+          };
+          thread.turns = thread.turns || [];
+          thread.turns.push(turn);
+          thread.updatedAt = Math.floor(Date.now() / 1000);
+          return {
+            turnId,
+            turn: { id: turnId, status: 'completed' },
+            status: 'completed',
+            turns: thread.turns.slice(-20),
+            items: turn.items,
+            slashHandled: true,
+          };
+        }
+        if (slashRes.rewrittenPrompt) {
+          text = slashRes.rewrittenPrompt;
+        }
+      }
       const inputItems = [{ type: 'text', text }];
       if (Array.isArray(request.attachments)) {
         for (const att of request.attachments) {
@@ -2330,6 +2418,268 @@ export function createRemoteServer(options = {}) {
     }
 
     throw new Error(`지원하지 않는 대화 요청 유형입니다: ${type}`);
+  }
+
+  function buildSlashCommandsList(cwd) {
+    const builtins = [
+      {
+        command: '/compact',
+        titleKo: '컨텍스트 압축',
+        titleEn: 'Compact context',
+        descriptionKo: '현재 대화 컨텍스트를 요약·압축하여 토큰 여유 공간을 확보합니다.',
+        descriptionEn: 'Summarize and compact the current conversation context.',
+        category: 'builtin',
+        action: 'compact',
+      },
+      {
+        command: '/status',
+        titleKo: '세션·모델·컨텍스트 상태',
+        titleEn: 'Session, model & context status',
+        descriptionKo: '현재 세션의 모델, 추론 수준, 토큰 사용량, 작업 경로 및 연결 상태를 표시합니다.',
+        descriptionEn: 'Show current model, reasoning effort, token usage, working directory, and connection status.',
+        category: 'builtin',
+        action: 'status',
+      },
+      {
+        command: '/model',
+        titleKo: '모델 및 추론 수준 확인·변경',
+        titleEn: 'Show or switch model & reasoning effort',
+        descriptionKo: '현재 모델/추론 수준을 확인하거나 변경합니다 (예: /model gpt-5.4 high).',
+        descriptionEn: 'View or switch model and reasoning effort (e.g., /model gpt-5.4 high).',
+        category: 'builtin',
+        action: 'model',
+      },
+      {
+        command: '/diff',
+        titleKo: 'Git 변경 요약 확인',
+        titleEn: 'Show Git status & diff summary',
+        descriptionKo: '현재 작업 폴더의 git status 및 git diff --stat 요약을 출력합니다.',
+        descriptionEn: 'Display git status and git diff --stat for the session working folder.',
+        category: 'builtin',
+        action: 'diff',
+      },
+      {
+        command: '/review',
+        titleKo: '현재 변경사항 코드 리뷰',
+        titleEn: 'Review current changes',
+        descriptionKo: '작업 폴더의 변경 사항에 대해 코드 리뷰를 요청합니다.',
+        descriptionEn: 'Start a code review turn for the current working directory changes.',
+        category: 'builtin',
+        action: 'review',
+      },
+      {
+        command: '/clear',
+        titleKo: '터미널 화면 지우기',
+        titleEn: 'Clear terminal display',
+        descriptionKo: '현재 터미널 출력 화면을 깨끗하게 지웁니다.',
+        descriptionEn: 'Clear the current terminal screen.',
+        category: 'builtin',
+        action: 'clear',
+      },
+      {
+        command: '/conversation',
+        titleKo: '대화 / 터미널 화면 전환',
+        titleEn: 'Toggle conversation / terminal view',
+        descriptionKo: '구조화 대화 화면과 터미널 화면을 전환합니다.',
+        descriptionEn: 'Switch between structured conversation view and terminal view.',
+        category: 'ui',
+        action: 'conversation',
+      },
+      {
+        command: '/subagents',
+        titleKo: '서브에이전트 관리',
+        titleEn: 'Manage subagents',
+        descriptionKo: '이 세션의 서브에이전트 관리 창을 엽니다.',
+        descriptionEn: 'Open the subagent management dialog for this session.',
+        category: 'ui',
+        action: 'subagents',
+      },
+      {
+        command: '/cron',
+        titleKo: '예약 작업 (Cron) 관리',
+        titleEn: 'Manage scheduled jobs (Cron)',
+        descriptionKo: '이 세션의 반복·예약 작업(Cron) 설정 창을 엽니다.',
+        descriptionEn: 'Open the scheduled jobs (Cron) dialog for this session.',
+        category: 'ui',
+        action: 'cron',
+      },
+      {
+        command: '/help',
+        titleKo: '슬래시 명령어 및 스킬 목록',
+        titleEn: 'List slash commands & skills',
+        descriptionKo: '사용 가능한 모든 슬래시(/) 명령어와 설치된 스킬 목록을 출력합니다.',
+        descriptionEn: 'Display all available slash commands and installed skills.',
+        category: 'builtin',
+        action: 'help',
+      },
+    ];
+    const builtinsWithDesc = builtins.map(b => ({
+      description: b.descriptionKo,
+      title: b.titleKo,
+      ...b,
+    }));
+    const ext = scanCodexExtensions(cwd || null, computeSettings().resolvedPath);
+    const seen = new Set(builtins.map(b => b.command));
+    const skills = [];
+    for (const sk of ext.skills || []) {
+      if (!sk || !sk.name) continue;
+      const cmd = `/${String(sk.name).trim().replace(/^\/+/, '')}`;
+      if (seen.has(cmd)) continue;
+      seen.add(cmd);
+      skills.push({
+        command: cmd,
+        title: `${sk.name} (${sk.scope === 'project' ? '프로젝트 스킬' : '사용자 스킬'})`,
+        titleKo: `${sk.name} (${sk.scope === 'project' ? '프로젝트 스킬' : '사용자 스킬'})`,
+        titleEn: `${sk.name} (${sk.scope === 'project' ? 'Project skill' : 'User skill'})`,
+        description: sk.description || `${sk.name} 스킬을 호출합니다.`,
+        descriptionKo: sk.description || `${sk.name} 스킬을 호출합니다.`,
+        descriptionEn: sk.description || `Invoke the ${sk.name} skill.`,
+        category: 'skill',
+        action: 'skill',
+        skillName: sk.name,
+      });
+    }
+    return { commands: [...builtinsWithDesc, ...skills] };
+  }
+
+  async function executeServerSlashCommand(session, rawText, { emitToTerminal = true } = {}) {
+    const trimmed = String(rawText || '').trim();
+    if (!trimmed.startsWith('/')) return { handled: false };
+    const spaceIdx = trimmed.indexOf(' ');
+    const cmd = (spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx)).toLowerCase();
+    const rest = spaceIdx === -1 ? '' : trimmed.slice(spaceIdx + 1).trim();
+    const thread = (session.threadId && state.threads[session.threadId]) || {
+      id: session.threadId || 'local',
+      title: session.title,
+      cwd: session.cwd,
+      model: null,
+      effort: null,
+      modelContextWindow: 128000,
+      effectiveContextWindow: 128000,
+      usedTokens: 0,
+      turns: [],
+    };
+
+    const writeTerm = text => {
+      if (!emitToTerminal) return;
+      const formatted = text
+        .split(/\r?\n/)
+        .map(line => `\x1b[38;5;252m${line}\x1b[0m`)
+        .join('\r\n');
+      emitTerminalOutput(session, `${formatted}\r\n\x1b[38;5;141m›\x1b[0m `);
+    };
+
+    if (cmd === '/' || cmd === '/help') {
+      const { commands } = buildSlashCommandsList(session.cwd);
+      const builtins = commands.filter(c => c.category !== 'skill');
+      const skills = commands.filter(c => c.category === 'skill');
+      const lines = [
+        '• 사용 가능한 슬래시(/) 명령어:',
+        ...builtins.map(c => `  ${c.command.padEnd(16, ' ')} ${c.titleKo} — ${c.descriptionKo}`),
+      ];
+      if (skills.length > 0) {
+        lines.push('');
+        lines.push(`• 설치된 스킬 (${skills.length}개):`);
+        for (const s of skills.slice(0, 25)) {
+          lines.push(`  ${s.command.padEnd(28, ' ')} ${String(s.descriptionKo).slice(0, 72)}`);
+        }
+      }
+      const outputText = lines.join('\n');
+      writeTerm(outputText);
+      return { handled: true, outputText };
+    }
+
+    if (cmd === '/clear') {
+      if (emitToTerminal) {
+        emitTerminalOutput(session, '\x1b[2J\x1b[H\x1b[38;5;141m›\x1b[0m ');
+      }
+      return { handled: true, outputText: '' };
+    }
+
+    if (cmd === '/status') {
+      const used = Number(thread.usedTokens || 0);
+      const win = Number(thread.modelContextWindow || 128000);
+      const pct = win > 0 ? Math.min(100, Math.round((used / win) * 100)) : 0;
+      const lines = [
+        `• 세션 상태: ${session.title} (${session.state})`,
+        `  작업 폴더 : ${session.cwd || '(미지정)'}`,
+        `  Thread ID : ${session.threadId || '(없음)'}`,
+        `  모델/추론 : ${thread.model || '기본값'} · ${thread.effort || '기본값'}`,
+        `  컨텍스트  : ${pct}% (${used.toLocaleString('ko-KR')} / ${win.toLocaleString('ko-KR')} 토큰)`,
+      ];
+      const outputText = lines.join('\n');
+      writeTerm(outputText);
+      return { handled: true, outputText };
+    }
+
+    if (cmd === '/model') {
+      if (rest) {
+        const parts = rest.split(/\s+/).filter(Boolean);
+        thread.model = parts[0];
+        if (parts[1]) thread.effort = parts[1];
+        persistState();
+        const msg = `• 다음 턴부터 모델 설정이 변경되었습니다: 모델=${thread.model}, 추론=${thread.effort || '기본값'}`;
+        writeTerm(msg);
+        return { handled: true, outputText: msg };
+      }
+      const msg = `• 현재 설정된 모델: ${thread.model || '기본값'} · 추론 수준: ${thread.effort || '기본값'} (변경 예: /model gpt-5.4 high)`;
+      writeTerm(msg);
+      return { handled: true, outputText: msg };
+    }
+
+    if (cmd === '/compact') {
+      try {
+        await appServerBridge.ensureStarted().catch(() => {});
+        if (appServerBridge.isConnected() && session.threadId) {
+          await appServerBridge.request('thread/compact/startIfIdle', { threadId: session.threadId });
+        }
+        const msg = '• 컨텍스트 압축(/compact)을 요청했습니다.';
+        writeTerm(msg);
+        return { handled: true, outputText: msg };
+      } catch (err) {
+        const msg = `• 컨텍스트 압축 요청 실패: ${err.message || err}`;
+        writeTerm(msg);
+        return { handled: true, outputText: msg };
+      }
+    }
+
+    if (cmd === '/diff') {
+      try {
+        const cwd = session.cwd && fs.existsSync(session.cwd) ? session.cwd : process.cwd();
+        const statusOut = execFileSync('git', ['status', '-s'], { cwd, encoding: 'utf8', timeout: 4000, windowsHide: true }).trim();
+        const diffOut = execFileSync('git', ['diff', '--stat'], { cwd, encoding: 'utf8', timeout: 4000, windowsHide: true }).trim();
+        const lines = [
+          `• Git 작업 트리 상태 (${cwd}):`,
+          statusOut ? statusOut : '  (변경된 파일 없음)',
+          ...(diffOut ? ['', '• Git Diff 요약:', diffOut] : []),
+        ];
+        const outputText = lines.join('\n');
+        writeTerm(outputText);
+        return { handled: true, outputText };
+      } catch (err) {
+        const msg = `• Git 상태를 조회할 수 없습니다: ${err.message || err}`;
+        writeTerm(msg);
+        return { handled: true, outputText: msg };
+      }
+    }
+
+    if (cmd === '/review') {
+      const rewrittenPrompt = rest
+        ? `현재 작업 폴더의 변경 사항에 대해 다음 관점으로 코드 리뷰를 수행해 주세요: ${rest}`
+        : '현재 작업 폴더의 변경 사항(git diff)을 확인하고 결함, 회귀 위험, 개선점을 코드 리뷰해 주세요.';
+      return { handled: false, rewrittenPrompt };
+    }
+
+    const { commands } = buildSlashCommandsList(session.cwd);
+    const matchedSkill = commands.find(c => c.category === 'skill' && c.command.toLowerCase() === cmd);
+    if (matchedSkill) {
+      const rewrittenPrompt = rest
+        ? `$${matchedSkill.skillName} ${rest}`
+        : `$${matchedSkill.skillName} 스킬을 적용하여 현재 작업을 진행해 주세요.`;
+      return { handled: false, rewrittenPrompt };
+    }
+
+    return { handled: false };
   }
 
   function clearCronTimer(jobId) {
@@ -2715,7 +3065,20 @@ export function createRemoteServer(options = {}) {
           proc.stdin.write(data.replace(/\r/g, '\n'));
           return null;
         }
-        if (session.threadId) {
+        if (session.threadId || data.trimStart().startsWith('/')) {
+          const isWideTerminalChar = ch => {
+            if (!ch) return false;
+            const cp = ch.codePointAt(0) || 0;
+            return (
+              (cp >= 0x1100 && cp <= 0x115f) ||
+              (cp >= 0x2e80 && cp <= 0xa4cf && cp !== 0x303f) ||
+              (cp >= 0xac00 && cp <= 0xd7a3) ||
+              (cp >= 0xf900 && cp <= 0xfaff) ||
+              (cp >= 0xfe10 && cp <= 0xfe6f) ||
+              (cp >= 0xff00 && cp <= 0xff60) ||
+              (cp >= 0xffe0 && cp <= 0xffe6)
+            );
+          };
           session.inputBuffer = String(session.inputBuffer || '');
           let out = '';
           const submittedPrompts = [];
@@ -2723,13 +3086,15 @@ export function createRemoteServer(options = {}) {
             if (ch === '\u0003') {
               session.inputBuffer = '';
               out += '^C\r\n\x1b[38;5;141m›\x1b[0m ';
-              if (appServerBridge.isConnected()) {
+              if (session.threadId && appServerBridge.isConnected()) {
                 void appServerBridge.request('turn/interrupt', { threadId: session.threadId }).catch(() => {});
               }
             } else if (ch === '\u007f' || ch === '\b') {
-              if (session.inputBuffer.length > 0) {
-                session.inputBuffer = session.inputBuffer.slice(0, -1);
-                out += '\b \b';
+              const chars = Array.from(session.inputBuffer);
+              if (chars.length > 0) {
+                const popped = chars.pop();
+                session.inputBuffer = chars.join('');
+                out += isWideTerminalChar(popped) ? '\b \b\b \b' : '\b \b';
               }
             } else if (ch === '\r' || ch === '\n') {
               const promptText = session.inputBuffer.trim();
@@ -2752,7 +3117,9 @@ export function createRemoteServer(options = {}) {
             }
             try {
               await handleConversationRequest(session, { type: 'send', text: promptText });
-              emitMirroredSessionSnapshot(session, false);
+              if (session.threadId) {
+                emitMirroredSessionSnapshot(session, false);
+              }
             } catch (err) {
               emitTerminalOutput(
                 session,
@@ -2807,59 +3174,153 @@ export function createRemoteServer(options = {}) {
       case 'list_external':
         return [];
       case 'catalog_list': {
-        if (appServerBridge.isConnected()) {
+        materializeDesktopSessions();
+        const query = String(args.request?.query ?? '').trim().toLowerCase();
+        const rawCwdFilter = args.request?.cwd ? String(args.request.cwd).trim() : '';
+        const cwdFilter = rawCwdFilter
+          ? normalizeWindowsExtendedPath(rawCwdFilter).replace(/[\\/]+$/, '').toLowerCase()
+          : null;
+        const matchedProjectIds = new Set();
+        if (cwdFilter) {
+          for (const p of state.projects || []) {
+            const pCwd = p?.cwd ? normalizeWindowsExtendedPath(String(p.cwd)).replace(/[\\/]+$/, '').toLowerCase() : '';
+            if (pCwd === cwdFilter || String(p?.id || '').toLowerCase() === cwdFilter || String(p?.name || '').toLowerCase() === cwdFilter) {
+              if (p.id) matchedProjectIds.add(String(p.id));
+            }
+          }
+        }
+        const projectThreadIds = new Set();
+        if (matchedProjectIds.size > 0) {
+          for (const s of sessions.values()) {
+            if (s.threadId && s.projectId && matchedProjectIds.has(String(s.projectId))) {
+              projectThreadIds.add(String(s.threadId));
+            }
+          }
+          for (const ls of state.layout?.sessions || []) {
+            const tid = ls?.threadId || ls?.resumeSessionId;
+            if (tid && ls?.projectId && matchedProjectIds.has(String(ls.projectId))) {
+              projectThreadIds.add(String(tid));
+            }
+          }
+        }
+
+        const normalizeCatalogTimestamp = val => {
+          const num = Number(val || 0);
+          if (!Number.isFinite(num) || num <= 0) return Math.floor(Date.now() / 1000);
+          return num > 10_000_000_000 ? Math.floor(num / 1000) : Math.floor(num);
+        };
+        const normalizeCatalogTitle = (nameVal, titleVal, previewVal, fallbackId) => {
+          const raw = String(nameVal || titleVal || previewVal || fallbackId || '').trim();
+          const firstLine = raw.split(/\r?\n/)[0].trim();
+          return (firstLine || String(fallbackId || '세션')).slice(0, 200);
+        };
+
+        const threadMap = new Map();
+        for (const t of Object.values(state.threads)) {
+          if (!t || !t.id) continue;
+          const tid = String(t.id);
+          threadMap.set(tid, {
+            id: tid,
+            title: normalizeCatalogTitle(t.name, t.title, '', tid),
+            cwd: normalizeWindowsExtendedPath(String(t.cwd || '')),
+            createdAt: normalizeCatalogTimestamp(t.createdAt ?? t.created_at),
+            updatedAt: normalizeCatalogTimestamp(t.updatedAt ?? t.updated_at),
+            projectId: t.projectId ? String(t.projectId) : null,
+          });
+        }
+
+        const stateDbPath = path.join(codexHomeDir || getCodexHome(), 'state_5.sqlite');
+        if (fs.existsSync(stateDbPath)) {
+          let db = null;
           try {
-            const rpcRes = await appServerBridge.request('thread/list', {
-              cursor: args.request?.cursor ?? null,
-              cwd: args.request?.cwd ?? undefined,
-            });
+            db = new DatabaseSync(stateDbPath, { readOnly: true });
+            const cols = new Set(
+              db
+                .prepare('PRAGMA table_info(threads)')
+                .all()
+                .map(c => String(c.name)),
+            );
+            if (cols.has('id')) {
+              const selectCols = ['id', 'cwd', 'created_at', 'updated_at', 'name', 'title', 'first_user_message', 'preview', 'project_id', 'archived']
+                .filter(c => cols.has(c));
+              const whereClauses = [];
+              if (cols.has('archived')) whereClauses.push('archived = 0');
+              const whereSql = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
+              const orderSql = cols.has('updated_at') ? 'ORDER BY updated_at DESC' : '';
+              const rows = db
+                .prepare(`SELECT ${selectCols.join(', ')} FROM threads ${whereSql} ${orderSql} LIMIT 2500`)
+                .all();
+              for (const r of rows) {
+                const tid = String(r.id);
+                const rCwd = normalizeWindowsExtendedPath(String(r.cwd || ''));
+                const rTitle = normalizeCatalogTitle(r.name, r.title, r.first_user_message || r.preview, tid);
+                const existing = threadMap.get(tid);
+                if (!existing) {
+                  threadMap.set(tid, {
+                    id: tid,
+                    title: rTitle,
+                    cwd: rCwd,
+                    createdAt: normalizeCatalogTimestamp(r.created_at),
+                    updatedAt: normalizeCatalogTimestamp(r.updated_at ?? r.created_at),
+                    projectId: r.project_id ? String(r.project_id) : null,
+                  });
+                } else {
+                  if ((!existing.title || existing.title === tid) && rTitle) existing.title = rTitle;
+                  if (!existing.cwd && rCwd) existing.cwd = rCwd;
+                  if (r.updated_at) existing.updatedAt = Math.max(existing.updatedAt, normalizeCatalogTimestamp(r.updated_at));
+                }
+              }
+            }
+          } catch {} finally {
+            try { db?.close(); } catch {}
+          }
+        }
+
+        if (appServerBridge.isConnected() && (threadMap.size === 0 || options.customTransport)) {
+          try {
+            const rpcRes = await appServerBridge.request(
+              'thread/list',
+              {
+                cursor: args.request?.cursor ?? null,
+                cwd: args.request?.cwd ?? undefined,
+              },
+              2000,
+            );
             if (Array.isArray(rpcRes?.data)) {
-              return {
-                sessions: rpcRes.data,
-                nextCursor: rpcRes.nextCursor ?? null,
-              };
+              for (const r of rpcRes.data) {
+                if (!r || !r.id) continue;
+                const tid = String(r.id);
+                if (!threadMap.has(tid)) {
+                  threadMap.set(tid, {
+                    id: tid,
+                    title: normalizeCatalogTitle(r.name, r.title, r.preview, tid),
+                    cwd: normalizeWindowsExtendedPath(String(r.cwd || '')),
+                    createdAt: normalizeCatalogTimestamp(r.createdAt ?? r.created_at),
+                    updatedAt: normalizeCatalogTimestamp(r.updatedAt ?? r.updated_at ?? r.createdAt ?? r.created_at),
+                    projectId: r.projectId ? String(r.projectId) : null,
+                  });
+                }
+              }
             }
           } catch {
             // Fall back to persisted workspace threads.
           }
         }
-        const query = String(args.request?.query ?? '').trim().toLowerCase();
-        const cwdFilter = args.request?.cwd ? normalizeWindowsExtendedPath(String(args.request.cwd)).toLowerCase() : null;
-        const threadMap = new Map(Object.values(state.threads).map(t => [String(t.id), t]));
-        if (desktopDbPath) {
-          const stateDbPath = path.join(getCodexHome(), 'state_5.sqlite');
-          if (fs.existsSync(stateDbPath)) {
-            let db = null;
-            try {
-              db = new DatabaseSync(stateDbPath, { readOnly: true });
-              const rows = db
-                .prepare('SELECT id, name, title, cwd, created_at, updated_at FROM threads WHERE archived = 0 ORDER BY updated_at DESC LIMIT 80')
-                .all();
-              for (const r of rows) {
-                const tid = String(r.id);
-                if (!threadMap.has(tid)) {
-                  threadMap.set(tid, {
-                    id: tid,
-                    title: String(r.name || r.title || tid),
-                    cwd: normalizeWindowsExtendedPath(String(r.cwd || '')),
-                    createdAt: Number(r.created_at || 0),
-                    updatedAt: Number(r.updated_at || 0),
-                  });
-                }
-              }
-            } catch {} finally {
-              try { db?.close(); } catch {}
-            }
-          }
-        }
+
         const allThreads = [...threadMap.values()];
         const filtered = allThreads.filter(t => {
-          if (cwdFilter && normalizeWindowsExtendedPath(String(t.cwd || '')).toLowerCase() !== cwdFilter) return false;
+          if (cwdFilter) {
+            const tCwd = normalizeWindowsExtendedPath(String(t.cwd || '')).replace(/[\\/]+$/, '').toLowerCase();
+            const cwdMatched = tCwd === cwdFilter || tCwd.startsWith(`${cwdFilter}\\`) || tCwd.startsWith(`${cwdFilter}/`);
+            const projectMatched = projectThreadIds.has(String(t.id)) || (t.projectId && matchedProjectIds.has(String(t.projectId)));
+            if (!cwdMatched && !projectMatched) return false;
+          }
           if (query && !String(t.title || '').toLowerCase().includes(query) && !String(t.id || '').toLowerCase().includes(query)) return false;
           return true;
         });
+        filtered.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
         return {
-          sessions: filtered.map(t => ({
+          sessions: filtered.slice(0, 250).map(t => ({
             id: t.id,
             title: t.title,
             cwd: t.cwd,
@@ -2881,7 +3342,7 @@ export function createRemoteServer(options = {}) {
         }
         if ((!thread || !Array.isArray(thread.turns) || thread.turns.length === 0) && appServerBridge.isConnected() && threadId) {
           try {
-            const readRes = await appServerBridge.request('thread/read', { threadId, includeTurns: true });
+            const readRes = await appServerBridge.request('thread/read', { threadId, includeTurns: true }, 2500);
             if (Array.isArray(readRes?.thread?.turns) && readRes.thread.turns.length > 0) {
               thread = readRes.thread;
             }
@@ -2909,6 +3370,11 @@ export function createRemoteServer(options = {}) {
       case 'extensions_list': {
         const cwd = args.cwd ? String(args.cwd) : null;
         return scanCodexExtensions(cwd, computeSettings().resolvedPath);
+      }
+      case 'slash_commands_list': {
+        const session = args.id ? sessions.get(args.id) : null;
+        const cwd = args.cwd ? String(args.cwd) : session?.cwd || null;
+        return buildSlashCommandsList(cwd);
       }
       case 'extensions_mutate': {
         const cwd = args.cwd ? String(args.cwd) : null;
@@ -3473,15 +3939,19 @@ export function createRemoteServer(options = {}) {
     // 1:1 Single-Owner Host Tunnel Endpoints (/api/relay/*)
     if (pathname.startsWith('/api/relay/')) {
       const hostAuth = req.headers['x-opendiy-host-secret'] || req.headers.authorization?.replace(/^Bearer\s+/i, '') || '';
-      const validSecret = verifyToken(hostSecretSha256, String(hostAuth));
+      const validSecret = isHostCredentialValid(String(hostAuth));
       const rate = checkAndRecordAuth(`host:${clientIp}`, validSecret);
       if (!rate.allowed) {
         res.writeHead(rate.locked ? 429 : 401, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
         res.end(JSON.stringify({
           ok: false,
+          oauthSupported: googleOAuthEnabled,
+          authUrl: googleOAuthEnabled ? '/auth/google' : null,
           error: rate.locked
             ? '반복된 인증 실패로 호스트 연결이 일시 차단되었습니다.'
-            : '유효한 호스트 비밀키(OPENDIY_REMOTE_HOST_SECRET)가 필요합니다.',
+            : googleOAuthEnabled
+              ? '유효한 호스트 인증(Google OAuth 또는 OPENDIY_REMOTE_HOST_SECRET)이 필요합니다.'
+              : '유효한 호스트 비밀키(OPENDIY_REMOTE_HOST_SECRET)가 필요합니다.',
         }));
         return;
       }
@@ -3609,15 +4079,28 @@ export function createRemoteServer(options = {}) {
         return;
       }
       const now = Date.now();
-      for (const [k, exp] of oauthStates) {
-        if (exp < now) oauthStates.delete(k);
+      for (const [k, entry] of oauthStates) {
+        const expTime = typeof entry === 'number' ? entry : entry.exp;
+        if (expTime < now) oauthStates.delete(k);
+      }
+      for (const [k, entry] of cliOAuthSessions) {
+        if (entry.exp < now) cliOAuthSessions.delete(k);
       }
       if (oauthStates.size >= 256) {
         const oldest = oauthStates.keys().next().value;
         if (oldest) oauthStates.delete(oldest);
       }
+      const cliSessionRaw = String(reqUrl.searchParams.get('cli_session') || '').trim();
+      const cliSessionId = /^[a-f0-9]{16,128}$/i.test(cliSessionRaw) ? cliSessionRaw : null;
+      if (cliSessionId) {
+        if (cliOAuthSessions.size >= 128) {
+          const oldestCli = cliOAuthSessions.keys().next().value;
+          if (oldestCli) cliOAuthSessions.delete(oldestCli);
+        }
+        cliOAuthSessions.set(cliSessionId, { status: 'pending', exp: now + 10 * 60 * 1000 });
+      }
       const stateNonce = crypto.randomBytes(24).toString('hex');
-      oauthStates.set(stateNonce, now + 10 * 60 * 1000);
+      oauthStates.set(stateNonce, { exp: now + 10 * 60 * 1000, cliSessionId });
       const isHttps = useTls || String(req.headers['x-forwarded-proto'] || '').toLowerCase() === 'https';
       const origin = `${isHttps ? 'https' : 'http'}://${req.headers.host || '127.0.0.1'}`;
       const redirectUri = `${origin}/auth/google/callback`;
@@ -3633,6 +4116,31 @@ export function createRemoteServer(options = {}) {
       return;
     }
 
+    if (req.method === 'GET' && pathname === '/auth/google/cli-poll') {
+      if (!googleOAuthEnabled) {
+        res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ ok: false, status: 'unsupported', error: '서버에 Google OAuth가 설정되어 있지 않습니다.' }));
+        return;
+      }
+      const cliSessionId = String(reqUrl.searchParams.get('cli_session') || '').trim();
+      const entry = cliOAuthSessions.get(cliSessionId);
+      if (!entry || Date.now() > entry.exp) {
+        cliOAuthSessions.delete(cliSessionId);
+        res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ ok: false, status: 'expired' }));
+        return;
+      }
+      if (entry.status === 'authenticated' && entry.token) {
+        cliOAuthSessions.delete(cliSessionId);
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({ ok: true, status: 'authenticated', token: entry.token, email: entry.email }));
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify({ ok: true, status: 'pending' }));
+      return;
+    }
+
     if (req.method === 'GET' && pathname === '/auth/google/callback') {
       if (!googleOAuthEnabled) {
         res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
@@ -3641,8 +4149,10 @@ export function createRemoteServer(options = {}) {
       }
       const stateParam = reqUrl.searchParams.get('state') || '';
       const codeParam = reqUrl.searchParams.get('code') || '';
-      const exp = oauthStates.get(stateParam);
+      const stateEntry = oauthStates.get(stateParam);
       oauthStates.delete(stateParam);
+      const exp = typeof stateEntry === 'number' ? stateEntry : stateEntry?.exp;
+      const cliSessionId = typeof stateEntry === 'object' && stateEntry ? stateEntry.cliSessionId : null;
       if (!stateParam || !codeParam || !exp || Date.now() > exp) {
         res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
         res.end(renderAuthGatePage({ errorMsg: 'OAuth 인증 상태(state)가 만료되었거나 유효하지 않습니다. 다시 시도해 주세요.' }));
@@ -3689,10 +4199,27 @@ export function createRemoteServer(options = {}) {
           }
           checkAndRecordAuth(`client:${clientIp}`, true);
           const sessionCookieVal = signOAuthSessionToken(email);
+          const setCookieHeader = `${AUTH_COOKIE_NAME}=${encodeURIComponent(sessionCookieVal)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800${isHttps ? '; Secure' : ''}`;
+          if (cliSessionId && cliOAuthSessions.has(cliSessionId)) {
+            const hostOAuthToken = signOAuthSessionToken(email, 30 * 24 * 60 * 60 * 1000);
+            cliOAuthSessions.set(cliSessionId, {
+              status: 'authenticated',
+              token: hostOAuthToken,
+              email,
+              exp: Date.now() + 5 * 60 * 1000,
+            });
+            res.writeHead(200, {
+              'Content-Type': 'text/html; charset=utf-8',
+              'Cache-Control': 'no-store',
+              'Set-Cookie': setCookieHeader,
+            });
+            res.end(renderCliOAuthSuccessPage(email));
+            return;
+          }
           res.writeHead(302, {
             Location: '/',
             'Cache-Control': 'no-store',
-            'Set-Cookie': `${AUTH_COOKIE_NAME}=${encodeURIComponent(sessionCookieVal)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800${isHttps ? '; Secure' : ''}`,
+            'Set-Cookie': setCookieHeader,
           });
           res.end();
         } catch (err) {
@@ -3910,7 +4437,14 @@ export function createRemoteServer(options = {}) {
  */
 export function startHostConnector(options = {}) {
   const relayUrl = normalizeRelayBaseUrl(options.relayUrl || process.env.OPENDIY_REMOTE_RELAY_URL || '');
-  const hostSecret = String(options.hostSecret ?? process.env.OPENDIY_REMOTE_HOST_SECRET ?? process.env.OPENDIY_REMOTE_TOKEN ?? '').trim();
+  const explicitSecret = String(options.hostSecret ?? process.env.OPENDIY_REMOTE_HOST_SECRET ?? process.env.OPENDIY_REMOTE_TOKEN ?? '').trim();
+  const localWorkspaceDir = path.resolve(
+    options.workspaceDir ||
+      process.env.OPENDIY_REMOTE_DATA_DIR ||
+      process.env.AGENT_GRID_WORKSPACE_DIR ||
+      path.join(os.tmpdir(), 'opendiy-remote-workspace'),
+  );
+  const oauthCacheFile = path.resolve(options.oauthCacheFile || path.join(localWorkspaceDir, 'host-oauth-token.json'));
   const hostId = options.hostId || crypto.randomUUID();
   const rejectUnauthorized = options.tlsRejectUnauthorized !== undefined
     ? Boolean(options.tlsRejectUnauthorized)
@@ -3918,8 +4452,45 @@ export function startHostConnector(options = {}) {
   let stopped = false;
   let activeReq = null;
   let reconnectTimer = null;
+  let oauthPollTimer = null;
+  let oauthInProgress = false;
   const inFlightReqIds = new Set();
   const completedReqIds = new Map(); // reqId -> { ok, result, error }
+
+  function loadCachedOAuthToken() {
+    try {
+      if (!fs.existsSync(oauthCacheFile)) return '';
+      const raw = JSON.parse(fs.readFileSync(oauthCacheFile, 'utf8'));
+      const entry = raw && typeof raw === 'object' ? raw[relayUrl] : null;
+      if (!entry || typeof entry.token !== 'string' || !entry.token.startsWith('oauth.')) return '';
+      const parts = entry.token.split('.');
+      if (parts.length === 3) {
+        const parsed = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+        if (parsed && typeof parsed.exp === 'number' && Date.now() >= parsed.exp - 60000) {
+          return '';
+        }
+      }
+      return entry.token;
+    } catch {
+      return '';
+    }
+  }
+
+  function saveCachedOAuthToken(token, email) {
+    try {
+      fs.mkdirSync(path.dirname(oauthCacheFile), { recursive: true });
+      let current = {};
+      if (fs.existsSync(oauthCacheFile)) {
+        try { current = JSON.parse(fs.readFileSync(oauthCacheFile, 'utf8')) || {}; } catch {}
+      }
+      current[relayUrl] = { token, email: email || null, savedAt: Date.now() };
+      fs.writeFileSync(oauthCacheFile, JSON.stringify(current, null, 2), { encoding: 'utf8', mode: 0o600 });
+    } catch {
+      // Ignore cache write errors.
+    }
+  }
+
+  let currentAuthToken = explicitSecret || loadCachedOAuthToken();
 
   const localRuntime = createRemoteServer({
     ...options,
@@ -3950,6 +4521,99 @@ export function startHostConnector(options = {}) {
     completedReqIds.set(reqId, replyPayload);
   }
 
+  function getJson(endpointPath) {
+    return new Promise((resolve, reject) => {
+      const target = new URL(endpointPath, `${relayUrl}/`);
+      const isHttpsTarget = target.protocol === 'https:';
+      const mod = isHttpsTarget ? https : http;
+      const req = mod.request(
+        target,
+        {
+          method: 'GET',
+          agent: isHttpsTarget ? httpsAgent : httpAgent,
+          ...(isHttpsTarget ? { rejectUnauthorized } : {}),
+          headers: { Accept: 'application/json', Connection: 'keep-alive' },
+        },
+        res => {
+          const chunks = [];
+          res.on('data', chunk => chunks.push(chunk));
+          res.on('end', () => {
+            try {
+              const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+              resolve({ statusCode: res.statusCode || 0, body });
+            } catch {
+              resolve({ statusCode: res.statusCode || 0, body: {} });
+            }
+          });
+        },
+      );
+      req.setNoDelay(true);
+      req.on('error', reject);
+      req.end();
+    });
+  }
+
+  function openSystemBrowser(url) {
+    if (options.openBrowser === false) return;
+    try {
+      if (process.platform === 'win32') {
+        spawn('cmd.exe', ['/c', 'start', '', url], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+      } else if (process.platform === 'darwin') {
+        spawn('open', [url], { detached: true, stdio: 'ignore' }).unref();
+      } else {
+        spawn('xdg-open', [url], { detached: true, stdio: 'ignore' }).unref();
+      }
+    } catch {
+      // User can still click the printed URL manually.
+    }
+  }
+
+  function startCliOAuthFlow() {
+    if (stopped || oauthInProgress || options.oauthLogin === false) return;
+    oauthInProgress = true;
+    const cliSessionId = crypto.randomBytes(24).toString('hex');
+    const loginUrl = `${relayUrl}/auth/google?cli_session=${cliSessionId}`;
+    options.onOAuthPrompt?.({ loginUrl, cliSessionId });
+    if (options.silent !== true) {
+      console.log(`\n[OpenDIY Remote] Google OAuth 로그인으로 로컬 PC 호스트를 인증합니다.`);
+      console.log(`브라우저에서 허용된 Google 계정으로 로그인하세요:\n  ${loginUrl}\n`);
+    }
+    openSystemBrowser(loginUrl);
+
+    const pollInterval = Math.max(150, Number(options.oauthPollIntervalMs || 1200));
+    const pollOnce = async () => {
+      if (stopped) return;
+      try {
+        const { statusCode, body } = await getJson(`/auth/google/cli-poll?cli_session=${cliSessionId}`);
+        if (stopped) return;
+        if (statusCode === 200 && body.status === 'authenticated' && body.token) {
+          oauthInProgress = false;
+          currentAuthToken = String(body.token);
+          saveCachedOAuthToken(currentAuthToken, body.email);
+          options.onOAuthAuthenticated?.({ email: body.email, token: currentAuthToken });
+          if (options.silent !== true) {
+            console.log(`[OpenDIY Remote] Google OAuth 인증 완료 (${body.email || 'owner'}). 중계 서버에 연결합니다...`);
+          }
+          connectStream();
+          return;
+        }
+        if (statusCode === 404 && body.status === 'unsupported') {
+          oauthInProgress = false;
+          if (options.silent !== true) {
+            console.error(`[OpenDIY Remote] 중계 서버에 Google OAuth가 설정되어 있지 않습니다. --host-secret 옵션을 사용하세요.`);
+          }
+          return;
+        }
+      } catch {
+        // Retry on transient network errors while user completes login.
+      }
+      if (!stopped && oauthInProgress) {
+        oauthPollTimer = setTimeout(pollOnce, pollInterval);
+      }
+    };
+    oauthPollTimer = setTimeout(pollOnce, pollInterval);
+  }
+
   function postJson(endpointPath, payload) {
     return new Promise((resolve, reject) => {
       const target = new URL(endpointPath, `${relayUrl}/`);
@@ -3970,7 +4634,7 @@ export function startHostConnector(options = {}) {
             'Content-Length': bodyBuf.length,
             Connection: 'keep-alive',
             'X-OpenDIY-Host-Id': hostId,
-            ...(hostSecret ? { 'X-OpenDIY-Host-Secret': hostSecret } : {}),
+            ...(currentAuthToken ? { 'X-OpenDIY-Host-Secret': currentAuthToken } : {}),
           },
         },
         res => {
@@ -4002,15 +4666,28 @@ export function startHostConnector(options = {}) {
         headers: {
           Accept: 'text/event-stream',
           'X-OpenDIY-Host-Id': hostId,
-          ...(hostSecret ? { 'X-OpenDIY-Host-Secret': hostSecret } : {}),
+          ...(currentAuthToken ? { 'X-OpenDIY-Host-Secret': currentAuthToken } : {}),
         },
       },
       res => {
         if (res.statusCode !== 200) {
-          res.resume();
-          if (!stopped && options.autoReconnect !== false) {
-            reconnectTimer = setTimeout(connectStream, 2000);
-          }
+          const chunks = [];
+          res.on('data', chunk => chunks.push(chunk));
+          res.on('end', () => {
+            if (stopped) return;
+            if (res.statusCode === 401 && !explicitSecret) {
+              try {
+                const errBody = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+                if (errBody.oauthSupported) {
+                  startCliOAuthFlow();
+                  return;
+                }
+              } catch {}
+            }
+            if (options.autoReconnect !== false) {
+              reconnectTimer = setTimeout(connectStream, 2000);
+            }
+          });
           return;
         }
         const rl = readline.createInterface({ input: res });
