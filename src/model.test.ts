@@ -588,25 +588,27 @@ test('remote server mirrors OpenDIY Desktop workspace.sqlite3 projects, active s
   desktopDb.prepare('INSERT INTO workspace_layout (id, layout) VALUES (1, ?)').run(JSON.stringify(layoutPayload));
   desktopDb.prepare('INSERT INTO session_metadata (id, generation, metadata, updated_at) VALUES (?, 1, ?, 1700000100)').run(
     'sess-desktop',
-    JSON.stringify({ id: 'sess-desktop', name: 'desktop 담당', cwd: projDir, projectId: 'proj-dev', resumeSessionId: 'thread-desktop-1', runtimeKind: 'codex' }),
+    JSON.stringify({ id: 'sess-desktop', name: 'desktop 담당', cwd: projDir, projectId: 'proj-dev', resumeSessionId: 'thread-desktop-1', runtimeKind: 'codex', state: 'running', active: true }),
   );
   desktopDb.prepare('INSERT INTO session_metadata (id, generation, metadata, updated_at) VALUES (?, 1, ?, 1700000100)').run(
     'sess-cli',
-    JSON.stringify({ id: 'sess-cli', name: 'CLI 담당', cwd: projDir, projectId: 'proj-dev', resumeSessionId: 'thread-cli-1', runtimeKind: 'codex' }),
+    JSON.stringify({ id: 'sess-cli', name: 'CLI 담당', cwd: projDir, projectId: 'proj-dev', resumeSessionId: 'thread-cli-1', runtimeKind: 'codex', state: 'running', active: true }),
   );
   desktopDb.close();
 
   // 2. Create mock ~/.codex/state_5.sqlite and rollout JSONL file
   const rolloutFile = path.join(codexHomeDir, 'rollout-desktop.jsonl');
+  const hugeOutput = 'A'.repeat(25000);
   const rolloutLines = [
     JSON.stringify({ timestamp: '2026-11-08T02:00:00Z', type: 'session_meta', payload: { id: 'thread-desktop-1', cwd: projDir } }),
     JSON.stringify({ timestamp: '2026-11-08T02:00:01Z', type: 'turn_context', payload: { turn_id: 'turn-1', cwd: projDir, model: 'GPT-6.1-Sol', effort: 'xhigh' } }),
     JSON.stringify({ timestamp: '2026-11-08T02:00:02Z', type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-1', model_context_window: 380000 } }),
     JSON.stringify({ timestamp: '2026-11-08T02:00:03Z', type: 'event_msg', payload: { type: 'user_message', message: '중단된 지점부터 이어서 작업해줘.' } }),
     JSON.stringify({ timestamp: '2026-11-08T02:00:04Z', type: 'response_item', payload: { type: 'function_call', name: 'exec_command', call_id: 'call-1', arguments: JSON.stringify({ cmd: 'git status --short' }) } }),
-    JSON.stringify({ timestamp: '2026-11-08T02:00:05Z', type: 'response_item', payload: { type: 'function_call_output', call_id: 'call-1', output: 'Process exited with code 0\nOutput:\nM src/main.ts' } }),
+    JSON.stringify({ timestamp: '2026-11-08T02:00:05Z', type: 'response_item', payload: { type: 'function_call_output', call_id: 'call-1', output: `Process exited with code 0\nOutput:\nM src/main.ts\n${hugeOutput}` } }),
     JSON.stringify({ timestamp: '2026-11-08T02:00:06Z', type: 'event_msg', payload: { type: 'agent_message', message: '작업을 재개했습니다.' } }),
     JSON.stringify({ timestamp: '2026-11-08T02:00:07Z', type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { total_tokens: 120000 }, last_token_usage: { total_tokens: 228000 }, model_context_window: 380000 } } }),
+    JSON.stringify({ timestamp: '2026-11-08T02:00:08Z', type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn-1' } }),
   ];
   fs.writeFileSync(rolloutFile, rolloutLines.join('\n') + '\n', 'utf8');
 
@@ -665,6 +667,9 @@ test('remote server mirrors OpenDIY Desktop workspace.sqlite3 projects, active s
       registered = true;
     },
     rpcTransport: async (method: string, params: any) => {
+      if (method === 'thread/read' && params?.includeTurns === true) {
+        throw new Error('REMOTE-BLKR-05: thread/read(includeTurns: true) must not be called when rollout turns are available');
+      }
       if (method === 'turn/start') {
         cronTurnStarted = true;
         return {
@@ -732,10 +737,21 @@ test('remote server mirrors OpenDIY Desktop workspace.sqlite3 projects, active s
 
     const sessions = await relayInvoke('list_sessions');
     assert.equal(sessions.length, 2);
-    assert.equal(sessions.some((s: any) => s.title === 'desktop 담당' && s.threadId === 'thread-desktop-1'), true);
+    const desktopSess = sessions.find((s: any) => s.title === 'desktop 담당' && s.threadId === 'thread-desktop-1');
+    assert.equal(Boolean(desktopSess), true);
+    // REMOTE-BLKR-06: Even though session_metadata had stale state:'running', completed rollout turn reconciles session.state to 'idle'
+    assert.equal(desktopSess.state, 'idle');
     assert.equal(sessions.some((s: any) => s.title === 'CLI 담당' && s.threadId === 'thread-cli-1'), true);
 
-    // Verify conversation_request (attach + items) returns rollout turns/items from state_5.sqlite + rollout JSONL
+    const ctxStatusMirrored = await relayInvoke('conversation_request', {
+      id: 'sess-desktop',
+      generation: 1,
+      request: { type: 'contextStatus' },
+    });
+    assert.equal(ctxStatusMirrored.idle, true);
+    assert.equal(ctxStatusMirrored.canCompact, true);
+
+    // Verify conversation_request (attach + page + items + detail) returns rollout turns/items quickly without heavy thread/read
     const attachRes = await relayInvoke('conversation_request', {
       id: 'sess-desktop',
       generation: 1,
@@ -745,12 +761,31 @@ test('remote server mirrors OpenDIY Desktop workspace.sqlite3 projects, active s
     assert.equal(attachRes.model, 'GPT-6.1-Sol');
     assert.equal(attachRes.turns.length >= 1, true);
 
+    const pageRes = await relayInvoke('conversation_request', {
+      id: 'sess-desktop',
+      generation: 1,
+      request: { type: 'page' },
+    });
+    assert.equal(pageRes.data.length >= 1, true);
+
     const itemsRes = await relayInvoke('conversation_request', {
       id: 'sess-desktop',
       generation: 1,
-      request: { type: 'items', turnId: attachRes.turns[0].id },
+      request: { type: 'items', turnId: pageRes.data[0].id },
     });
     assert.equal(itemsRes.items.some((it: any) => it.type === 'userMessage' && it.text.includes('중단된 지점부터')), true);
+    const cmdItem = itemsRes.items.find((it: any) => it.type === 'commandExecution');
+    assert.equal(Boolean(cmdItem), true);
+    assert.equal(cmdItem.truncated, true);
+    assert.equal(cmdItem.aggregatedOutput.length, 16384);
+
+    const detailRes = await relayInvoke('conversation_request', {
+      id: 'sess-desktop',
+      generation: 1,
+      request: { type: 'detail', turnId: pageRes.data[0].id, itemId: cmdItem.id, offset: 16384 },
+    });
+    assert.equal(detailRes.totalBytes > 25000, true);
+    assert.equal(detailRes.text.includes('AAAA'), true);
 
     // Wait briefly for scheduleMirroredSessionSnapshots to emit terminal-output over relay SSE
     for (let i = 0; i < 25 && !sseBuffer.includes('terminal-output'); i++) {

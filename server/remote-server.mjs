@@ -480,6 +480,77 @@ function normalizeConversationItem(rawItem, index = 0, turnId = 'turn') {
   };
 }
 
+function itemFullDetailText(item) {
+  if (!item || typeof item !== 'object') return String(item ?? '');
+  const type = String(item.type || '');
+  if (type === 'commandExecution') {
+    const cmd = String(item.command ?? '');
+    const out = String(item._fullAggregatedOutput ?? item.aggregatedOutput ?? '');
+    return [cmd, out].filter(Boolean).join('\n\n');
+  }
+  if (type === 'fileChange') {
+    const changes = Array.isArray(item._fullChanges ?? item.changes) ? (item._fullChanges ?? item.changes) : [];
+    return changes.map(c => `${String(c?.path ?? '')}\n${String(c?.diff ?? '')}`).join('\n\n');
+  }
+  if (type === 'mcpToolCall') {
+    const argsStr = typeof item._fullArgumentsJson === 'string' ? item._fullArgumentsJson : JSON.stringify(item.arguments ?? {});
+    const resStr = typeof item._fullResultJson === 'string' ? item._fullResultJson : JSON.stringify(item.result ?? item.error ?? {});
+    return `${String(item.server || 'mcp')} / ${String(item.tool || '')}\n${argsStr}\n${resStr}`;
+  }
+  if (type === 'reasoning') {
+    const parts = [...(item._fullSummary ?? item.summary ?? []), ...(item._fullContent ?? item.content ?? [])];
+    return parts.map(p => (typeof p === 'string' ? p : JSON.stringify(p))).join('\n');
+  }
+  return String(item._fullText ?? item.text ?? item.message ?? '');
+}
+
+const ITEM_PREVIEW_LIMIT = 16384;
+
+function serializeItemForPage(item) {
+  if (!item || typeof item !== 'object') return item;
+  const fullText = itemFullDetailText(item);
+  const isTruncated = fullText.length > ITEM_PREVIEW_LIMIT || Boolean(item.truncated);
+  const out = { ...item };
+  delete out._fullText;
+  delete out._fullAggregatedOutput;
+  delete out._fullChanges;
+  delete out._fullArgumentsJson;
+  delete out._fullResultJson;
+  delete out._fullSummary;
+  delete out._fullContent;
+  if (!isTruncated) return out;
+  out.truncated = true;
+  out.hasMore = true;
+  if (out.type === 'agentMessage') {
+    out.text = String(out.text ?? '').slice(0, ITEM_PREVIEW_LIMIT);
+  } else if (out.type === 'userMessage') {
+    const sliced = String(out.text ?? '').slice(0, ITEM_PREVIEW_LIMIT);
+    out.text = sliced;
+    out.content = [{ type: 'text', text: sliced }];
+  } else if (out.type === 'commandExecution') {
+    out.aggregatedOutput = String(out.aggregatedOutput ?? '').slice(0, ITEM_PREVIEW_LIMIT);
+  } else if (out.type === 'fileChange' && Array.isArray(out.changes)) {
+    let budget = ITEM_PREVIEW_LIMIT;
+    const boundedChanges = [];
+    for (const ch of out.changes) {
+      if (budget <= 0) break;
+      const diffStr = String(ch?.diff ?? '');
+      const slicedDiff = diffStr.slice(0, budget);
+      budget -= slicedDiff.length;
+      boundedChanges.push({ path: String(ch?.path ?? ''), diff: slicedDiff });
+    }
+    out.changes = boundedChanges;
+  } else if (out.type === 'mcpToolCall') {
+    const resJson = JSON.stringify(out.result ?? {});
+    if (resJson.length > ITEM_PREVIEW_LIMIT) {
+      out.result = { preview: resJson.slice(0, ITEM_PREVIEW_LIMIT), __detail: true };
+    }
+  }
+  return out;
+}
+
+const rolloutSummaryCache = new Map(); // threadId -> { rolloutPath, mtimeMs, size, summary }
+
 function readCodexRolloutSummary(threadId, customCodexHome = null) {
   if (!threadId) return null;
   const stateDbPath = path.join(customCodexHome || getCodexHome(), 'state_5.sqlite');
@@ -491,6 +562,22 @@ function readCodexRolloutSummary(threadId, customCodexHome = null) {
       .prepare('SELECT * FROM threads WHERE id = ?')
       .get(String(threadId));
     if (!row) return null;
+    const rolloutPath = row.rollout_path ? normalizeWindowsExtendedPath(String(row.rollout_path)) : '';
+    let st = null;
+    if (rolloutPath && fs.existsSync(rolloutPath)) {
+      try { st = fs.statSync(rolloutPath); } catch {}
+    }
+    const cached = rolloutSummaryCache.get(String(threadId));
+    if (
+      cached &&
+      cached.rolloutPath === rolloutPath &&
+      cached.size === (st ? st.size : 0) &&
+      cached.mtimeMs === (st ? st.mtimeMs : 0) &&
+      cached.updatedAt === Number(row.updated_at || 0)
+    ) {
+      return cached.summary;
+    }
+
     const out = {
       id: String(row.id),
       title: String(row.name || row.title || ''),
@@ -503,13 +590,11 @@ function readCodexRolloutSummary(threadId, customCodexHome = null) {
       updatedAt: Number(row.updated_at || Math.floor(Date.now() / 1000)),
       turns: [],
       terminalLines: [],
+      latestTurnStatus: 'completed',
     };
-    const rolloutPath = row.rollout_path ? normalizeWindowsExtendedPath(String(row.rollout_path)) : '';
     out.rolloutPath = rolloutPath;
-    out.rolloutSize = 0;
-    if (rolloutPath && fs.existsSync(rolloutPath)) {
-      const st = fs.statSync(rolloutPath);
-      out.rolloutSize = st.size;
+    out.rolloutSize = st ? st.size : 0;
+    if (st && st.size > 0) {
       const readSize = Math.min(1536 * 1024, st.size);
       if (readSize > 0) {
         const fd = fs.openSync(rolloutPath, 'r');
@@ -524,6 +609,7 @@ function readCodexRolloutSummary(threadId, customCodexHome = null) {
         const turnsMap = new Map();
         let currentTurnId = `turn-${out.id.slice(0, 8)}`;
         const terminalLines = [];
+        const pendingCallMap = new Map();
 
         for (const line of rawLines) {
           const trimmed = line.trim();
@@ -546,7 +632,19 @@ function readCodexRolloutSummary(threadId, customCodexHome = null) {
               });
             }
             const turn = turnsMap.get(turnId);
-            if (obj.type === 'event_msg' && p.type === 'token_count' && p.info) {
+            if (obj.type === 'event_msg' && p.type === 'task_started') {
+              turn.status = 'inProgress';
+              out.latestTurnStatus = 'inProgress';
+              if (p.model_context_window) {
+                out.modelContextWindow = Number(p.model_context_window);
+              }
+            } else if (
+              obj.type === 'event_msg' &&
+              (p.type === 'task_complete' || p.type === 'turn_complete' || p.type === 'turn_aborted' || p.type === 'error')
+            ) {
+              turn.status = p.type === 'turn_aborted' ? 'interrupted' : 'completed';
+              out.latestTurnStatus = turn.status;
+            } else if (obj.type === 'event_msg' && p.type === 'token_count' && p.info) {
               if (p.info.last_token_usage?.total_tokens) {
                 out.usedTokens = Number(p.info.last_token_usage.total_tokens);
               }
@@ -572,8 +670,33 @@ function readCodexRolloutSummary(threadId, customCodexHome = null) {
                   terminalLines.push(`\x1b[90m›\x1b[0m \x1b[1m${txt.split('\n')[0].slice(0, 160)}\x1b[0m`);
                 }
               }
-            } else if (obj.type === 'event_msg' && p.type === 'agent_message' && p.message) {
-              const txt = String(p.message).trim();
+            } else if (obj.type === 'response_item' && p.type === 'function_call' && p.call_id) {
+              let cmd = String(p.name || 'command');
+              try {
+                const parsedArgs = typeof p.arguments === 'string' ? JSON.parse(p.arguments) : p.arguments;
+                if (parsedArgs?.cmd) cmd = String(parsedArgs.cmd);
+                else if (Array.isArray(parsedArgs?.command)) cmd = parsedArgs.command.join(' ');
+              } catch {}
+              const cItem = normalizeConversationItem(
+                { id: String(p.call_id), type: 'commandExecution', command: cmd, aggregatedOutput: '', status: 'completed' },
+                turn.items.length,
+                turnId,
+              );
+              turn.items.push(cItem);
+              pendingCallMap.set(String(p.call_id), cItem);
+              terminalLines.push(`\x1b[38;5;114m• Ran\x1b[0m ${cmd.slice(0, 140)}`);
+            } else if (obj.type === 'response_item' && p.type === 'function_call_output' && p.call_id) {
+              const target = pendingCallMap.get(String(p.call_id));
+              if (target) {
+                target.aggregatedOutput = String(p.output ?? '');
+              }
+            } else if (
+              (obj.type === 'event_msg' && p.type === 'agent_message' && p.message) ||
+              (obj.type === 'response_item' && p.type === 'message' && p.role === 'assistant')
+            ) {
+              const txt = Array.isArray(p.content)
+                ? p.content.map(c => String(c?.text ?? '')).join('\n').trim()
+                : String(p.message ?? '').trim();
               if (txt && !turn.items.some(it => it.type === 'agentMessage' && it.text === txt)) {
                 const aItem = normalizeConversationItem(
                   { id: p.id || `a-${turn.items.length}`, type: 'agentMessage', role: 'assistant', text: txt, status: 'completed' },
@@ -581,6 +704,8 @@ function readCodexRolloutSummary(threadId, customCodexHome = null) {
                   turnId,
                 );
                 turn.items.push(aItem);
+                out.latestTurnStatus = 'completed';
+                turn.status = 'completed';
                 for (const al of txt.split(/\r?\n/).slice(0, 6)) {
                   terminalLines.push(`\x1b[38;5;252m• ${al}\x1b[0m`);
                 }
@@ -600,6 +725,8 @@ function readCodexRolloutSummary(threadId, customCodexHome = null) {
               } else if (norm.type === 'fileChange' && Array.isArray(norm.changes) && norm.changes.length) {
                 terminalLines.push(`\x1b[38;5;114m• Edited\x1b[0m ${norm.changes.map(c => c.path).join(', ')}`);
               } else if (norm.type === 'agentMessage' && norm.text) {
+                out.latestTurnStatus = 'completed';
+                turn.status = 'completed';
                 for (const al of String(norm.text).trim().split(/\r?\n/).slice(0, 6)) {
                   terminalLines.push(`\x1b[38;5;252m• ${al}\x1b[0m`);
                 }
@@ -609,7 +736,14 @@ function readCodexRolloutSummary(threadId, customCodexHome = null) {
             // Skip truncated or unparseable JSONL line.
           }
         }
-        out.turns = [...turnsMap.values()].filter(t => t.items.length > 0).slice(-20);
+        // If the rollout file has not been modified for more than 120 seconds, any stale inProgress turn has settled.
+        if (out.latestTurnStatus === 'inProgress' && st.mtimeMs && Date.now() - st.mtimeMs > 120 * 1000) {
+          out.latestTurnStatus = 'completed';
+          for (const t of turnsMap.values()) {
+            if (t.status === 'inProgress') t.status = 'completed';
+          }
+        }
+        out.turns = [...turnsMap.values()].filter(t => t.items.length > 0).slice(-50);
         const modelLabel = out.model ? out.model.replace(/^gpt-6\.1-sol$/i, 'GPT-6.1-Sol') : 'Codex';
         const effortLabel = out.effort || 'high';
         const winK = Math.round((out.modelContextWindow || 380000) / 1000);
@@ -622,6 +756,13 @@ function readCodexRolloutSummary(threadId, customCodexHome = null) {
         out.terminalLines = tailLines;
       }
     }
+    rolloutSummaryCache.set(String(threadId), {
+      rolloutPath,
+      size: st ? st.size : 0,
+      mtimeMs: st ? st.mtimeMs : 0,
+      updatedAt: Number(row.updated_at || 0),
+      summary: out,
+    });
     return out;
   } catch {
     return null;
@@ -1345,6 +1486,31 @@ export function createRemoteServer(options = {}) {
   let cronJobSeq = 1;
   let sessionSeq = 1;
 
+  function resolveMirroredSessionState(session, rollout = null, thread = null) {
+    if (!session) return 'idle';
+    if (!session.active) return 'stopped';
+    const turns = Array.isArray(thread?.turns) && thread.turns.length > 0
+      ? thread.turns
+      : Array.isArray(rollout?.turns)
+        ? rollout.turns
+        : [];
+    const latestTurn = turns.length > 0 ? turns[turns.length - 1] : null;
+    if (latestTurn) {
+      return latestTurn.status === 'inProgress' ? 'running' : 'idle';
+    }
+    if (rollout && typeof rollout.latestTurnStatus === 'string') {
+      return rollout.latestTurnStatus === 'inProgress' ? 'running' : 'idle';
+    }
+    return 'idle';
+  }
+
+  function updateSessionStateIfChanged(session, nextState) {
+    if (!session || !nextState || session.state === nextState) return false;
+    session.state = nextState;
+    broadcast('session-changed', publicSessionInfo(session));
+    return true;
+  }
+
   function materializeDesktopSessions() {
     const synced = syncFromDesktopDatabase();
     if (!synced) return;
@@ -1356,13 +1522,18 @@ export function createRemoteServer(options = {}) {
       const threadId = ls.threadId || ls.resumeSessionId || meta.threadId || meta.resumeSessionId || null;
       const cwd = normalizeWindowsExtendedPath(String(ls.cwd || meta.cwd || os.homedir()));
       const title = String(ls.title || ls.name || meta.title || meta.name || '세션');
-      const liveState = meta.state && meta.state !== 'stopped' ? String(meta.state) : 'idle';
+      const rollout = threadId ? readCodexRolloutSummary(String(threadId), codexHomeDir) : null;
       if (existing) {
         existing.title = title;
         existing.cwd = cwd;
         existing.projectId = ls.projectId ?? meta.projectId ?? existing.projectId ?? null;
         existing.projectAssigned = Boolean(ls.projectAssigned ?? meta.projectAssigned ?? existing.projectAssigned);
-        if (meta.state && meta.active !== false) existing.state = String(meta.state);
+        const derivedState = resolveMirroredSessionState(
+          existing,
+          rollout,
+          existing.threadId ? state.threads[existing.threadId] : null,
+        );
+        updateSessionStateIfChanged(existing, derivedState);
         continue;
       }
       const session = {
@@ -1373,7 +1544,7 @@ export function createRemoteServer(options = {}) {
         threadId: threadId ? String(threadId) : null,
         projectId: ls.projectId ?? meta.projectId ?? null,
         projectAssigned: Boolean(ls.projectAssigned ?? meta.projectAssigned ?? (ls.projectId !== undefined)),
-        state: liveState,
+        state: 'idle',
         active: meta.active !== false,
         cols: 100,
         rows: 30,
@@ -1387,31 +1558,33 @@ export function createRemoteServer(options = {}) {
         rolloutTerminalLines: [],
         lastRolloutUpdatedAt: 0,
       };
-      sessions.set(id, session);
-      if (session.threadId) {
-        const rollout = readCodexRolloutSummary(session.threadId, codexHomeDir);
-        if (rollout) {
-          session.rolloutTerminalLines = rollout.terminalLines || [];
-          session.lastRolloutUpdatedAt = rollout.updatedAt || 0;
-          session.lastRolloutSize = rollout.rolloutSize || 0;
-          session.lastRolloutDigest = JSON.stringify(session.rolloutTerminalLines);
-          state.threads[session.threadId] = {
-            id: session.threadId,
-            title: rollout.title || session.title,
-            cwd: rollout.cwd || session.cwd,
-            createdAt: rollout.createdAt,
-            updatedAt: rollout.updatedAt,
-            model: rollout.model,
-            effort: rollout.effort,
-            modelContextWindow: rollout.modelContextWindow || 380000,
-            effectiveContextWindow: rollout.modelContextWindow || 380000,
-            usedTokens: rollout.usedTokens || 0,
-            turns: rollout.turns,
-            memorySummary: null,
-            readState: { firstUnread: null, revision: 'rev-1' },
-          };
-        }
+      if (session.threadId && rollout) {
+        session.rolloutTerminalLines = rollout.terminalLines || [];
+        session.lastRolloutUpdatedAt = rollout.updatedAt || 0;
+        session.lastRolloutSize = rollout.rolloutSize || 0;
+        session.lastRolloutDigest = JSON.stringify(session.rolloutTerminalLines);
+        state.threads[session.threadId] = {
+          id: session.threadId,
+          title: rollout.title || session.title,
+          cwd: rollout.cwd || session.cwd,
+          createdAt: rollout.createdAt,
+          updatedAt: rollout.updatedAt,
+          model: rollout.model,
+          effort: rollout.effort,
+          modelContextWindow: rollout.modelContextWindow || 380000,
+          effectiveContextWindow: rollout.modelContextWindow || 380000,
+          usedTokens: rollout.usedTokens || 0,
+          turns: rollout.turns,
+          memorySummary: null,
+          readState: { firstUnread: null, revision: 'rev-1' },
+        };
       }
+      session.state = resolveMirroredSessionState(
+        session,
+        rollout,
+        session.threadId ? state.threads[session.threadId] : null,
+      );
+      sessions.set(id, session);
     }
   }
 
@@ -1420,6 +1593,20 @@ export function createRemoteServer(options = {}) {
   function emitMirroredSessionSnapshot(session, force = false) {
     if (!session || !session.threadId) return false;
     const rollout = readCodexRolloutSummary(session.threadId, codexHomeDir);
+    if (rollout) {
+      session.lastRolloutUpdatedAt = rollout.updatedAt || session.lastRolloutUpdatedAt || 0;
+      session.lastRolloutSize = rollout.rolloutSize || session.lastRolloutSize || 0;
+      if (state.threads[session.threadId] && rollout.turns?.length) {
+        state.threads[session.threadId].turns = rollout.turns;
+        state.threads[session.threadId].updatedAt = rollout.updatedAt;
+      }
+      if (session.isDesktopMirrored) {
+        updateSessionStateIfChanged(
+          session,
+          resolveMirroredSessionState(session, rollout, state.threads[session.threadId]),
+        );
+      }
+    }
     const lines = rollout?.terminalLines?.length ? rollout.terminalLines : session.rolloutTerminalLines;
     if (!lines || lines.length === 0) return false;
     const digest = JSON.stringify(lines);
@@ -1429,14 +1616,6 @@ export function createRemoteServer(options = {}) {
     session.seededRolloutTerminal = true;
     session.rolloutTerminalLines = lines;
     session.lastRolloutDigest = digest;
-    if (rollout) {
-      session.lastRolloutUpdatedAt = rollout.updatedAt || session.lastRolloutUpdatedAt || 0;
-      session.lastRolloutSize = rollout.rolloutSize || session.lastRolloutSize || 0;
-      if (state.threads[session.threadId] && rollout.turns?.length) {
-        state.threads[session.threadId].turns = rollout.turns;
-        state.threads[session.threadId].updatedAt = rollout.updatedAt;
-      }
-    }
     emitTerminalOutput(
       session,
       `\x1b[2J\x1b[H\x1b[38;5;141m╭─ ${session.title} · ${session.cwd}\x1b[0m\r\n` +
@@ -1499,6 +1678,11 @@ export function createRemoteServer(options = {}) {
           ...(notification.id !== undefined ? { requestId: String(notification.id), responded: false } : {}),
         };
         session.events.push(entry);
+        if (notification.method === 'turn/started') {
+          updateSessionStateIfChanged(session, 'running');
+        } else if (notification.method === 'turn/completed' || notification.method === 'error') {
+          updateSessionStateIfChanged(session, 'idle');
+        }
         if (notification.method === 'item/agentMessage/delta' && notification.params?.delta) {
           session._streamedItemIds = session._streamedItemIds || new Set();
           if (notification.params?.itemId) session._streamedItemIds.add(String(notification.params.itemId));
@@ -1551,8 +1735,19 @@ export function createRemoteServer(options = {}) {
     };
   }
 
+  const threadReadInFlight = new Map(); // `${threadId}:${includeTurns}` -> Promise
+  const threadReadFullCacheAt = new Map(); // threadId -> unixMs
+
   async function syncThreadFromServer(session, includeTurns = true) {
     let threadId = session.threadId;
+    const rollout = threadId ? readCodexRolloutSummary(threadId, codexHomeDir) : null;
+    const hasRolloutTurns = Boolean(rollout && Array.isArray(rollout.turns) && rollout.turns.length > 0);
+    const cachedFullAt = threadId ? (threadReadFullCacheAt.get(threadId) || 0) : 0;
+    const existingTurns = threadId && Array.isArray(state.threads[threadId]?.turns) ? state.threads[threadId].turns : [];
+    const canSkipHeavyRead =
+      includeTurns &&
+      (hasRolloutTurns || (existingTurns.length > 0 && Date.now() - cachedFullAt < 5000));
+
     if (appServerBridge.isConnected() || options.rpcTransport || computeSettings().appServer.resolvedPath) {
       try {
         await appServerBridge.ensureStarted();
@@ -1563,16 +1758,34 @@ export function createRemoteServer(options = {}) {
               threadId = String(started.thread.id);
               session.threadId = threadId;
             }
-          } else {
+          } else if (!canSkipHeavyRead) {
+            const rpcIncludeTurns = includeTurns && !hasRolloutTurns;
+            const flightKey = `${threadId}:${rpcIncludeTurns ? '1' : '0'}`;
+            let readPromise = threadReadInFlight.get(flightKey);
+            if (!readPromise) {
+              readPromise = appServerBridge
+                .request('thread/read', { threadId, includeTurns: rpcIncludeTurns })
+                .finally(() => {
+                  threadReadInFlight.delete(flightKey);
+                });
+              threadReadInFlight.set(flightKey, readPromise);
+            }
             try {
-              const readRes = await appServerBridge.request('thread/read', { threadId, includeTurns });
+              const readRes = await readPromise;
               if (readRes?.thread) {
-                state.threads[threadId] = {
+                const nextThread = {
                   ...(state.threads[threadId] || {}),
                   ...readRes.thread,
                   id: threadId,
                   cwd: readRes.thread.cwd || session.cwd,
                 };
+                if (!rpcIncludeTurns && Array.isArray(state.threads[threadId]?.turns) && state.threads[threadId].turns.length > 0) {
+                  nextThread.turns = state.threads[threadId].turns;
+                }
+                state.threads[threadId] = nextThread;
+                if (rpcIncludeTurns) {
+                  threadReadFullCacheAt.set(threadId, Date.now());
+                }
               }
             } catch {
               // FAIL-05 fix: Never overwrite an existing session threadId when thread/read fails
@@ -1606,40 +1819,57 @@ export function createRemoteServer(options = {}) {
       };
     }
     const currentThread = state.threads[threadId];
-    if (includeTurns || !currentThread.turns || currentThread.turns.length === 0) {
-      const rollout = readCodexRolloutSummary(threadId, codexHomeDir);
-      if (rollout) {
-        if (!currentThread.model && rollout.model) currentThread.model = rollout.model;
-        if (!currentThread.effort && rollout.effort) currentThread.effort = rollout.effort;
-        if (rollout.usedTokens > 0) currentThread.usedTokens = rollout.usedTokens;
-        if (rollout.modelContextWindow > 0) {
-          currentThread.modelContextWindow = rollout.modelContextWindow;
-          currentThread.effectiveContextWindow = rollout.modelContextWindow;
-        }
-        if ((!currentThread.turns || currentThread.turns.length === 0) && rollout.turns.length > 0) {
-          currentThread.turns = rollout.turns;
-        }
-        if (!session.seededRolloutTerminal && rollout.terminalLines.length > 0) {
-          session.seededRolloutTerminal = true;
-          emitTerminalOutput(
-            session,
-            `\x1b[38;5;141m╭─ ${session.title} · ${session.cwd}\x1b[0m\r\n` +
-              rollout.terminalLines.join('\r\n') +
-              '\r\n',
-          );
-        }
+    const activeRollout = rollout || readCodexRolloutSummary(threadId, codexHomeDir);
+    if (activeRollout) {
+      if (!currentThread.model && activeRollout.model) currentThread.model = activeRollout.model;
+      if (!currentThread.effort && activeRollout.effort) currentThread.effort = activeRollout.effort;
+      if (activeRollout.usedTokens > 0) currentThread.usedTokens = activeRollout.usedTokens;
+      if (activeRollout.modelContextWindow > 0) {
+        currentThread.modelContextWindow = activeRollout.modelContextWindow;
+        currentThread.effectiveContextWindow = activeRollout.modelContextWindow;
       }
+      if (activeRollout.turns.length > 0) {
+        const localExtraTurns = Array.isArray(currentThread.turns)
+          ? currentThread.turns.filter(lt => !activeRollout.turns.some(rt => rt.id === lt.id))
+          : [];
+        currentThread.turns = [...activeRollout.turns, ...localExtraTurns].slice(-50);
+      }
+      if (!session.seededRolloutTerminal && activeRollout.terminalLines.length > 0) {
+        session.seededRolloutTerminal = true;
+        emitTerminalOutput(
+          session,
+          `\x1b[38;5;141m╭─ ${session.title} · ${session.cwd}\x1b[0m\r\n` +
+            activeRollout.terminalLines.join('\r\n') +
+            '\r\n',
+        );
+      }
+    }
+    if (session.isDesktopMirrored) {
+      updateSessionStateIfChanged(
+        session,
+        resolveMirroredSessionState(session, activeRollout, currentThread),
+      );
     }
     return currentThread;
   }
 
+  let cachedModelsResult = null;
+  let cachedModelsAt = 0;
   async function queryServerModels(cursor = null) {
+    if (!cursor && cachedModelsResult && Date.now() - cachedModelsAt < 30000) {
+      return cachedModelsResult;
+    }
     try {
       await appServerBridge.ensureStarted();
       if (appServerBridge.isConnected()) {
         const rpcRes = await appServerBridge.request('model/list', { cursor });
         if (Array.isArray(rpcRes?.data)) {
-          return { data: rpcRes.data, models: rpcRes.data, nextCursor: rpcRes.nextCursor ?? null };
+          const res = { data: rpcRes.data, models: rpcRes.data, nextCursor: rpcRes.nextCursor ?? null };
+          if (!cursor) {
+            cachedModelsResult = res;
+            cachedModelsAt = Date.now();
+          }
+          return res;
         }
       }
     } catch {
@@ -1659,16 +1889,20 @@ export function createRemoteServer(options = {}) {
     }
 
     if (type === 'page') {
+      const PAGE_SIZE = 30;
       const rawTurns = Array.isArray(thread.turns) ? [...thread.turns].reverse() : [];
-      const data = rawTurns.map((t, idx) => ({
-        id: String(t.id || `turn-${idx + 1}`),
+      const offset = Math.max(0, Number(request.cursor || 0) || 0);
+      const slicedTurns = rawTurns.slice(offset, offset + PAGE_SIZE);
+      const data = slicedTurns.map((t, idx) => ({
+        id: String(t.id || `turn-${offset + idx + 1}`),
         status: String(t.status || 'completed'),
         createdAt: t.createdAt ?? Math.floor(Date.now() / 1000),
       }));
+      const nextCursor = offset + PAGE_SIZE < rawTurns.length ? String(offset + PAGE_SIZE) : null;
       return {
         data,
         turns: data,
-        nextCursor: null,
+        nextCursor,
       };
     }
 
@@ -1737,31 +1971,48 @@ export function createRemoteServer(options = {}) {
     }
 
     if (type === 'items') {
+      const ITEMS_PAGE_SIZE = 50;
       const turn = (thread.turns || []).find(t => t.id === request.turnId);
       const rawItems = turn && Array.isArray(turn.items) ? turn.items : [];
-      const data = rawItems.map((rawItem, idx) => ({
+      const normalizedAll = rawItems.map((rawItem, idx) =>
+        normalizeConversationItem(rawItem, idx, String(request.turnId)),
+      );
+      if (turn) {
+        turn._normalizedItems = normalizedAll;
+      }
+      const reversedAll = [...normalizedAll].reverse();
+      const offset = Math.max(0, Number(request.cursor || 0) || 0);
+      const pageItems = reversedAll.slice(offset, offset + ITEMS_PAGE_SIZE);
+      const data = pageItems.map(item => ({
         turnId: String(request.turnId),
-        item: normalizeConversationItem(rawItem, idx, String(request.turnId)),
+        item: serializeItemForPage(item),
       }));
+      const nextCursor = offset + ITEMS_PAGE_SIZE < reversedAll.length ? String(offset + ITEMS_PAGE_SIZE) : null;
       return {
         turnId: request.turnId,
         data,
         items: data.map(d => d.item),
-        nextCursor: null,
+        nextCursor,
       };
     }
 
     if (type === 'detail') {
       const turn = (thread.turns || []).find(t => t.id === request.turnId);
-      const item = (turn?.items || []).find(i => i.id === request.itemId);
-      const fullText = String(item?.text ?? '');
-      const offset = Number(request.offset || 0);
+      const itemsPool = Array.isArray(turn?._normalizedItems)
+        ? turn._normalizedItems
+        : Array.isArray(turn?.items)
+          ? turn.items.map((rawItem, idx) => normalizeConversationItem(rawItem, idx, String(request.turnId)))
+          : [];
+      const item = itemsPool.find(i => i.id === request.itemId);
+      const fullText = itemFullDetailText(item);
+      const offset = Math.max(0, Number(request.offset || 0) || 0);
+      const sliceEnd = offset + ITEM_PREVIEW_LIMIT;
       return {
         turnId: request.turnId,
         itemId: request.itemId,
-        text: fullText.slice(offset, offset + 16384),
-        totalBytes: Buffer.byteLength(fullText, 'utf8'),
-        nextOffset: offset + 16384 < fullText.length ? offset + 16384 : null,
+        text: fullText.slice(offset, sliceEnd),
+        totalBytes: fullText.length,
+        nextOffset: sliceEnd < fullText.length ? sliceEnd : null,
       };
     }
 
@@ -1804,6 +2055,7 @@ export function createRemoteServer(options = {}) {
       thread.updatedAt = Math.floor(Date.now() / 1000);
       if (request.model) thread.model = String(request.model);
       if (request.effort) thread.effort = String(request.effort);
+      updateSessionStateIfChanged(session, turn.status === 'inProgress' ? 'running' : 'idle');
       persistState();
       if (!sessionProcesses.has(session.id)) {
         const outLines = [];
@@ -1834,6 +2086,14 @@ export function createRemoteServer(options = {}) {
         threadId,
         ...(request.turnId ? { turnId: request.turnId } : {}),
       });
+      if (Array.isArray(thread.turns)) {
+        for (const t of thread.turns) {
+          if (t.status === 'inProgress' && (!request.turnId || t.id === request.turnId)) {
+            t.status = 'interrupted';
+          }
+        }
+      }
+      updateSessionStateIfChanged(session, 'idle');
       return rpcRes || { interrupted: true };
     }
 
@@ -1859,6 +2119,10 @@ export function createRemoteServer(options = {}) {
         } catch {
           // Use cached thread values if read fails on unmaterialized thread.
         }
+      }
+      if (session.isDesktopMirrored) {
+        const rollout = readCodexRolloutSummary(threadId, codexHomeDir);
+        updateSessionStateIfChanged(session, resolveMirroredSessionState(session, rollout, thread));
       }
       const caps = appServerBridge.serverInfo?.opendiyCapabilities || {};
       const usedTokens = Number(thread.usedTokens || 0);
@@ -2497,44 +2761,34 @@ export function createRemoteServer(options = {}) {
       }
       case 'catalog_preview': {
         const threadId = String(args.threadId ?? args.thread_id ?? '');
-        if (appServerBridge.isConnected() && threadId) {
+        let thread = state.threads[threadId];
+        if ((!thread || !Array.isArray(thread.turns) || thread.turns.length === 0) && threadId) {
+          const rollout = readCodexRolloutSummary(threadId, codexHomeDir);
+          if (rollout && rollout.turns.length > 0) {
+            thread = rollout;
+          }
+        }
+        if ((!thread || !Array.isArray(thread.turns) || thread.turns.length === 0) && appServerBridge.isConnected() && threadId) {
           try {
             const readRes = await appServerBridge.request('thread/read', { threadId, includeTurns: true });
             if (Array.isArray(readRes?.thread?.turns) && readRes.thread.turns.length > 0) {
-              const messages = [];
-              let msgSeq = 1;
-              for (const turn of readRes.thread.turns) {
-                for (const item of turn.items || []) {
-                  messages.push({
-                    id: String(item.id || `${turn.id || 'turn'}-${msgSeq++}`),
-                    role: item.role === 'user' || item.type === 'userMessage' ? 'user' : 'assistant',
-                    text: String(item.text ?? ''),
-                  });
-                }
-              }
-              return { messages, nextCursor: null };
+              thread = readRes.thread;
             }
           } catch {
             // Fall back to local thread cache.
           }
         }
-        let thread = state.threads[threadId];
-        if ((!thread || !Array.isArray(thread.turns) || thread.turns.length === 0) && threadId) {
-          const rollout = readCodexRolloutSummary(threadId);
-          if (rollout && rollout.turns.length > 0) {
-            thread = rollout;
-          }
-        }
         const messages = [];
         let msgSeq = 1;
         if (thread && Array.isArray(thread.turns)) {
-          for (const turn of thread.turns) {
+          for (const turn of thread.turns.slice(-20)) {
             for (const item of turn.items || []) {
-              if (!item.text) continue;
+              const txt = String(item.text ?? '').trim();
+              if (!txt) continue;
               messages.push({
                 id: String(item.id || `${turn.id || 'turn'}-${msgSeq++}`),
                 role: item.role === 'user' || item.type === 'userMessage' ? 'user' : 'assistant',
-                text: String(item.text ?? ''),
+                text: txt.slice(0, ITEM_PREVIEW_LIMIT),
               });
             }
           }

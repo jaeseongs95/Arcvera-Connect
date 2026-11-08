@@ -245,7 +245,7 @@ test('relay + host connector mode renders mirrored desktop terminal rollout on i
   );
   desktopDb.prepare('INSERT INTO session_metadata (id, generation, metadata, updated_at) VALUES (?, 1, ?, 1700000100)').run(
     'sess-relay-1',
-    JSON.stringify({ id: 'sess-relay-1', name: 'desktop 담당', cwd: projDir, projectId: 'proj-dev', resumeSessionId: 'thread-relay-1', runtimeKind: 'codex' }),
+    JSON.stringify({ id: 'sess-relay-1', name: 'desktop 담당', cwd: projDir, projectId: 'proj-dev', resumeSessionId: 'thread-relay-1', runtimeKind: 'codex', state: 'running' }),
   );
   desktopDb.close();
 
@@ -280,6 +280,9 @@ test('relay + host connector mode renders mirrored desktop terminal rollout on i
               historySummary: true,
             },
           };
+        }
+        if (method === 'thread/read' && params?.includeTurns === true) {
+          throw new Error('thread/read with includeTurns: true must not block mirrored rollout history');
         }
         if (method === 'thread/resume') {
           return { thread: { id: params.threadId, turns: [] }, model: 'gpt-5.4', reasoningEffort: 'xhigh' };
@@ -331,6 +334,18 @@ test('relay + host connector mode renders mirrored desktop terminal rollout on i
     await expect(card).toBeVisible();
     await expect(card.locator('.xterm-rows')).toContainText('중단된 지점부터 이어서 작업해줘.');
     await expect(card.locator('.xterm-rows')).toContainText('릴레이 미러링 복원 완료했습니다.');
+
+    // REMOTE-BLKR-06: Stale state="running" in session_metadata is reconciled to "입력 가능" (idle) when latest turn is completed
+    await expect(card.locator('.session-state')).toHaveText('입력 가능');
+
+    // REMOTE-BLKR-05: Structured conversation toggle (☷) loads history immediately without heavy thread/read timeout
+    await card.locator('.conversation-toggle').click();
+    await expect(card.locator('.conversation-host')).toBeVisible();
+    await expect(card.locator('.conversation-message')).toHaveCount(2, { timeout: 2000 });
+    await expect(card.locator('.conversation-message').first()).toContainText('중단된 지점부터 이어서 작업해줘.');
+    await expect(card.locator('.conversation-message').nth(1)).toContainText('릴레이 미러링 복원 완료했습니다.');
+    await expect(card.locator('.conversation-input')).toBeEnabled();
+    await card.locator('.conversation-toggle').click();
 
     // BLKR-02: Browser refresh (F5) in relay mode preserves and re-renders the mirrored terminal snapshot
     await page.reload();
