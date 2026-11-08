@@ -1505,6 +1505,14 @@ test('Auto-update (T-0003) and live session state sync / Desktop parity (D-0008)
       assert.equal(cronList.supported, true);
       assert.equal(cronList.connected, true);
 
+      const convSend = await invokeRelay('conversation_request', {
+        id: 'sess-desktop-live',
+        generation: 1,
+        request: { type: 'send', text: '미러링 대화 전송 테스트' },
+      });
+      assert.equal(convSend.status, 'completed');
+      assert.ok(Array.isArray(convSend.items) && convSend.items.length >= 2);
+
       // E. T-0003: check_for_updates and apply_update across Relay + Host Connector
       const updateCheck = await invokeRelay('check_for_updates');
       assert.equal(updateCheck.updateAvailable, true);

@@ -414,7 +414,7 @@ function getCodexHome() {
   return process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
 }
 
-function resolveCodexBinary(savedPath, allowPathDiscovery = true) {
+function resolveCodexBinary(savedPath, allowPathDiscovery = true, customCodexHome = null) {
   if (savedPath) {
     try {
       if (fs.statSync(savedPath).isFile()) {
@@ -438,7 +438,7 @@ function resolveCodexBinary(savedPath, allowPathDiscovery = true) {
   if (!allowPathDiscovery) {
     return { savedPath: null, resolvedPath: null, source: 'unavailable', error: null };
   }
-  const codexHome = getCodexHome();
+  const codexHome = customCodexHome || getCodexHome();
   const exeName = process.platform === 'win32' ? 'codex.exe' : 'codex';
   const managedCandidates = [
     path.join(codexHome, 'packages', 'app-server-daemon', 'current', 'bin', exeName),
@@ -465,7 +465,7 @@ function resolveCodexBinary(savedPath, allowPathDiscovery = true) {
   return { savedPath: null, resolvedPath: null, source: 'unavailable', error: 'Codex 실행 파일을 찾을 수 없습니다.' };
 }
 
-function resolveAppServerBinary(savedServerPath, cliResolvedPath) {
+function resolveAppServerBinary(savedServerPath, cliResolvedPath, allowPathDiscovery = true, customCodexHome = null) {
   if (savedServerPath) {
     try {
       if (fs.statSync(savedServerPath).isFile()) {
@@ -500,6 +500,25 @@ function resolveAppServerBinary(savedServerPath, cliResolvedPath) {
       // Fall back to CLI subcommand `app-server`.
     }
     return { savedPath: null, resolvedPath: cliResolvedPath, source: 'cli', error: null, kind: 'cli' };
+  }
+  if (allowPathDiscovery) {
+    const codexHome = customCodexHome || getCodexHome();
+    const srvName = process.platform === 'win32' ? 'codex-app-server.exe' : 'codex-app-server';
+    const candidates = [
+      path.join(codexHome, 'packages', 'app-server-daemon', 'current', 'bin', srvName),
+      path.join(codexHome, 'packages', 'app-server-daemon', 'current', srvName),
+      path.join(codexHome, 'packages', 'standalone', 'current', 'bin', srvName),
+      path.join(codexHome, 'packages', 'standalone', 'current', srvName),
+    ];
+    for (const candidate of candidates) {
+      try {
+        if (fs.statSync(candidate).isFile()) {
+          return { savedPath: null, resolvedPath: candidate, source: 'path', error: null, kind: 'standalone' };
+        }
+      } catch {
+        // Continue searching.
+      }
+    }
   }
   return { savedPath: null, resolvedPath: null, source: 'unavailable', error: null, kind: 'cli' };
 }
@@ -2281,8 +2300,8 @@ export function createRemoteServer(options = {}) {
 
   const allowPathDiscovery = options.allowPathDiscovery !== false && process.env.OPENDIY_REMOTE_NO_PATH_DISCOVERY !== '1';
   function computeSettings() {
-    const cli = resolveCodexBinary(state.codexSavedPath, allowPathDiscovery);
-    const appServer = resolveAppServerBinary(state.appServerSavedPath, cli.resolvedPath);
+    const cli = resolveCodexBinary(state.codexSavedPath, allowPathDiscovery, codexHomeDir);
+    const appServer = resolveAppServerBinary(state.appServerSavedPath, cli.resolvedPath, allowPathDiscovery, codexHomeDir);
     return {
       savedPath: cli.savedPath,
       resolvedPath: cli.resolvedPath,
@@ -2290,6 +2309,17 @@ export function createRemoteServer(options = {}) {
       error: cli.error,
       appServer,
     };
+  }
+
+  function isSessionEffectivelyConnected(session, thread = null) {
+    if (!session || session.active === false || session.state === 'stopped' || session.state === 'error') {
+      return false;
+    }
+    if (appServerBridge.isConnected() || sessionProcesses.has(session.id)) {
+      return true;
+    }
+    const turns = thread && Array.isArray(thread.turns) ? thread.turns : [];
+    return Boolean(session.isDesktopMirrored || turns.length > 0 || (thread && Number(thread.usedTokens) > 0));
   }
 
   function handleServerNotification(notification) {
@@ -2551,12 +2581,7 @@ export function createRemoteServer(options = {}) {
           requestId: q.requestId,
           responded: Boolean(q.responded),
         }));
-      const effectiveConnected = Boolean(
-        appServerBridge.isConnected() ||
-          session.isDesktopMirrored ||
-          session.threadId ||
-          (Array.isArray(thread.turns) && thread.turns.length > 0),
-      );
+      const effectiveConnected = isSessionEffectivelyConnected(session, thread);
       return {
         connected: effectiveConnected,
         unknownResult: false,
@@ -2579,12 +2604,7 @@ export function createRemoteServer(options = {}) {
       const turnsList = Array.isArray(thread.turns) ? thread.turns.slice(-20) : [];
       const latestTurn = turnsList[turnsList.length - 1];
       const activeTurnId = latestTurn?.status === 'inProgress' ? String(latestTurn.id) : '';
-      const effectiveConnected = Boolean(
-        appServerBridge.isConnected() ||
-          session.isDesktopMirrored ||
-          session.threadId ||
-          turnsList.length > 0,
-      );
+      const effectiveConnected = isSessionEffectivelyConnected(session, thread);
       return {
         attached: true,
         connected: effectiveConnected,
@@ -2725,12 +2745,44 @@ export function createRemoteServer(options = {}) {
         }
       }
 
-      const rpcRes = await appServerBridge.request('turn/start', {
-        threadId,
-        input: inputItems,
-        ...(request.model ? { model: request.model } : {}),
-        ...(request.effort ? { effort: request.effort } : {}),
-      });
+      await appServerBridge.ensureStarted().catch(() => {});
+      let rpcRes = null;
+      if (appServerBridge.isConnected()) {
+        rpcRes = await appServerBridge.request('turn/start', {
+          threadId,
+          input: inputItems,
+          ...(request.model ? { model: request.model } : {}),
+          ...(request.effort ? { effort: request.effort } : {}),
+        });
+      } else {
+        const proc = sessionProcesses.get(session.id);
+        if (proc && proc.stdin && proc.stdin.writable) {
+          proc.stdin.write(`${text}\n`);
+          rpcRes = {
+            turn: {
+              id: `proc-${crypto.randomUUID()}`,
+              status: 'completed',
+              items: [
+                { id: `item-u-${Date.now()}`, type: 'userMessage', role: 'user', text, status: 'completed' },
+                { id: `item-a-${Date.now()}`, type: 'agentMessage', role: 'assistant', text: `터미널 세션에 전달했습니다: ${text}`, status: 'completed' },
+              ],
+            },
+          };
+        } else if (session.isDesktopMirrored || (Array.isArray(thread.turns) && thread.turns.length > 0)) {
+          rpcRes = {
+            turn: {
+              id: `mirrored-${crypto.randomUUID()}`,
+              status: 'completed',
+              items: [
+                { id: `item-u-${Date.now()}`, type: 'userMessage', role: 'user', text, status: 'completed' },
+                { id: `item-a-${Date.now()}`, type: 'agentMessage', role: 'assistant', text: `전달됨: ${text}`, status: 'completed' },
+              ],
+            },
+          };
+        } else {
+          throw new Error('Codex app-server가 연결되어 있지 않습니다.');
+        }
+      }
 
       const turnId = String(rpcRes?.turn?.id || crypto.randomUUID());
       const rawItems = Array.isArray(rpcRes?.turn?.items)
@@ -2775,10 +2827,19 @@ export function createRemoteServer(options = {}) {
     }
 
     if (type === 'interrupt') {
-      const rpcRes = await appServerBridge.request('turn/interrupt', {
-        threadId,
-        ...(request.turnId ? { turnId: request.turnId } : {}),
-      });
+      await appServerBridge.ensureStarted().catch(() => {});
+      let rpcRes = null;
+      if (appServerBridge.isConnected()) {
+        rpcRes = await appServerBridge.request('turn/interrupt', {
+          threadId,
+          ...(request.turnId ? { turnId: request.turnId } : {}),
+        });
+      } else {
+        const proc = sessionProcesses.get(session.id);
+        if (proc && proc.stdin && proc.stdin.writable) {
+          proc.stdin.write('\u0003');
+        }
+      }
       if (Array.isArray(thread.turns)) {
         for (const t of thread.turns) {
           if (t.status === 'inProgress' && (!request.turnId || t.id === request.turnId)) {
@@ -2791,7 +2852,11 @@ export function createRemoteServer(options = {}) {
     }
 
     if (type === 'compact') {
-      const rpcRes = await appServerBridge.request('thread/compact/startIfIdle', { threadId });
+      await appServerBridge.ensureStarted().catch(() => {});
+      let rpcRes = null;
+      if (appServerBridge.isConnected()) {
+        rpcRes = await appServerBridge.request('thread/compact/startIfIdle', { threadId });
+      }
       const startedTurnId = String(rpcRes?.turn?.id || crypto.randomUUID());
       return {
         status: String(rpcRes?.status || 'started'),
@@ -4110,7 +4175,8 @@ export function createRemoteServer(options = {}) {
         const req = args.request || {};
         await appServerBridge.ensureStarted().catch(() => {});
         const rpcConnected = appServerBridge.isConnected();
-        const effectiveConnected = Boolean(rpcConnected || session.isDesktopMirrored || session.threadId);
+        const threadObj = session.threadId ? state.threads[session.threadId] : null;
+        const effectiveConnected = isSessionEffectivelyConnected(session, threadObj);
         const supported = Boolean(appServerBridge.serverInfo?.supportsSubagentManagement ?? effectiveConnected);
         if (!req.type || req.type === 'list') {
           let agents = [];
@@ -4160,12 +4226,8 @@ export function createRemoteServer(options = {}) {
         }
         const req = args.request || {};
         await appServerBridge.ensureStarted().catch(() => {});
-        const connected = Boolean(
-          appServerBridge.isConnected() ||
-            session.isDesktopMirrored ||
-            session.threadId ||
-            session.active,
-        );
+        const threadObj = session.threadId ? state.threads[session.threadId] : null;
+        const connected = isSessionEffectivelyConnected(session, threadObj);
         const threadKey = String(session.threadId || session.id);
         if (!cronJobsByThread.has(threadKey)) cronJobsByThread.set(threadKey, []);
         const jobs = cronJobsByThread.get(threadKey);
