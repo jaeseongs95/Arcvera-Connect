@@ -605,10 +605,14 @@ test('remote server mirrors OpenDIY Desktop workspace.sqlite3 projects, active s
     JSON.stringify({ timestamp: '2026-11-08T02:00:02Z', type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-1', model_context_window: 380000 } }),
     JSON.stringify({ timestamp: '2026-11-08T02:00:03Z', type: 'event_msg', payload: { type: 'user_message', message: '중단된 지점부터 이어서 작업해줘.' } }),
     JSON.stringify({ timestamp: '2026-11-08T02:00:04Z', type: 'response_item', payload: { type: 'function_call', name: 'exec_command', call_id: 'call-1', arguments: JSON.stringify({ cmd: 'git status --short' }) } }),
+    JSON.stringify({ timestamp: '2026-11-08T02:00:04.5Z', type: 'event_msg', payload: { type: 'item_completed', turn_id: 'turn-1', item: { id: 'call-1', type: 'CommandExecution', command: ['git', 'status', '--short'], status: 'completed' } } }),
     JSON.stringify({ timestamp: '2026-11-08T02:00:05Z', type: 'response_item', payload: { type: 'function_call_output', call_id: 'call-1', output: `Process exited with code 0\nOutput:\nM src/main.ts\n${hugeOutput}` } }),
-    JSON.stringify({ timestamp: '2026-11-08T02:00:06Z', type: 'event_msg', payload: { type: 'agent_message', message: '작업을 재개했습니다.' } }),
+    JSON.stringify({ timestamp: '2026-11-08T02:00:06Z', type: 'event_msg', payload: { type: 'item_completed', turn_id: 'turn-1', item: { id: 'msg-assistant-1', type: 'AgentMessage', content: [{ type: 'Text', text: '작업을 재개했습니다.' }] } } }),
+    JSON.stringify({ timestamp: '2026-11-08T02:00:06.5Z', type: 'response_item', payload: { type: 'message', id: 'msg-assistant-1', role: 'assistant', content: [{ type: 'output_text', text: '작업을 재개했습니다.' }] } }),
     JSON.stringify({ timestamp: '2026-11-08T02:00:07Z', type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { total_tokens: 120000 }, last_token_usage: { total_tokens: 228000 }, model_context_window: 380000 } } }),
     JSON.stringify({ timestamp: '2026-11-08T02:00:08Z', type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn-1' } }),
+    JSON.stringify({ timestamp: '2026-11-08T02:00:09Z', type: 'event_msg', payload: { type: 'item_completed', turn_id: 'turn-1', item: { id: 'msg-assistant-2', type: 'AgentMessage', content: [{ type: 'Text', text: '두 번째 턴 응답입니다.' }] } } }),
+    JSON.stringify({ timestamp: '2026-11-08T02:00:09.5Z', type: 'response_item', payload: { type: 'message', id: 'msg-assistant-2', role: 'assistant', content: [{ type: 'output_text', text: '두 번째 턴 응답입니다.' }] } }),
   ];
   fs.writeFileSync(rolloutFile, rolloutLines.join('\n') + '\n', 'utf8');
 
@@ -766,13 +770,18 @@ test('remote server mirrors OpenDIY Desktop workspace.sqlite3 projects, active s
       generation: 1,
       request: { type: 'page' },
     });
-    assert.equal(pageRes.data.length >= 1, true);
+    // REMOTE-BLKR-09: Rollout lines with multiple assistant turns split into discrete turns (>= 2)
+    assert.equal(pageRes.data.length >= 2, true);
+    const firstTurnId = pageRes.data[pageRes.data.length - 1].id;
 
     const itemsRes = await relayInvoke('conversation_request', {
       id: 'sess-desktop',
       generation: 1,
-      request: { type: 'items', turnId: pageRes.data[0].id },
+      request: { type: 'items', turnId: firstTurnId },
     });
+    // REMOTE-BLKR-08: Verify 0 duplicate item IDs even when response_item + event_msg(item_completed) share the same id
+    const seenIds = new Set(itemsRes.items.map((it: any) => it.id));
+    assert.equal(seenIds.size, itemsRes.items.length);
     assert.equal(itemsRes.items.some((it: any) => it.type === 'userMessage' && it.text.includes('중단된 지점부터')), true);
     const cmdItem = itemsRes.items.find((it: any) => it.type === 'commandExecution');
     assert.equal(Boolean(cmdItem), true);
@@ -782,7 +791,7 @@ test('remote server mirrors OpenDIY Desktop workspace.sqlite3 projects, active s
     const detailRes = await relayInvoke('conversation_request', {
       id: 'sess-desktop',
       generation: 1,
-      request: { type: 'detail', turnId: pageRes.data[0].id, itemId: cmdItem.id, offset: 16384 },
+      request: { type: 'detail', turnId: firstTurnId, itemId: cmdItem.id, offset: 16384 },
     });
     assert.equal(detailRes.totalBytes > 25000, true);
     assert.equal(detailRes.text.includes('AAAA'), true);

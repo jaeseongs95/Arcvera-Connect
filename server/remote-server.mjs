@@ -607,9 +607,47 @@ function readCodexRolloutSummary(threadId, customCodexHome = null) {
         const rawText = buf.toString('utf8');
         const rawLines = st.size > readSize ? rawText.split('\n').slice(1) : rawText.split('\n');
         const turnsMap = new Map();
-        let currentTurnId = `turn-${out.id.slice(0, 8)}`;
+        const baseTurnPrefix = `turn-${out.id.slice(0, 8)}`;
+        let subTurnSeq = 1;
+        let currentTurnId = `${baseTurnPrefix}-${subTurnSeq}`;
         const terminalLines = [];
         const pendingCallMap = new Map();
+
+        function ensureTurn(tid) {
+          if (!turnsMap.has(tid)) {
+            turnsMap.set(tid, {
+              id: tid,
+              status: 'completed',
+              createdAt: out.updatedAt,
+              items: [],
+            });
+          }
+          return turnsMap.get(tid);
+        }
+
+        function startNextSubTurn(explicitId = null) {
+          subTurnSeq += 1;
+          currentTurnId = explicitId ? `${explicitId}-${subTurnSeq}` : `${baseTurnPrefix}-${subTurnSeq}`;
+          return ensureTurn(currentTurnId);
+        }
+
+        function upsertTurnItem(turn, item) {
+          if (!turn || !item || !item.id) return item;
+          const existingIdx = turn.items.findIndex(it => it.id === item.id);
+          if (existingIdx !== -1) {
+            const prev = turn.items[existingIdx];
+            const merged = {
+              ...prev,
+              ...item,
+              text: item.text || prev.text || '',
+              aggregatedOutput: item.aggregatedOutput || prev.aggregatedOutput || '',
+            };
+            turn.items[existingIdx] = merged;
+            return merged;
+          }
+          turn.items.push(item);
+          return item;
+        }
 
         for (const line of rawLines) {
           const trimmed = line.trim();
@@ -617,26 +655,30 @@ function readCodexRolloutSummary(threadId, customCodexHome = null) {
           try {
             const obj = JSON.parse(trimmed);
             const p = obj.payload || {};
-            const turnId = String(
+            const explicitTurnId = String(
               p.turn_id ||
                 p.internal_chat_message_metadata_passthrough?.turn_id ||
-                currentTurnId,
+                '',
             );
-            currentTurnId = turnId;
-            if (!turnsMap.has(turnId)) {
-              turnsMap.set(turnId, {
-                id: turnId,
-                status: 'completed',
-                createdAt: out.updatedAt,
-                items: [],
-              });
+            if (!turnsMap.size && explicitTurnId) {
+              currentTurnId = `${explicitTurnId}-${subTurnSeq}`;
             }
-            const turn = turnsMap.get(turnId);
-            if (obj.type === 'event_msg' && p.type === 'task_started') {
-              turn.status = 'inProgress';
-              out.latestTurnStatus = 'inProgress';
-              if (p.model_context_window) {
-                out.modelContextWindow = Number(p.model_context_window);
+            let turn = ensureTurn(currentTurnId);
+
+            if (
+              (obj.type === 'event_msg' && p.type === 'task_started') ||
+              obj.type === 'turn_context' ||
+              obj.type === 'compacted'
+            ) {
+              if (turn.items.length > 0) {
+                turn = startNextSubTurn(explicitTurnId || null);
+              }
+              if (obj.type === 'event_msg' && p.type === 'task_started') {
+                turn.status = 'inProgress';
+                out.latestTurnStatus = 'inProgress';
+                if (p.model_context_window) {
+                  out.modelContextWindow = Number(p.model_context_window);
+                }
               }
             } else if (
               obj.type === 'event_msg' &&
@@ -652,25 +694,42 @@ function readCodexRolloutSummary(threadId, customCodexHome = null) {
                 out.modelContextWindow = Number(p.info.model_context_window);
               }
             } else if (
-              (obj.type === 'response_item' && p.type === 'message' && p.role === 'user') ||
+              (obj.type === 'response_item' && p.type === 'message' && (p.role === 'user' || p.role === 'developer')) ||
               (obj.type === 'event_msg' && p.type === 'user_message' && p.message)
             ) {
               const txt = Array.isArray(p.content)
                 ? p.content.map(c => String(c?.text ?? '')).join('\n').trim()
                 : String(p.message ?? '').trim();
-              if (txt && !txt.startsWith('<hook_prompt') && !txt.startsWith('[AGS 단계 확인]')) {
+              const isDeveloperWake =
+                p.role === 'developer' &&
+                (txt.includes('[agent-governance-suite') || txt.includes('peer message'));
+              if (isDeveloperWake && turn.items.some(it => it.type === 'agentMessage' || it.type === 'commandExecution' || it.type === 'mcpToolCall')) {
+                turn = startNextSubTurn(explicitTurnId || null);
+              }
+              if (
+                p.role !== 'developer' &&
+                txt &&
+                !txt.startsWith('<hook_prompt') &&
+                !txt.startsWith('[AGS 단계 확인]')
+              ) {
+                if (turn.items.some(it => it.type === 'agentMessage' || it.type === 'commandExecution' || it.type === 'mcpToolCall')) {
+                  turn = startNextSubTurn(explicitTurnId || null);
+                }
                 const alreadyAdded = turn.items.some(it => it.type === 'userMessage' && it.text === txt);
                 if (!alreadyAdded) {
                   const uItem = normalizeConversationItem(
-                    { id: p.id || `u-${turn.items.length}`, type: 'userMessage', role: 'user', text: txt, status: 'completed' },
+                    { id: p.id || `u-${turn.id}-${turn.items.length}`, type: 'userMessage', role: 'user', text: txt, status: 'completed' },
                     turn.items.length,
-                    turnId,
+                    turn.id,
                   );
-                  turn.items.push(uItem);
+                  upsertTurnItem(turn, uItem);
                   terminalLines.push(`\x1b[90m›\x1b[0m \x1b[1m${txt.split('\n')[0].slice(0, 160)}\x1b[0m`);
                 }
               }
             } else if (obj.type === 'response_item' && p.type === 'function_call' && p.call_id) {
+              if (turn.items.length >= 25 || turn.items.some(it => it.type === 'agentMessage')) {
+                turn = startNextSubTurn(explicitTurnId || null);
+              }
               let cmd = String(p.name || 'command');
               try {
                 const parsedArgs = typeof p.arguments === 'string' ? JSON.parse(p.arguments) : p.arguments;
@@ -680,10 +739,10 @@ function readCodexRolloutSummary(threadId, customCodexHome = null) {
               const cItem = normalizeConversationItem(
                 { id: String(p.call_id), type: 'commandExecution', command: cmd, aggregatedOutput: '', status: 'completed' },
                 turn.items.length,
-                turnId,
+                turn.id,
               );
-              turn.items.push(cItem);
-              pendingCallMap.set(String(p.call_id), cItem);
+              const stored = upsertTurnItem(turn, cItem);
+              pendingCallMap.set(String(p.call_id), stored);
               terminalLines.push(`\x1b[38;5;114m• Ran\x1b[0m ${cmd.slice(0, 140)}`);
             } else if (obj.type === 'response_item' && p.type === 'function_call_output' && p.call_id) {
               const target = pendingCallMap.get(String(p.call_id));
@@ -697,13 +756,17 @@ function readCodexRolloutSummary(threadId, customCodexHome = null) {
               const txt = Array.isArray(p.content)
                 ? p.content.map(c => String(c?.text ?? '')).join('\n').trim()
                 : String(p.message ?? '').trim();
-              if (txt && !turn.items.some(it => it.type === 'agentMessage' && it.text === txt)) {
+              const itemId = String(p.id || `a-${turn.id}-${turn.items.length}`);
+              if (txt && !turn.items.some(it => it.id === itemId || (it.type === 'agentMessage' && it.text === txt))) {
+                if (turn.items.some(it => it.type === 'agentMessage')) {
+                  turn = startNextSubTurn(explicitTurnId || null);
+                }
                 const aItem = normalizeConversationItem(
-                  { id: p.id || `a-${turn.items.length}`, type: 'agentMessage', role: 'assistant', text: txt, status: 'completed' },
+                  { id: p.id || `a-${turn.id}-${turn.items.length}`, type: 'agentMessage', role: 'assistant', text: txt, status: 'completed' },
                   turn.items.length,
-                  turnId,
+                  turn.id,
                 );
-                turn.items.push(aItem);
+                upsertTurnItem(turn, aItem);
                 out.latestTurnStatus = 'completed';
                 turn.status = 'completed';
                 for (const al of txt.split(/\r?\n/).slice(0, 6)) {
@@ -712,23 +775,43 @@ function readCodexRolloutSummary(threadId, customCodexHome = null) {
               }
             } else if (obj.type === 'event_msg' && p.type === 'item_completed' && p.item) {
               if (p.item.type === 'HookPrompt') continue;
-              const norm = normalizeConversationItem(p.item, turn.items.length, turnId);
-              turn.items.push(norm);
-              if (norm.type === 'commandExecution' && norm.command) {
-                terminalLines.push(`\x1b[38;5;114m• Ran\x1b[0m ${String(norm.command).slice(0, 140)}`);
-                if (norm.aggregatedOutput) {
-                  const firstOut = String(norm.aggregatedOutput).trim().split(/\r?\n/).slice(0, 3);
-                  for (const ol of firstOut) terminalLines.push(`  \x1b[90m└ ${ol.slice(0, 140)}\x1b[0m`);
-                }
-              } else if (norm.type === 'mcpToolCall' && norm.tool) {
-                terminalLines.push(`\x1b[38;5;114m• Called\x1b[0m ${norm.server}.${norm.tool}`);
-              } else if (norm.type === 'fileChange' && Array.isArray(norm.changes) && norm.changes.length) {
-                terminalLines.push(`\x1b[38;5;114m• Edited\x1b[0m ${norm.changes.map(c => c.path).join(', ')}`);
-              } else if (norm.type === 'agentMessage' && norm.text) {
-                out.latestTurnStatus = 'completed';
-                turn.status = 'completed';
-                for (const al of String(norm.text).trim().split(/\r?\n/).slice(0, 6)) {
-                  terminalLines.push(`\x1b[38;5;252m• ${al}\x1b[0m`);
+              const rawId = p.item.id ? String(p.item.id) : '';
+              if (
+                (p.item.type === 'AgentMessage' || p.item.type === 'agentMessage') &&
+                !turn.items.some(it => it.id === rawId) &&
+                turn.items.some(it => it.type === 'agentMessage')
+              ) {
+                turn = startNextSubTurn(explicitTurnId || null);
+              } else if (
+                turn.items.length >= 25 &&
+                !turn.items.some(it => it.id === rawId) &&
+                turn.items.some(it => it.type === 'agentMessage')
+              ) {
+                turn = startNextSubTurn(explicitTurnId || null);
+              }
+              const norm = normalizeConversationItem(p.item, turn.items.length, turn.id);
+              const alreadyExisted = turn.items.some(it => it.id === norm.id);
+              const stored = upsertTurnItem(turn, norm);
+              if (stored.type === 'commandExecution' && stored.id) {
+                pendingCallMap.set(String(stored.id), stored);
+              }
+              if (!alreadyExisted) {
+                if (norm.type === 'commandExecution' && norm.command) {
+                  terminalLines.push(`\x1b[38;5;114m• Ran\x1b[0m ${String(norm.command).slice(0, 140)}`);
+                  if (norm.aggregatedOutput) {
+                    const firstOut = String(norm.aggregatedOutput).trim().split(/\r?\n/).slice(0, 3);
+                    for (const ol of firstOut) terminalLines.push(`  \x1b[90m└ ${ol.slice(0, 140)}\x1b[0m`);
+                  }
+                } else if (norm.type === 'mcpToolCall' && norm.tool) {
+                  terminalLines.push(`\x1b[38;5;114m• Called\x1b[0m ${norm.server}.${norm.tool}`);
+                } else if (norm.type === 'fileChange' && Array.isArray(norm.changes) && norm.changes.length) {
+                  terminalLines.push(`\x1b[38;5;114m• Edited\x1b[0m ${norm.changes.map(c => c.path).join(', ')}`);
+                } else if (norm.type === 'agentMessage' && norm.text) {
+                  out.latestTurnStatus = 'completed';
+                  turn.status = 'completed';
+                  for (const al of String(norm.text).trim().split(/\r?\n/).slice(0, 6)) {
+                    terminalLines.push(`\x1b[38;5;252m• ${al}\x1b[0m`);
+                  }
                 }
               }
             }
@@ -1974,9 +2057,25 @@ export function createRemoteServer(options = {}) {
       const ITEMS_PAGE_SIZE = 50;
       const turn = (thread.turns || []).find(t => t.id === request.turnId);
       const rawItems = turn && Array.isArray(turn.items) ? turn.items : [];
-      const normalizedAll = rawItems.map((rawItem, idx) =>
-        normalizeConversationItem(rawItem, idx, String(request.turnId)),
-      );
+      const dedupedItems = [];
+      const idxById = new Map();
+      for (let idx = 0; idx < rawItems.length; idx += 1) {
+        const norm = normalizeConversationItem(rawItems[idx], idx, String(request.turnId));
+        if (idxById.has(norm.id)) {
+          const prevIdx = idxById.get(norm.id);
+          const prev = dedupedItems[prevIdx];
+          dedupedItems[prevIdx] = {
+            ...prev,
+            ...norm,
+            text: norm.text || prev.text || '',
+            aggregatedOutput: norm.aggregatedOutput || prev.aggregatedOutput || '',
+          };
+        } else {
+          idxById.set(norm.id, dedupedItems.length);
+          dedupedItems.push(norm);
+        }
+      }
+      const normalizedAll = dedupedItems;
       if (turn) {
         turn._normalizedItems = normalizedAll;
       }

@@ -200,11 +200,79 @@ test('relay + host connector mode renders mirrored desktop terminal rollout on i
     [
       JSON.stringify({
         type: 'event_msg',
-        payload: { type: 'user_message', message: '중단된 지점부터 이어서 작업해줘.' },
+        payload: {
+          type: 'item_completed',
+          turn_id: '01a1ba46-97b9-7f81-8253-5dd182122f45',
+          item: {
+            id: 'msg-early-turn-1',
+            type: 'AgentMessage',
+            content: [{ type: 'Text', text: '이전 턴 완료 메시지입니다.' }],
+          },
+        },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          id: 'msg-early-turn-1',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: '이전 턴 완료 메시지입니다.' }],
+        },
       }),
       JSON.stringify({
         type: 'event_msg',
-        payload: { type: 'agent_message', message: '릴레이 미러링 복원 완료했습니다.' },
+        payload: { type: 'user_message', message: '중단된 지점부터 이어서 작업해줘.' },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'function_call',
+          name: 'exec_command',
+          call_id: 'call_593ccfee3ff942d7964ed20ddd6baa48',
+          arguments: JSON.stringify({ cmd: 'git status --short' }),
+        },
+      }),
+      JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'item_completed',
+          turn_id: '01a1ba46-97b9-7f81-8253-5dd182122f45',
+          item: {
+            id: 'call_593ccfee3ff942d7964ed20ddd6baa48',
+            type: 'CommandExecution',
+            command: ['git', 'status', '--short'],
+            status: 'completed',
+          },
+        },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'function_call_output',
+          call_id: 'call_593ccfee3ff942d7964ed20ddd6baa48',
+          output: 'M server/remote-server.mjs',
+        },
+      }),
+      JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'item_completed',
+          turn_id: '01a1ba46-97b9-7f81-8253-5dd182122f45',
+          item: {
+            id: 'msg_04d3d6ef52528f04016af04adb724087d09454994d3a0fdfe8',
+            type: 'AgentMessage',
+            content: [{ type: 'Text', text: '릴레이 미러링 복원 완료했습니다.' }],
+          },
+        },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          id: 'msg_04d3d6ef52528f04016af04adb724087d09454994d3a0fdfe8',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: '릴레이 미러링 복원 완료했습니다.' }],
+        },
       }),
     ].join('\n') + '\n',
     'utf8',
@@ -338,12 +406,14 @@ test('relay + host connector mode renders mirrored desktop terminal rollout on i
     // REMOTE-BLKR-06: Stale state="running" in session_metadata is reconciled to "입력 가능" (idle) when latest turn is completed
     await expect(card.locator('.session-state')).toHaveText('입력 가능');
 
-    // REMOTE-BLKR-05: Structured conversation toggle (☷) loads history immediately without heavy thread/read timeout
+    // REMOTE-BLKR-05, REMOTE-BLKR-08 & REMOTE-BLKR-09: Structured conversation toggle (☷) loads deduplicated items and multiple turns without error
     await card.locator('.conversation-toggle').click();
     await expect(card.locator('.conversation-host')).toBeVisible();
-    await expect(card.locator('.conversation-message')).toHaveCount(2, { timeout: 2000 });
+    await expect(card.locator('.conversation-turns option')).toHaveCount(2);
+    await expect(card.locator('.conversation-message')).toHaveCount(3, { timeout: 2000 });
     await expect(card.locator('.conversation-message').first()).toContainText('중단된 지점부터 이어서 작업해줘.');
-    await expect(card.locator('.conversation-message').nth(1)).toContainText('릴레이 미러링 복원 완료했습니다.');
+    await expect(card.locator('.conversation-message').nth(1)).toContainText('git status --short');
+    await expect(card.locator('.conversation-message').nth(2)).toContainText('릴레이 미러링 복원 완료했습니다.');
     await expect(card.locator('.conversation-input')).toBeEnabled();
     await card.locator('.conversation-toggle').click();
 
