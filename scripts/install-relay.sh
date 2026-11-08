@@ -3,14 +3,14 @@ set -euo pipefail
 
 # OpenDIY Remote 1:1 Relay — One-Click VPS Installer (Ubuntu / Debian, Full TLS + Google OAuth support)
 # Usage:
-#   curl -fsSL https://github.com/jaeseongs95/opendiy-remote/releases/download/v1.0.0/install-relay.sh | bash
+#   curl -fsSL https://github.com/jaeseongs95/opendiy-remote/releases/download/v1.0.1/install-relay.sh | bash
 # Optional Google OAuth flags (via env vars):
 #   OPENDIY_REMOTE_GOOGLE_CLIENT_ID="..." \
 #   OPENDIY_REMOTE_GOOGLE_CLIENT_SECRET="..." \
 #   OPENDIY_REMOTE_ALLOWED_EMAIL="me@gmail.com" \
-#   bash <(curl -fsSL https://github.com/jaeseongs95/opendiy-remote/releases/download/v1.0.0/install-relay.sh)
+#   bash <(curl -fsSL https://github.com/jaeseongs95/opendiy-remote/releases/download/v1.0.1/install-relay.sh)
 
-VERSION="${OPENDIY_REMOTE_VERSION:-v1.0.0}"
+VERSION="${OPENDIY_REMOTE_VERSION:-v1.0.1}"
 PORT="${OPENDIY_REMOTE_PORT:-3210}"
 BIND_HOST="${OPENDIY_REMOTE_BIND_HOST:-0.0.0.0}"
 INSTALL_DIR="${OPENDIY_REMOTE_DIR:-$HOME/opendiy-remote}"
