@@ -6,6 +6,7 @@ import os from 'node:os';
 import crypto from 'node:crypto';
 import readline from 'node:readline';
 import { spawn, execFileSync } from 'node:child_process';
+import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -68,6 +69,7 @@ export const RELAY_COMMAND_ALLOWLIST = Object.freeze([
   'choose_project_folder',
   'choose_skill_folder',
   'choose_project',
+  'list_directory',
 ]);
 
 export const RELAY_BLOCKED_COMMANDS = Object.freeze([
@@ -82,6 +84,7 @@ export const RELAY_BLOCKED_COMMANDS = Object.freeze([
 ]);
 
 export const RELAY_EVENT_ALLOWLIST = Object.freeze([
+  'terminal-output',
   'session-output',
   'session-changed',
   'host-connection-changed',
@@ -342,6 +345,22 @@ function scanCodexExtensions(cwd, executablePath) {
   };
 }
 
+function normalizeWindowsExtendedPath(p) {
+  if (!p || typeof p !== 'string') return p;
+  return p.replace(/^\\\\\?\\UNC\\/i, '\\\\').replace(/^\\\\\?\\/, '');
+}
+
+function getDefaultDesktopDbPath() {
+  if (process.env.OPENDIY_DESKTOP_DB_PATH) return process.env.OPENDIY_DESKTOP_DB_PATH;
+  if (process.platform === 'win32' && process.env.APPDATA) {
+    return path.join(process.env.APPDATA, 'io.agentgrid.desktop', 'workspace.sqlite3');
+  }
+  if (process.platform === 'darwin') {
+    return path.join(os.homedir(), 'Library', 'Application Support', 'io.agentgrid.desktop', 'workspace.sqlite3');
+  }
+  return path.join(os.homedir(), '.local', 'share', 'io.agentgrid.desktop', 'workspace.sqlite3');
+}
+
 function normalizeConversationItem(rawItem, index = 0, turnId = 'turn') {
   if (!rawItem || typeof rawItem !== 'object') {
     return {
@@ -352,8 +371,91 @@ function normalizeConversationItem(rawItem, index = 0, turnId = 'turn') {
     };
   }
   const id = String(rawItem.id || `item-${turnId}-${index}`);
-  if (typeof rawItem.type === 'string' && rawItem.type) {
-    return { ...rawItem, id };
+  const rawType = typeof rawItem.type === 'string' ? rawItem.type : '';
+  const lowerType = rawType ? rawType[0].toLowerCase() + rawType.slice(1) : '';
+  if (lowerType === 'agentMessage') {
+    const textFromContent = Array.isArray(rawItem.content)
+      ? rawItem.content.map(c => String(c?.text ?? '')).filter(Boolean).join('\n')
+      : '';
+    return {
+      ...rawItem,
+      id,
+      type: 'agentMessage',
+      text: String(rawItem.text ?? (textFromContent || rawItem.message || '')),
+      status: String(rawItem.status || 'completed'),
+    };
+  }
+  if (lowerType === 'userMessage') {
+    const content = Array.isArray(rawItem.content)
+      ? rawItem.content.map(c => ({ ...c, type: c?.type === 'Text' ? 'text' : (c?.type || 'text'), text: String(c?.text ?? '') }))
+      : [{ type: 'text', text: String(rawItem.text ?? '') }];
+    return {
+      ...rawItem,
+      id,
+      type: 'userMessage',
+      content,
+      text: String(rawItem.text ?? content.map(c => c?.text || '').join('\n')),
+      status: String(rawItem.status || 'completed'),
+    };
+  }
+  if (lowerType === 'commandExecution') {
+    const cmdStr = Array.isArray(rawItem.command)
+      ? rawItem.command.join(' ')
+      : String(rawItem.command ?? '');
+    return {
+      ...rawItem,
+      id,
+      type: 'commandExecution',
+      command: cmdStr,
+      aggregatedOutput: String(rawItem.aggregatedOutput ?? rawItem.aggregated_output ?? ''),
+      status: String(rawItem.status || 'completed'),
+    };
+  }
+  if (lowerType === 'fileChange') {
+    let changes = rawItem.changes;
+    if (changes && !Array.isArray(changes) && typeof changes === 'object') {
+      changes = Object.entries(changes).map(([filePath, detail]) => ({
+        path: filePath,
+        diff: String(detail?.diff ?? detail?.unified_diff ?? detail?.type ?? ''),
+      }));
+    }
+    return {
+      ...rawItem,
+      id,
+      type: 'fileChange',
+      changes: Array.isArray(changes) ? changes : [],
+      status: String(rawItem.status || 'completed'),
+    };
+  }
+  if (lowerType === 'mcpToolCall') {
+    return {
+      ...rawItem,
+      id,
+      type: 'mcpToolCall',
+      server: String(rawItem.server || 'mcp'),
+      tool: String(rawItem.tool || ''),
+      arguments: rawItem.arguments ?? {},
+      result: rawItem.result ?? rawItem.error ?? {},
+      status: String(rawItem.status || 'completed'),
+    };
+  }
+  if (lowerType === 'reasoning') {
+    const summaryArr = Array.isArray(rawItem.summary)
+      ? rawItem.summary.map(s => (typeof s === 'string' ? s : String(s?.text ?? '')))
+      : Array.isArray(rawItem.summary_text)
+        ? rawItem.summary_text.map(s => String(s ?? ''))
+        : [];
+    return {
+      ...rawItem,
+      id,
+      type: 'reasoning',
+      summary: summaryArr,
+      content: Array.isArray(rawItem.content) ? rawItem.content : [],
+      status: String(rawItem.status || 'completed'),
+    };
+  }
+  if (lowerType) {
+    return { ...rawItem, id, type: lowerType };
   }
   const role = String(rawItem.role || 'assistant');
   if (role === 'user') {
@@ -376,6 +478,153 @@ function normalizeConversationItem(rawItem, index = 0, turnId = 'turn') {
     text: String(rawItem.text ?? rawItem.message ?? ''),
     status: String(rawItem.status || 'completed'),
   };
+}
+
+function readCodexRolloutSummary(threadId, customCodexHome = null) {
+  if (!threadId) return null;
+  const stateDbPath = path.join(customCodexHome || getCodexHome(), 'state_5.sqlite');
+  if (!fs.existsSync(stateDbPath)) return null;
+  let db = null;
+  try {
+    db = new DatabaseSync(stateDbPath, { readOnly: true });
+    const row = db
+      .prepare('SELECT * FROM threads WHERE id = ?')
+      .get(String(threadId));
+    if (!row) return null;
+    const out = {
+      id: String(row.id),
+      title: String(row.name || row.title || ''),
+      cwd: normalizeWindowsExtendedPath(String(row.cwd || '')),
+      model: row.model ? String(row.model) : null,
+      effort: row.reasoning_effort ? String(row.reasoning_effort) : null,
+      usedTokens: Number(row.tokens_used || 0),
+      modelContextWindow: 380000,
+      createdAt: Number(row.created_at || Math.floor(Date.now() / 1000)),
+      updatedAt: Number(row.updated_at || Math.floor(Date.now() / 1000)),
+      turns: [],
+      terminalLines: [],
+    };
+    const rolloutPath = row.rollout_path ? normalizeWindowsExtendedPath(String(row.rollout_path)) : '';
+    if (rolloutPath && fs.existsSync(rolloutPath)) {
+      const st = fs.statSync(rolloutPath);
+      const readSize = Math.min(1536 * 1024, st.size);
+      if (readSize > 0) {
+        const fd = fs.openSync(rolloutPath, 'r');
+        const buf = Buffer.alloc(readSize);
+        try {
+          fs.readSync(fd, buf, 0, readSize, st.size - readSize);
+        } finally {
+          fs.closeSync(fd);
+        }
+        const rawText = buf.toString('utf8');
+        const rawLines = st.size > readSize ? rawText.split('\n').slice(1) : rawText.split('\n');
+        const turnsMap = new Map();
+        let currentTurnId = `turn-${out.id.slice(0, 8)}`;
+        const terminalLines = [];
+
+        for (const line of rawLines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          try {
+            const obj = JSON.parse(trimmed);
+            const p = obj.payload || {};
+            const turnId = String(
+              p.turn_id ||
+                p.internal_chat_message_metadata_passthrough?.turn_id ||
+                currentTurnId,
+            );
+            currentTurnId = turnId;
+            if (!turnsMap.has(turnId)) {
+              turnsMap.set(turnId, {
+                id: turnId,
+                status: 'completed',
+                createdAt: out.updatedAt,
+                items: [],
+              });
+            }
+            const turn = turnsMap.get(turnId);
+            if (obj.type === 'event_msg' && p.type === 'token_count' && p.info) {
+              if (p.info.last_token_usage?.total_tokens) {
+                out.usedTokens = Number(p.info.last_token_usage.total_tokens);
+              }
+              if (p.info.model_context_window) {
+                out.modelContextWindow = Number(p.info.model_context_window);
+              }
+            } else if (
+              (obj.type === 'response_item' && p.type === 'message' && p.role === 'user') ||
+              (obj.type === 'event_msg' && p.type === 'user_message' && p.message)
+            ) {
+              const txt = Array.isArray(p.content)
+                ? p.content.map(c => String(c?.text ?? '')).join('\n').trim()
+                : String(p.message ?? '').trim();
+              if (txt && !txt.startsWith('<hook_prompt') && !txt.startsWith('[AGS 단계 확인]')) {
+                const alreadyAdded = turn.items.some(it => it.type === 'userMessage' && it.text === txt);
+                if (!alreadyAdded) {
+                  const uItem = normalizeConversationItem(
+                    { id: p.id || `u-${turn.items.length}`, type: 'userMessage', role: 'user', text: txt, status: 'completed' },
+                    turn.items.length,
+                    turnId,
+                  );
+                  turn.items.push(uItem);
+                  terminalLines.push(`\x1b[90m›\x1b[0m \x1b[1m${txt.split('\n')[0].slice(0, 160)}\x1b[0m`);
+                }
+              }
+            } else if (obj.type === 'event_msg' && p.type === 'agent_message' && p.message) {
+              const txt = String(p.message).trim();
+              if (txt && !turn.items.some(it => it.type === 'agentMessage' && it.text === txt)) {
+                const aItem = normalizeConversationItem(
+                  { id: p.id || `a-${turn.items.length}`, type: 'agentMessage', role: 'assistant', text: txt, status: 'completed' },
+                  turn.items.length,
+                  turnId,
+                );
+                turn.items.push(aItem);
+                for (const al of txt.split(/\r?\n/).slice(0, 6)) {
+                  terminalLines.push(`\x1b[38;5;252m• ${al}\x1b[0m`);
+                }
+              }
+            } else if (obj.type === 'event_msg' && p.type === 'item_completed' && p.item) {
+              if (p.item.type === 'HookPrompt') continue;
+              const norm = normalizeConversationItem(p.item, turn.items.length, turnId);
+              turn.items.push(norm);
+              if (norm.type === 'commandExecution' && norm.command) {
+                terminalLines.push(`\x1b[38;5;114m• Ran\x1b[0m ${String(norm.command).slice(0, 140)}`);
+                if (norm.aggregatedOutput) {
+                  const firstOut = String(norm.aggregatedOutput).trim().split(/\r?\n/).slice(0, 3);
+                  for (const ol of firstOut) terminalLines.push(`  \x1b[90m└ ${ol.slice(0, 140)}\x1b[0m`);
+                }
+              } else if (norm.type === 'mcpToolCall' && norm.tool) {
+                terminalLines.push(`\x1b[38;5;114m• Called\x1b[0m ${norm.server}.${norm.tool}`);
+              } else if (norm.type === 'fileChange' && Array.isArray(norm.changes) && norm.changes.length) {
+                terminalLines.push(`\x1b[38;5;114m• Edited\x1b[0m ${norm.changes.map(c => c.path).join(', ')}`);
+              } else if (norm.type === 'agentMessage' && norm.text) {
+                for (const al of String(norm.text).trim().split(/\r?\n/).slice(0, 6)) {
+                  terminalLines.push(`\x1b[38;5;252m• ${al}\x1b[0m`);
+                }
+              }
+            }
+          } catch {
+            // Skip truncated or unparseable JSONL line.
+          }
+        }
+        out.turns = [...turnsMap.values()].filter(t => t.items.length > 0).slice(-20);
+        const modelLabel = out.model ? out.model.replace(/^gpt-6\.1-sol$/i, 'GPT-6.1-Sol') : 'Codex';
+        const effortLabel = out.effort || 'high';
+        const winK = Math.round((out.modelContextWindow || 380000) / 1000);
+        const tailLines = terminalLines.slice(-60);
+        tailLines.push('');
+        tailLines.push('\x1b[38;5;141m›\x1b[0m \x1b[90mAsk Codex to do anything\x1b[0m');
+        tailLines.push(
+          `\x1b[38;5;214m${modelLabel} ${effortLabel}\x1b[0m \x1b[90m·\x1b[0m \x1b[38;5;141m${out.title || 'session'}\x1b[0m \x1b[90m· ${winK}K window\x1b[0m`,
+        );
+        out.terminalLines = tailLines;
+      }
+    }
+    return out;
+  } catch {
+    return null;
+  } finally {
+    try { db?.close(); } catch {}
+  }
 }
 
 function buildPendingQuestionEntry(session, notification) {
@@ -821,6 +1070,128 @@ export function createRemoteServer(options = {}) {
     }
   }
 
+  const codexHomeDir = options.codexHomeDir || process.env.CODEX_HOME || null;
+  const desktopDbPath =
+    options.desktopDbPath === false
+      ? null
+      : options.desktopDbPath ||
+        process.env.OPENDIY_DESKTOP_DB_PATH ||
+        (!options.workspaceDir && mode !== 'relay' ? getDefaultDesktopDbPath() : null);
+
+  function syncFromDesktopDatabase() {
+    if (!desktopDbPath || mode === 'relay' || !fs.existsSync(desktopDbPath)) return false;
+    let db = null;
+    try {
+      db = new DatabaseSync(desktopDbPath, { readOnly: true });
+      const settingsRows = db.prepare('SELECT key, value FROM app_settings').all();
+      const settingsMap = new Map();
+      const syncedCrons = [];
+      for (const r of settingsRows) {
+        const k = String(r.key || '');
+        const v = String(r.value ?? '');
+        settingsMap.set(k, v);
+        if (k.startsWith('saved_cron:')) {
+          try {
+            const parsedCron = JSON.parse(v);
+            if (parsedCron && parsedCron.id) syncedCrons.push(parsedCron);
+          } catch {}
+        }
+      }
+      if (settingsMap.get('ui_language') === 'en' || settingsMap.get('ui_language') === 'ko') {
+        state.uiLanguage = settingsMap.get('ui_language');
+      }
+      if (settingsMap.get('codex_executable') && !state.codexSavedPath) {
+        state.codexSavedPath = normalizeWindowsExtendedPath(settingsMap.get('codex_executable'));
+      }
+      if (syncedCrons.length > 0) {
+        const existingIds = new Set(state.savedCrons.map(c => c.id));
+        for (const sc of syncedCrons) {
+          if (!existingIds.has(sc.id)) state.savedCrons.push(sc);
+        }
+      }
+
+      const rawProjects = db
+        .prepare('SELECT id, cwd, canonical_cwd, name, created_at, favorite FROM projects')
+        .all();
+      let orderIds = [];
+      if (settingsMap.has('project_order')) {
+        try {
+          const parsedOrder = JSON.parse(settingsMap.get('project_order'));
+          if (Array.isArray(parsedOrder)) orderIds = parsedOrder.map(String);
+        } catch {}
+      }
+      const orderRank = new Map(orderIds.map((id, idx) => [id, idx]));
+      const mappedProjects = rawProjects.map(p => ({
+        id: String(p.id),
+        name: String(p.name),
+        cwd: p.cwd ? normalizeWindowsExtendedPath(String(p.cwd)) : null,
+        createdAt: Number(p.created_at || Math.floor(Date.now() / 1000)),
+        favorite: Boolean(p.favorite),
+      }));
+      mappedProjects.sort((a, b) => {
+        if (a.favorite !== b.favorite) return a.favorite ? -1 : 1;
+        const ra = orderRank.has(a.id) ? orderRank.get(a.id) : 999999;
+        const rb = orderRank.has(b.id) ? orderRank.get(b.id) : 999999;
+        if (ra !== rb) return ra - rb;
+        return a.createdAt - b.createdAt;
+      });
+      if (mappedProjects.length > 0) {
+        state.projects = mappedProjects;
+      }
+
+      const layoutRow = db.prepare('SELECT layout FROM workspace_layout WHERE id = 1').get();
+      let layoutSessions = [];
+      if (layoutRow?.layout) {
+        try {
+          const parsedLayout = JSON.parse(String(layoutRow.layout));
+          if (parsedLayout && typeof parsedLayout === 'object') {
+            layoutSessions = Array.isArray(parsedLayout.sessions)
+              ? parsedLayout.sessions.map((s, idx) => {
+                  const sid = String(s.sessionId || s.id || `mirrored-session-${idx + 1}`);
+                  const title = String(s.title || s.name || '세션');
+                  const threadId = s.threadId || s.resumeSessionId || undefined;
+                  return {
+                    ...s,
+                    sessionId: sid,
+                    title,
+                    ...(threadId ? { threadId: String(threadId) } : {}),
+                    cwd: normalizeWindowsExtendedPath(String(s.cwd || '')),
+                  };
+                })
+              : [];
+            state.layout = {
+              version: 1,
+              columns: Number(parsedLayout.columns) || 2,
+              columnSizes: Array.isArray(parsedLayout.columnSizes) ? parsedLayout.columnSizes : [1, 1],
+              rowSizes: Array.isArray(parsedLayout.rowSizes) ? parsedLayout.rowSizes : [1, 1],
+              sessions: layoutSessions,
+            };
+          }
+        } catch {}
+      }
+
+      const metaRows = db.prepare('SELECT id, generation, metadata, updated_at FROM session_metadata').all();
+      const metaById = new Map();
+      for (const mr of metaRows) {
+        try {
+          const m = JSON.parse(String(mr.metadata || '{}'));
+          metaById.set(String(mr.id), {
+            ...m,
+            id: String(mr.id),
+            generation: Number(mr.generation || m.generation || 1),
+            cwd: normalizeWindowsExtendedPath(String(m.cwd || '')),
+          });
+        } catch {}
+      }
+
+      return { layoutSessions, metaById };
+    } catch {
+      return false;
+    } finally {
+      try { db?.close(); } catch {}
+    }
+  }
+
   const authRateMap = new Map();
   function checkAndRecordAuth(ip, valid) {
     if (!tokenSha256 && !hostSecretSha256 && !googleOAuthEnabled) return { allowed: true };
@@ -922,6 +1293,11 @@ export function createRemoteServer(options = {}) {
 
   const sseClients = new Set();
   function broadcast(event, payload) {
+    if (typeof options.onBroadcast === 'function') {
+      try {
+        options.onBroadcast(event, payload);
+      } catch {}
+    }
     const frame = `data: ${JSON.stringify({ event, payload })}\n\n`;
     for (const res of [...sseClients]) {
       if (res.writableEnded || res.destroyed || res.writableLength > MAX_SSE_BUFFER_BYTES) {
@@ -941,8 +1317,103 @@ export function createRemoteServer(options = {}) {
   const sessionProcesses = new Map();
   const pendingQuestions = new Map();
   const cronJobsByThread = new Map();
+  const cronTimers = new Map();
   let cronJobSeq = 1;
   let sessionSeq = 1;
+
+  function materializeDesktopSessions() {
+    const synced = syncFromDesktopDatabase();
+    if (!synced) return;
+    const { layoutSessions, metaById } = synced;
+    for (const ls of layoutSessions) {
+      const id = String(ls.sessionId || ls.id || crypto.randomUUID());
+      const meta = metaById.get(id) || {};
+      const existing = sessions.get(id);
+      const threadId = ls.threadId || ls.resumeSessionId || meta.threadId || meta.resumeSessionId || null;
+      const cwd = normalizeWindowsExtendedPath(String(ls.cwd || meta.cwd || os.homedir()));
+      const title = String(ls.title || ls.name || meta.title || meta.name || '세션');
+      const liveState = meta.state && meta.state !== 'stopped' ? String(meta.state) : 'idle';
+      if (existing) {
+        existing.title = title;
+        existing.cwd = cwd;
+        existing.projectId = ls.projectId ?? meta.projectId ?? existing.projectId ?? null;
+        existing.projectAssigned = Boolean(ls.projectAssigned ?? meta.projectAssigned ?? existing.projectAssigned);
+        if (meta.state && meta.active !== false) existing.state = String(meta.state);
+        continue;
+      }
+      const session = {
+        id,
+        generation: Number(meta.generation || 1),
+        title,
+        cwd,
+        threadId: threadId ? String(threadId) : null,
+        projectId: ls.projectId ?? meta.projectId ?? null,
+        projectAssigned: Boolean(ls.projectAssigned ?? meta.projectAssigned ?? (ls.projectId !== undefined)),
+        state: liveState,
+        active: meta.active !== false,
+        cols: 100,
+        rows: 30,
+        seq: 0,
+        events: [],
+        eventSeq: 0,
+        deliveredEventSeq: 0,
+        contextRevision: 0,
+        seededRolloutTerminal: false,
+        isDesktopMirrored: true,
+        rolloutTerminalLines: [],
+        lastRolloutUpdatedAt: 0,
+      };
+      sessions.set(id, session);
+      if (session.threadId) {
+        const rollout = readCodexRolloutSummary(session.threadId, codexHomeDir);
+        if (rollout) {
+          session.rolloutTerminalLines = rollout.terminalLines || [];
+          session.lastRolloutUpdatedAt = rollout.updatedAt || 0;
+          state.threads[session.threadId] = {
+            id: session.threadId,
+            title: rollout.title || session.title,
+            cwd: rollout.cwd || session.cwd,
+            createdAt: rollout.createdAt,
+            updatedAt: rollout.updatedAt,
+            model: rollout.model,
+            effort: rollout.effort,
+            modelContextWindow: rollout.modelContextWindow || 380000,
+            effectiveContextWindow: rollout.modelContextWindow || 380000,
+            usedTokens: rollout.usedTokens || 0,
+            turns: rollout.turns,
+            memorySummary: null,
+            readState: { firstUnread: null, revision: 'rev-1' },
+          };
+        }
+      }
+    }
+  }
+
+  materializeDesktopSessions();
+
+  let mirroredSnapshotTimer = null;
+  function scheduleMirroredSessionSnapshots() {
+    if (mirroredSnapshotTimer) clearTimeout(mirroredSnapshotTimer);
+    mirroredSnapshotTimer = setTimeout(() => {
+      mirroredSnapshotTimer = null;
+      for (const session of sessions.values()) {
+        if (!session.isDesktopMirrored || !session.threadId) continue;
+        const rollout = readCodexRolloutSummary(session.threadId, codexHomeDir);
+        const lines = rollout?.terminalLines?.length ? rollout.terminalLines : session.rolloutTerminalLines;
+        if (lines && lines.length > 0) {
+          session.seededRolloutTerminal = true;
+          session.rolloutTerminalLines = lines;
+          emitTerminalOutput(
+            session,
+            `\x1b[2J\x1b[H\x1b[38;5;141m╭─ ${session.title} · ${session.cwd}\x1b[0m\r\n` +
+              lines.join('\r\n') +
+              '\r\n',
+          );
+        }
+      }
+    }, 60);
+    mirroredSnapshotTimer.unref?.();
+  }
 
   const allowPathDiscovery = options.allowPathDiscovery !== false && process.env.OPENDIY_REMOTE_NO_PATH_DISCOVERY !== '1';
   function computeSettings() {
@@ -1065,7 +1536,32 @@ export function createRemoteServer(options = {}) {
         readState: { firstUnread: null, revision: 'rev-1' },
       };
     }
-    return state.threads[threadId];
+    const currentThread = state.threads[threadId];
+    if (includeTurns || !currentThread.turns || currentThread.turns.length === 0) {
+      const rollout = readCodexRolloutSummary(threadId, codexHomeDir);
+      if (rollout) {
+        if (!currentThread.model && rollout.model) currentThread.model = rollout.model;
+        if (!currentThread.effort && rollout.effort) currentThread.effort = rollout.effort;
+        if (rollout.usedTokens > 0) currentThread.usedTokens = rollout.usedTokens;
+        if (rollout.modelContextWindow > 0) {
+          currentThread.modelContextWindow = rollout.modelContextWindow;
+          currentThread.effectiveContextWindow = rollout.modelContextWindow;
+        }
+        if ((!currentThread.turns || currentThread.turns.length === 0) && rollout.turns.length > 0) {
+          currentThread.turns = rollout.turns;
+        }
+        if (!session.seededRolloutTerminal && rollout.terminalLines.length > 0) {
+          session.seededRolloutTerminal = true;
+          emitTerminalOutput(
+            session,
+            `\x1b[38;5;141m╭─ ${session.title} · ${session.cwd}\x1b[0m\r\n` +
+              rollout.terminalLines.join('\r\n') +
+              '\r\n',
+          );
+        }
+      }
+    }
+    return currentThread;
   }
 
   async function queryServerModels(cursor = null) {
@@ -1383,6 +1879,69 @@ export function createRemoteServer(options = {}) {
     throw new Error(`지원하지 않는 대화 요청 유형입니다: ${type}`);
   }
 
+  function clearCronTimer(jobId) {
+    const entry = cronTimers.get(String(jobId));
+    if (entry) {
+      if (entry.kind === 'every') clearInterval(entry.handle);
+      else clearTimeout(entry.handle);
+      cronTimers.delete(String(jobId));
+    }
+  }
+
+  function scheduleCronJob(session, job, fullPrompt) {
+    clearCronTimer(job.id);
+    const promptText = String(fullPrompt || job.promptPreview || '').trim();
+    const runOnce = async () => {
+      if (job.removed || !sessions.has(session.id)) {
+        clearCronTimer(job.id);
+        return;
+      }
+      if (job.paused) {
+        if (job.schedule?.type === 'every') {
+          job.nextRunAt = Date.now() + Math.max(1, Number(job.schedule.seconds || 60)) * 1000;
+        }
+        return;
+      }
+      if (job.state === 'running') {
+        job.skipped = Number(job.skipped || 0) + 1;
+        return;
+      }
+      job.state = 'running';
+      try {
+        if (promptText) {
+          await handleConversationRequest(session, { type: 'send', text: promptText });
+        }
+      } catch {
+        // Keep schedule alive even if an individual turn fails.
+      } finally {
+        if (job.schedule?.type === 'every') {
+          job.state = 'ready';
+          job.nextRunAt = Date.now() + Math.max(1, Number(job.schedule.seconds || 60)) * 1000;
+        } else {
+          job.state = 'finished';
+          job.nextRunAt = null;
+          clearCronTimer(job.id);
+        }
+      }
+    };
+
+    if (job.schedule?.type === 'every') {
+      const intervalMs = Math.max(1000, Number(job.schedule.seconds || 60) * 1000);
+      const handle = setInterval(() => {
+        void runOnce();
+      }, intervalMs);
+      handle.unref?.();
+      cronTimers.set(String(job.id), { kind: 'every', handle });
+    } else if (job.schedule?.type === 'at') {
+      const delayMs = Math.max(50, Number(job.schedule.atUnixMs || Date.now() + 1000) - Date.now());
+      const handle = setTimeout(() => {
+        void runOnce();
+      }, delayMs);
+      handle.unref?.();
+      cronTimers.set(String(job.id), { kind: 'at', handle });
+    }
+  }
+
   async function dispatchCommand(command, args = {}) {
     if (mode === 'relay') {
       return invokeRelayHost(command, args);
@@ -1486,6 +2045,8 @@ export function createRemoteServer(options = {}) {
         return { status: 'updated', success: true, outcome: 'updated', message: null };
       }
       case 'load_layout':
+        materializeDesktopSessions();
+        scheduleMirroredSessionSnapshots();
         return state.layout;
       case 'save_layout':
         if (args.layout && typeof args.layout === 'object') {
@@ -1494,6 +2055,7 @@ export function createRemoteServer(options = {}) {
         }
         return null;
       case 'list_projects':
+        materializeDesktopSessions();
         return state.projects;
       case 'import_project': {
         const cwd = String(args.cwd ?? '').trim();
@@ -1590,6 +2152,20 @@ export function createRemoteServer(options = {}) {
         if (!stat.isDirectory()) {
           throw new Error(`프로젝트 경로가 디렉터리가 아닙니다: ${cwd}`);
         }
+        const existingSession = req.threadId
+          ? [...sessions.values()].find(s => s.threadId === String(req.threadId) && s.active)
+          : null;
+        if (existingSession) {
+          existingSession.title = title;
+          existingSession.cwd = cwd;
+          if (req.projectId !== undefined) existingSession.projectId = req.projectId;
+          if (req.projectAssigned !== undefined) existingSession.projectAssigned = Boolean(req.projectAssigned);
+          await syncThreadFromServer(existingSession, false);
+          scheduleMirroredSessionSnapshots();
+          const existingInfo = publicSessionInfo(existingSession);
+          broadcast('session-changed', existingInfo);
+          return existingInfo;
+        }
         const id = crypto.randomUUID();
         const session = {
           id,
@@ -1668,6 +2244,8 @@ export function createRemoteServer(options = {}) {
         return info;
       }
       case 'list_sessions':
+        materializeDesktopSessions();
+        scheduleMirroredSessionSnapshots();
         return [...sessions.values()].map(publicSessionInfo);
       case 'session_write': {
         const session = sessions.get(args.id);
@@ -1739,10 +2317,37 @@ export function createRemoteServer(options = {}) {
           }
         }
         const query = String(args.request?.query ?? '').trim().toLowerCase();
-        const cwdFilter = args.request?.cwd ? String(args.request.cwd).toLowerCase() : null;
-        const allThreads = Object.values(state.threads);
+        const cwdFilter = args.request?.cwd ? normalizeWindowsExtendedPath(String(args.request.cwd)).toLowerCase() : null;
+        const threadMap = new Map(Object.values(state.threads).map(t => [String(t.id), t]));
+        if (desktopDbPath) {
+          const stateDbPath = path.join(getCodexHome(), 'state_5.sqlite');
+          if (fs.existsSync(stateDbPath)) {
+            let db = null;
+            try {
+              db = new DatabaseSync(stateDbPath, { readOnly: true });
+              const rows = db
+                .prepare('SELECT id, name, title, cwd, created_at, updated_at FROM threads WHERE archived = 0 ORDER BY updated_at DESC LIMIT 80')
+                .all();
+              for (const r of rows) {
+                const tid = String(r.id);
+                if (!threadMap.has(tid)) {
+                  threadMap.set(tid, {
+                    id: tid,
+                    title: String(r.name || r.title || tid),
+                    cwd: normalizeWindowsExtendedPath(String(r.cwd || '')),
+                    createdAt: Number(r.created_at || 0),
+                    updatedAt: Number(r.updated_at || 0),
+                  });
+                }
+              }
+            } catch {} finally {
+              try { db?.close(); } catch {}
+            }
+          }
+        }
+        const allThreads = [...threadMap.values()];
         const filtered = allThreads.filter(t => {
-          if (cwdFilter && String(t.cwd || '').toLowerCase() !== cwdFilter) return false;
+          if (cwdFilter && normalizeWindowsExtendedPath(String(t.cwd || '')).toLowerCase() !== cwdFilter) return false;
           if (query && !String(t.title || '').toLowerCase().includes(query) && !String(t.id || '').toLowerCase().includes(query)) return false;
           return true;
         });
@@ -1763,7 +2368,7 @@ export function createRemoteServer(options = {}) {
         if (appServerBridge.isConnected() && threadId) {
           try {
             const readRes = await appServerBridge.request('thread/read', { threadId, includeTurns: true });
-            if (Array.isArray(readRes?.thread?.turns)) {
+            if (Array.isArray(readRes?.thread?.turns) && readRes.thread.turns.length > 0) {
               const messages = [];
               let msgSeq = 1;
               for (const turn of readRes.thread.turns) {
@@ -1781,12 +2386,19 @@ export function createRemoteServer(options = {}) {
             // Fall back to local thread cache.
           }
         }
-        const thread = state.threads[threadId];
+        let thread = state.threads[threadId];
+        if ((!thread || !Array.isArray(thread.turns) || thread.turns.length === 0) && threadId) {
+          const rollout = readCodexRolloutSummary(threadId);
+          if (rollout && rollout.turns.length > 0) {
+            thread = rollout;
+          }
+        }
         const messages = [];
         let msgSeq = 1;
         if (thread && Array.isArray(thread.turns)) {
           for (const turn of thread.turns) {
             for (const item of turn.items || []) {
+              if (!item.text) continue;
               messages.push({
                 id: String(item.id || `${turn.id || 'turn'}-${msgSeq++}`),
                 role: item.role === 'user' || item.type === 'userMessage' ? 'user' : 'assistant',
@@ -1942,15 +2554,42 @@ export function createRemoteServer(options = {}) {
             supportsExpectedTurnInterrupt: Boolean(appServerBridge.serverInfo?.supportsExpectedTurnInterrupt ?? true),
           };
         }
+        if (req.type === 'add') {
+          const promptText = String(req.prompt ?? req.promptPreview ?? '').trim();
+          const schedule = req.schedule || { type: 'every', seconds: 60 };
+          const jobId = String(cronJobSeq++);
+          const nextRunAt =
+            schedule.type === 'every'
+              ? Date.now() + Math.max(1, Number(schedule.seconds || 60)) * 1000
+              : Number(schedule.atUnixMs || Date.now() + 60000);
+          const job = {
+            id: jobId,
+            promptPreview: promptText.slice(0, 512),
+            schedule,
+            state: 'ready',
+            paused: false,
+            removed: false,
+            nextRunAt,
+            skipped: 0,
+          };
+          jobs.push(job);
+          scheduleCronJob(session, job, promptText);
+          return { status: 'applied', jobId };
+        }
         if (req.type === 'pause' || req.type === 'resume' || req.type === 'remove' || req.type === 'cancel') {
           const job = jobs.find(j => j.id === String(req.jobId));
           if (!job) return { status: 'notApplied' };
           if (req.type === 'pause') job.paused = true;
           else if (req.type === 'resume') job.paused = false;
           else if (req.type === 'remove') {
+            job.removed = true;
+            clearCronTimer(job.id);
             const idx = jobs.indexOf(job);
             if (idx !== -1) jobs.splice(idx, 1);
           } else if (req.type === 'cancel') {
+            if (session.threadId && appServerBridge.isConnected()) {
+              await appServerBridge.request('turn/interrupt', { threadId: session.threadId }).catch(() => {});
+            }
             job.state = 'ready';
           }
           return { status: 'applied' };
@@ -2003,7 +2642,7 @@ export function createRemoteServer(options = {}) {
         const nextRunAt = saved.schedule?.type === 'every'
           ? Date.now() + Number(saved.schedule.seconds) * 1000
           : Number(saved.schedule?.atUnixMs || Date.now() + 60000);
-        jobs.push({
+        const job = {
           id: jobId,
           promptPreview: String(saved.prompt).slice(0, 512),
           schedule: saved.schedule,
@@ -2012,7 +2651,9 @@ export function createRemoteServer(options = {}) {
           removed: false,
           nextRunAt,
           skipped: 0,
-        });
+        };
+        jobs.push(job);
+        scheduleCronJob(session, job, String(saved.prompt));
         saved.registration = {
           sessionId: session.id,
           generation: session.generation,
@@ -2165,7 +2806,55 @@ export function createRemoteServer(options = {}) {
         if (!raw) return null;
         return dispatchCommand('set_app_server_executable', { path: raw });
       }
+      case 'list_directory': {
+        const rawTarget = String(args.path ?? '').trim() || os.homedir();
+        const targetPath = path.resolve(normalizeWindowsExtendedPath(rawTarget));
+        if (!fs.existsSync(targetPath) || !fs.statSync(targetPath).isDirectory()) {
+          throw new Error(`폴더를 찾을 수 없습니다: ${targetPath}`);
+        }
+        const includeFiles = Boolean(args.includeFiles);
+        const parentDir = path.dirname(targetPath);
+        const parentPath = parentDir && parentDir !== targetPath ? parentDir : null;
+        const roots = [os.homedir()];
+        if (process.platform === 'win32') {
+          for (const drive of ['C:\\', 'D:\\', 'E:\\', 'F:\\']) {
+            try {
+              if (fs.existsSync(drive) && !roots.includes(drive)) roots.push(drive);
+            } catch {}
+          }
+        } else if (!roots.includes('/')) {
+          roots.push('/');
+        }
+        const entries = [];
+        try {
+          for (const dirent of fs.readdirSync(targetPath, { withFileTypes: true })) {
+            if (dirent.name.startsWith('.')) continue;
+            const isDir = dirent.isDirectory();
+            if (!isDir && !includeFiles) continue;
+            entries.push({
+              name: dirent.name,
+              path: path.join(targetPath, dirent.name),
+              isDirectory: isDir,
+            });
+          }
+        } catch (err) {
+          throw new Error(`폴더 내용을 읽을 수 없습니다: ${err.message || err}`);
+        }
+        entries.sort((a, b) => {
+          if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1;
+          return a.name.localeCompare(b.name);
+        });
+        return {
+          currentPath: targetPath,
+          parentPath,
+          roots,
+          entries: entries.slice(0, 300),
+        };
+      }
       case 'complete_exit': {
+        for (const jobId of [...cronTimers.keys()]) {
+          clearCronTimer(jobId);
+        }
         for (const proc of sessionProcesses.values()) {
           try { proc.kill(); } catch {}
         }
@@ -2608,6 +3297,9 @@ export function createRemoteServer(options = {}) {
     dispatchCommand,
     broadcast,
     close: async () => {
+      for (const jobId of [...cronTimers.keys()]) {
+        clearCronTimer(jobId);
+      }
       if (activeHostLease) {
         releaseHostLease(activeHostLease.hostId);
       }
@@ -2639,6 +3331,12 @@ export function startHostConnector(options = {}) {
   const rejectUnauthorized = options.tlsRejectUnauthorized !== undefined
     ? Boolean(options.tlsRejectUnauthorized)
     : process.env.OPENDIY_REMOTE_TLS_INSECURE !== '1' && process.env.OPENDIY_REMOTE_TLS_INSECURE !== 'true';
+  let stopped = false;
+  let activeReq = null;
+  let reconnectTimer = null;
+  const inFlightReqIds = new Set();
+  const completedReqIds = new Map(); // reqId -> { ok, result, error }
+
   const localRuntime = createRemoteServer({
     ...options,
     mode: 'direct',
@@ -2646,13 +3344,16 @@ export function startHostConnector(options = {}) {
     tlsKey: '',
     tlsCertFile: '',
     tlsKeyFile: '',
+    onBroadcast: (event, payload) => {
+      if (!stopped && RELAY_EVENT_SET.has(event)) {
+        postJson('/api/relay/event', { event, payload }).catch(() => {
+          if (event === 'terminal-output' && !stopped) {
+            postJson('/api/relay/event', { event: 'session-output', payload }).catch(() => {});
+          }
+        });
+      }
+    },
   });
-
-  let stopped = false;
-  let activeReq = null;
-  let reconnectTimer = null;
-  const inFlightReqIds = new Set();
-  const completedReqIds = new Map(); // reqId -> { ok, result, error }
 
   function recordCompletedReply(reqId, replyPayload) {
     if (completedReqIds.size >= 256) {
@@ -2693,14 +3394,7 @@ export function startHostConnector(options = {}) {
     });
   }
 
-  // Forward allowed local SSE broadcasts (session-output, session-changed) to the relay
-  const origBroadcast = localRuntime.broadcast;
-  localRuntime.broadcast = (event, payload) => {
-    origBroadcast(event, payload);
-    if (!stopped && RELAY_EVENT_SET.has(event)) {
-      postJson('/api/relay/event', { event, payload }).catch(() => {});
-    }
-  };
+  // localRuntime.broadcast already invokes onBroadcast via internal broadcast(event, payload)
 
   function connectStream() {
     if (stopped) return;

@@ -86,11 +86,13 @@ let selectedProject = '';
 let projectSelectionVersion = 0;
 let nativeWindowVisible = true;
 
+const remoteMode = isRemoteBrowser();
+if (remoteMode) document.title = 'OpenDIY Remote';
 if (native) $('#app').hidden = true;
 $('#app').setAttribute('aria-busy', 'true');
 $('#app').innerHTML = `
   <aside class="sidebar">
-    <a class="brand" href="#" aria-label="OpenDIY Desktop 홈"><span class="brand-mark"><i></i><i></i><i></i><i></i></span><span class="brand-name">OpenDIY <small>Desktop</small></span><span class="version">${version}</span></a>
+    <a class="brand" href="#" aria-label="OpenDIY Desktop 홈"><span class="brand-mark"><i></i><i></i><i></i><i></i></span><span class="brand-name">OpenDIY <small>${remoteMode ? 'Remote' : 'Desktop'}</small></span><span class="version">${version}</span></a>
     <div class="sidebar-lists">
       <section class="sidebar-projects" aria-labelledby="projects-heading">
         <div id="projects-heading" class="side-heading">프로젝트 <span id="project-count">0</span></div>
@@ -104,9 +106,11 @@ $('#app').innerHTML = `
     </div>
 
   </aside>
+  <div id="mobile-drawer-backdrop" class="mobile-drawer-backdrop" hidden></div>
   <main>
-    <header class="topbar"><div class="workspace-actions"><button id="catalog-open" class="quiet-button">세션 불러오기</button><button id="new-session" class="primary-button"><span>+</span> 새 세션</button></div><div class="top-actions"><span id="mode-label" class="mode-label">LOCAL WORKSPACE</span><button id="notifications" class="icon-button" aria-label="질문함">?<span id="notification-count" hidden></span></button><button id="settings-open" class="icon-button" aria-label="설정 열기" aria-haspopup="dialog" aria-controls="settings-dialog" title="설정">⚙</button><button id="exit" class="quiet-button">앱 종료</button></div></header>
+    <header class="topbar"><div class="workspace-actions"><button id="mobile-menu-toggle" class="icon-button mobile-only" type="button" aria-label="메뉴 열기" aria-expanded="false">☰</button><button id="catalog-open" class="quiet-button">세션 불러오기</button><button id="new-session" class="primary-button"><span>+</span> 새 세션</button></div><div class="top-actions"><span id="mode-label" class="mode-label">LOCAL WORKSPACE</span><button id="notifications" class="icon-button" aria-label="질문함">?<span id="notification-count" hidden></span></button><button id="settings-open" class="icon-button" aria-label="설정 열기" aria-haspopup="dialog" aria-controls="settings-dialog" title="설정">⚙</button><button id="exit" class="quiet-button">앱 종료</button></div></header>
     <div id="project-tabs" class="project-tabs" role="tablist" aria-label="프로젝트별 세션"></div>
+    <nav id="mobile-session-bar" class="mobile-session-bar mobile-only" aria-label="모바일 빠른 세션 전환" hidden></nav>
     <section class="toolbar" aria-label="그리드 도구"><div class="session-summary"><span class="connection-dot"></span><strong id="running-count">0</strong> 실행 중 <span class="divider"></span><span id="total-count">0개 세션</span></div><div class="layout-tools"><button id="search-toggle" class="quiet-button" title="활성 터미널 검색 (Ctrl+Shift+F)">⌕ <span>검색</span></button><span class="divider"></span><span class="layout-label">열</span><div id="column-options" class="segmented" role="group" aria-label="그리드 열 수"><button data-columns="1" aria-label="1열">▯</button><button data-columns="2" class="active" aria-label="2열">▥</button><button data-columns="3" aria-label="3열">▥▯</button><button data-columns="4" aria-label="4열">▥▥</button></div></div></section>
     <div id="runtime-banner" class="runtime-banner" role="status" hidden><span id="runtime-status"></span> <button id="runtime-retry" class="quiet-button" hidden>다시 시도</button> <button id="runtime-settings" class="quiet-button" hidden>서버 확인·복구</button></div>
     <div id="restore-banner" class="restore-banner" hidden><span>자동으로 연결하지 못한 저장 세션이 있습니다. 목록에서 다시 연결하거나 제거할 수 있습니다.</span><button id="restore-open" class="quiet-button">저장 세션 보기 →</button></div>
@@ -124,7 +128,8 @@ $('#app').innerHTML = `
 
 // Register only app-owned templates, before any terminal or user content is inserted.
 const markupLabels: Record<string, [string, string]> = {
-  "OpenDIY Desktop 홈": ["OpenDIY Desktop 홈", "OpenDIY Desktop home"],
+  "OpenDIY Desktop 홈": remoteMode ? ["OpenDIY Remote 홈", "OpenDIY Remote home"] : ["OpenDIY Desktop 홈", "OpenDIY Desktop home"],
+  "메뉴 열기": ["메뉴 열기", "Open menu"],
   "프로젝트": ["프로젝트", "Projects"],
   "+ 새 프로젝트": ["+ 새 프로젝트", "+ New project"],
   "+ 프로젝트 가져오기": ["+ 프로젝트 가져오기", "+ Import project"],
@@ -139,9 +144,9 @@ const markupLabels: Record<string, [string, string]> = {
   "설정 열기": ["설정 열기", "Open settings"],
   "설정 닫기": ["설정 닫기", "Close settings"],
   "언어": ["언어", "Language"],
-  "LOCAL WORKSPACE": isRemoteBrowser() ? ["원격 작업 공간", "REMOTE WORKSPACE"] : ["로컬 작업 공간", "LOCAL WORKSPACE"],
+  "LOCAL WORKSPACE": remoteMode ? ["원격 작업 공간", "REMOTE WORKSPACE"] : ["로컬 작업 공간", "LOCAL WORKSPACE"],
   "알림 보기": ["알림 보기", "View notifications"],
-  "앱 종료": ["앱 종료", "Exit app"],
+  "앱 종료": remoteMode ? ["로그아웃", "Sign out"] : ["앱 종료", "Exit app"],
   "세션 불러오기": ["세션 불러오기", "Load sessions"],
   "새 세션": ["새 세션", "New session"],
   "프로젝트별 세션": ["프로젝트별 세션", "Sessions by project"],
@@ -492,6 +497,7 @@ function setActive(id: string, focus = true) {
   active = id;
   for (const [key, view] of terminals) view.card.classList.toggle('focused', key === id);
   for (const element of document.querySelectorAll<HTMLElement>('[data-session-link]')) element.classList.toggle('active', element.dataset.sessionLink === id);
+  if (isMobileViewport()) renderGrid();
   if (focus) { const view = terminals.get(id); if (view && !view.card.querySelector<HTMLElement>('.conversation-host')?.hidden) view.card.querySelector<HTMLTextAreaElement>('.conversation-input')?.focus(); else view?.terminal.focus(); }
 }
 
@@ -739,6 +745,26 @@ function receiveOutput(output: Output) {
   if (terminal) terminal.write(output.data, () => ack(output)); else ack(output);
 }
 
+function isMobileViewport(): boolean {
+  return typeof window !== 'undefined' && typeof window.matchMedia === 'function' && window.matchMedia('(max-width: 768px)').matches;
+}
+function setMobileDrawerOpen(open: boolean) {
+  const sidebar = $('.sidebar');
+  const backdrop = $('#mobile-drawer-backdrop');
+  const toggleBtn = $<HTMLButtonElement>('#mobile-menu-toggle');
+  sidebar.classList.toggle('mobile-open', open);
+  backdrop.hidden = !open;
+  toggleBtn.setAttribute('aria-expanded', String(open));
+}
+$('#mobile-menu-toggle').onclick = () => setMobileDrawerOpen(!$('.sidebar').classList.contains('mobile-open'));
+$('#mobile-drawer-backdrop').onclick = () => setMobileDrawerOpen(false);
+if (typeof window !== 'undefined' && typeof window.matchMedia === 'function') {
+  window.matchMedia('(max-width: 768px)').addEventListener('change', () => {
+    setMobileDrawerOpen(false);
+    renderAll();
+  });
+}
+
 function renderCounts() {
   const visible = visibleSessions(); const live = visible.filter(session => session.active).length;
   $('#running-count').textContent = String(live); bindText($('#total-count'), `${visible.length}개 세션`, `${visible.length} session${visible.length === 1 ? '' : 's'}`); $('#side-count').textContent = String(visible.length);
@@ -757,7 +783,7 @@ function renderSide() {
     const row = document.createElement('button'); row.className = `project-row${selectedProject === key ? ' active' : ''}`; row.setAttribute('aria-pressed', String(selectedProject === key));
     const label = document.createElement('span'); if (key === 'unassigned') bindText(label, '미분류', 'Unassigned'); else label.textContent = name;
     row.title = cwd ?? t('실행 폴더 없음', 'No working folder'); row.dataset.projectCwd = cwd ?? ''; row.dataset.projectKey = key;
-    const total = document.createElement('small'); total.textContent = String(count); row.append(document.createTextNode(project.favorite ? '★ ' : '▱ '), label, total); row.onclick = () => { if (performance.now() >= projectDragClickUntil) selectProject(key); }; container.append(row);
+    const total = document.createElement('small'); total.textContent = String(count); row.append(document.createTextNode(project.favorite ? '★ ' : '▱ '), label, total); row.onclick = () => { if (performance.now() >= projectDragClickUntil) { selectProject(key); setMobileDrawerOpen(false); } }; container.append(row);
     if (project.id && native) {
       row.draggable = !exitInProgress;
       bindAttribute(row, 'aria-description', '드래그로 같은 그룹 안에서 프로젝트 순서 변경. 더보기 메뉴에서도 위아래로 이동할 수 있습니다.', 'Drag to reorder projects within the same group. The menu also has Move up and Move down.');
@@ -802,19 +828,51 @@ function renderSide() {
   });
   if (focused !== undefined) [...tabs.querySelectorAll<HTMLElement>('[role="tab"]')].find(tab => tab.dataset.projectKey === focused)?.focus();
   $('#session-list').replaceChildren();
-  visibleOrder().forEach((id, index) => { const session = sessions.get(id)!; const button = document.createElement('button'); button.className = `session-link${active === id ? ' active' : ''}`; button.dataset.sessionLink = id; const dot = document.createElement('span'); dot.className = `status-dot ${session.state}`; const label = document.createElement('span'); label.textContent = session.title; const shortcut = document.createElement('small'); shortcut.textContent = index < 9 ? `⌥${index + 1}` : ''; button.append(dot, label, shortcut); button.onclick = () => focusSession(id); $('#session-list').append(button); });
+  const mobileBar = $('#mobile-session-bar');
+  mobileBar.replaceChildren();
+  const vis = visibleOrder();
+  mobileBar.hidden = vis.length === 0;
+  const mobileFocusedId = (active && vis.includes(active)) ? active : (vis[0] ?? '');
+  vis.forEach((id, index) => {
+    const session = sessions.get(id)!;
+    const button = document.createElement('button'); button.className = `session-link${active === id ? ' active' : ''}`; button.dataset.sessionLink = id;
+    const dot = document.createElement('span'); dot.className = `status-dot ${session.state}`;
+    const label = document.createElement('span'); label.textContent = session.title;
+    const shortcut = document.createElement('small'); shortcut.textContent = index < 9 ? `⌥${index + 1}` : '';
+    button.append(dot, label, shortcut);
+    button.onclick = () => { focusSession(id); setMobileDrawerOpen(false); };
+    $('#session-list').append(button);
+
+    const pill = document.createElement('button');
+    pill.type = 'button';
+    pill.className = `mobile-session-pill${mobileFocusedId === id ? ' active' : ''}`;
+    pill.dataset.sessionLink = id;
+    const pillDot = document.createElement('span'); pillDot.className = `status-dot ${session.state}`;
+    const pillLabel = document.createElement('span'); pillLabel.textContent = session.title;
+    pill.append(pillDot, pillLabel);
+    pill.onclick = () => focusSession(id);
+    mobileBar.append(pill);
+  });
 }
 
 function renderGrid() {
   const grid = $('#grid');
   const visible = visibleOrder();
-  const count = maximized ? 1 : Math.min(columns, Math.max(1, visible.length));
-  const rows = Math.max(1, Math.ceil(visible.length / count));
+  const mobileSingle = isMobileViewport() && visible.length > 0;
+  const mobileTarget = mobileSingle ? ((active && visible.includes(active)) ? active : visible[0]) : '';
+  const singleView = Boolean(maximized || mobileSingle);
+  const count = singleView ? 1 : Math.min(columns, Math.max(1, visible.length));
+  const rows = singleView ? 1 : Math.max(1, Math.ceil(visible.length / count));
   while (columnSizes.length < count) columnSizes.push(1);
   while (rowSizes.length < rows) rowSizes.push(1);
-  grid.style.gridTemplateColumns = maximized ? 'minmax(0,1fr)' : columnSizes.slice(0, count).map(size => `minmax(0,${size}fr)`).join(' ');
-  grid.style.gridTemplateRows = maximized ? 'minmax(0,1fr)' : rowSizes.slice(0, rows).map(size => `minmax(0,${size}fr)`).join(' ');
-  order.forEach((id, index) => { const view = terminals.get(id)!; view.card.hidden = !isVisible(id) || (!!maximized && id !== maximized); refreshInputState(id); if (grid.children[index] !== view.card) grid.insertBefore(view.card, grid.children[index] ?? null); });
+  grid.style.gridTemplateColumns = singleView ? 'minmax(0,1fr)' : columnSizes.slice(0, count).map(size => `minmax(0,${size}fr)`).join(' ');
+  grid.style.gridTemplateRows = singleView ? 'minmax(0,1fr)' : rowSizes.slice(0, rows).map(size => `minmax(0,${size}fr)`).join(' ');
+  order.forEach((id, index) => {
+    const view = terminals.get(id)!;
+    view.card.hidden = !isVisible(id) || (!!maximized && id !== maximized) || (mobileSingle && id !== mobileTarget);
+    refreshInputState(id);
+    if (grid.children[index] !== view.card) grid.insertBefore(view.card, grid.children[index] ?? null);
+  });
   $('#empty').hidden = visible.length > 0;
   bindText($('#empty h2'), selectedProject ? '이 프로젝트에 열린 세션이 없습니다' : '다음 작업을 펼쳐 보세요', selectedProject ? 'No open sessions in this project' : 'Open your next task');
   bindText($('#empty p'), selectedProject ? '새 세션을 만들거나 세션 불러오기에서 기존 대화를 이어가세요. 다른 프로젝트의 세션은 계속 실행됩니다.' : '프로젝트 경로를 선택해 첫 세션을 시작하세요. 각 세션은 독립된 터미널에서 실행됩니다.', selectedProject ? 'Create a session or load an existing conversation. Sessions in other projects keep running.' : 'Choose a project path to start your first session. Each session runs in its own terminal.');
@@ -837,7 +895,7 @@ document.addEventListener('visibilitychange', updateConversationVisibility);
 
 function renderHandles(count: number, rows: number) {
   const layer = $('#grid-handles'); layer.replaceChildren();
-  if (maximized || !visibleOrder().length) return;
+  if (maximized || isMobileViewport() || !visibleOrder().length) return;
   for (const [axis, length, sizes] of [['column', count, columnSizes], ['row', rows, rowSizes]] as const) {
     const total = sizes.slice(0, length).reduce((a, b) => a + b, 0);
     let position = 0;
@@ -930,6 +988,10 @@ $('#project-tabs').addEventListener('keydown', event => {
 });
 const extensionsManager = createExtensionsManager({ call, notify });
 const mobileControl = createMobileControl({ call, notify, openExecutableSettings: () => void executableSettings.open() });
+if (remoteMode) {
+  const mobileControlBtn = document.querySelector<HTMLElement>('#mobile-control-open');
+  if (mobileControlBtn) mobileControlBtn.hidden = true;
+}
 const weeklyUsage = createWeeklyUsage({ call, initiallyVisible: !native });
 const questionCenter = createQuestionCenter({ call, button: $<HTMLButtonElement>('#notifications'), openSession: focusSession });
 document.body.append(questionCenter.element);
@@ -1123,7 +1185,13 @@ const exitDialog = $<HTMLDialogElement>('#exit-dialog');
 const unconfirmedExitButton = $<HTMLButtonElement>('#confirm-unconfirmed-exit');
 function resetExitRecovery() { unconfirmedExitButton.hidden = true; $('#unconfirmed-exit-warning').hidden = true; }
 function openExitDialog() { if (!exitDialog.open) { resetExitRecovery(); exitDialog.showModal(); } }
-$('#exit').onclick = openExitDialog;
+$('#exit').onclick = () => {
+  if (remoteMode) {
+    window.location.href = '/auth/logout';
+    return;
+  }
+  openExitDialog();
+};
 exitDialog.onclose = resetExitRecovery;
 exitDialog.oncancel = event => { if ($<HTMLButtonElement>('#confirm-exit').disabled) event.preventDefault(); };
 async function requestExit(allowUnconfirmedRemote = false) {

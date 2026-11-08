@@ -529,11 +529,243 @@ test('remote server injects browser flag, enforces token auth, and bridges sessi
     assert.equal(await invoke('open_external_url', { url: 'https://github.com/jaeseongs95/opendiy-remote' }), null);
     await assert.rejects(() => invoke('open_external_url', { url: 'javascript:alert(1)' }));
 
+    // list_directory RPC returns directories and files for remote browser path picker
+    fs.writeFileSync(path.join(projDir, 'sample.txt'), 'hello');
+    const dirListing = await invoke('list_directory', { path: projDir, includeFiles: true });
+    assert.equal(dirListing.currentPath, projDir);
+    assert.equal(Array.isArray(dirListing.entries), true);
+    assert.equal(dirListing.entries.some((e: any) => e.name === 'sample.txt' && e.isDirectory === false), true);
+
     await invoke('session_stop', { id: started.id, generation: started.generation });
     const remaining = await invoke('list_sessions');
     assert.equal(remaining.length, 0);
   } finally {
     await instance.close();
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('remote server mirrors OpenDIY Desktop workspace.sqlite3 projects, active sessions, rollout turns, terminal-output over relay, and executes cron timers', async () => {
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const { DatabaseSync } = await import('node:sqlite');
+  const { createRemoteServer, startHostConnector } = await import('../server/remote-server.mjs');
+
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'opendiy-remote-desktop-sync-'));
+  const desktopDbPath = path.join(tmpRoot, 'workspace.sqlite3');
+  const codexHomeDir = path.join(tmpRoot, '.codex');
+  fs.mkdirSync(codexHomeDir, { recursive: true });
+  const projDir = path.join(tmpRoot, '개발자');
+  fs.mkdirSync(projDir, { recursive: true });
+
+  // 1. Create mock OpenDIY Desktop workspace.sqlite3 matching real schema
+  const desktopDb = new DatabaseSync(desktopDbPath);
+  desktopDb.exec(`
+    CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    CREATE TABLE projects (id TEXT PRIMARY KEY, cwd TEXT, canonical_cwd TEXT, name TEXT NOT NULL, created_at INTEGER NOT NULL, favorite INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE workspace_layout (id INTEGER PRIMARY KEY, layout TEXT NOT NULL);
+    CREATE TABLE session_metadata (id TEXT PRIMARY KEY, generation INTEGER NOT NULL, metadata TEXT NOT NULL, updated_at INTEGER NOT NULL);
+  `);
+  desktopDb.prepare('INSERT INTO projects (id, cwd, canonical_cwd, name, created_at, favorite) VALUES (?, ?, ?, ?, ?, ?)').run(
+    'proj-dev',
+    projDir,
+    projDir.toLowerCase(),
+    '개발자',
+    1700000000,
+    1,
+  );
+  const layoutPayload = {
+    version: 1,
+    columns: 2,
+    columnSizes: [1, 1],
+    rowSizes: [1, 1],
+    sessions: [
+      { id: 'sess-desktop', name: 'desktop 담당', cwd: projDir, projectId: 'proj-dev', resumeSessionId: 'thread-desktop-1', runtimeKind: 'codex' },
+      { id: 'sess-cli', name: 'CLI 담당', cwd: projDir, projectId: 'proj-dev', resumeSessionId: 'thread-cli-1', runtimeKind: 'codex' },
+    ],
+  };
+  desktopDb.prepare('INSERT INTO workspace_layout (id, layout) VALUES (1, ?)').run(JSON.stringify(layoutPayload));
+  desktopDb.prepare('INSERT INTO session_metadata (id, generation, metadata, updated_at) VALUES (?, 1, ?, 1700000100)').run(
+    'sess-desktop',
+    JSON.stringify({ id: 'sess-desktop', name: 'desktop 담당', cwd: projDir, projectId: 'proj-dev', resumeSessionId: 'thread-desktop-1', runtimeKind: 'codex' }),
+  );
+  desktopDb.prepare('INSERT INTO session_metadata (id, generation, metadata, updated_at) VALUES (?, 1, ?, 1700000100)').run(
+    'sess-cli',
+    JSON.stringify({ id: 'sess-cli', name: 'CLI 담당', cwd: projDir, projectId: 'proj-dev', resumeSessionId: 'thread-cli-1', runtimeKind: 'codex' }),
+  );
+  desktopDb.close();
+
+  // 2. Create mock ~/.codex/state_5.sqlite and rollout JSONL file
+  const rolloutFile = path.join(codexHomeDir, 'rollout-desktop.jsonl');
+  const rolloutLines = [
+    JSON.stringify({ timestamp: '2026-11-08T02:00:00Z', type: 'session_meta', payload: { id: 'thread-desktop-1', cwd: projDir } }),
+    JSON.stringify({ timestamp: '2026-11-08T02:00:01Z', type: 'turn_context', payload: { turn_id: 'turn-1', cwd: projDir, model: 'GPT-6.1-Sol', effort: 'xhigh' } }),
+    JSON.stringify({ timestamp: '2026-11-08T02:00:02Z', type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-1', model_context_window: 380000 } }),
+    JSON.stringify({ timestamp: '2026-11-08T02:00:03Z', type: 'event_msg', payload: { type: 'user_message', message: '중단된 지점부터 이어서 작업해줘.' } }),
+    JSON.stringify({ timestamp: '2026-11-08T02:00:04Z', type: 'response_item', payload: { type: 'function_call', name: 'exec_command', call_id: 'call-1', arguments: JSON.stringify({ cmd: 'git status --short' }) } }),
+    JSON.stringify({ timestamp: '2026-11-08T02:00:05Z', type: 'response_item', payload: { type: 'function_call_output', call_id: 'call-1', output: 'Process exited with code 0\nOutput:\nM src/main.ts' } }),
+    JSON.stringify({ timestamp: '2026-11-08T02:00:06Z', type: 'event_msg', payload: { type: 'agent_message', message: '작업을 재개했습니다.' } }),
+    JSON.stringify({ timestamp: '2026-11-08T02:00:07Z', type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { total_tokens: 120000 }, last_token_usage: { total_tokens: 228000 }, model_context_window: 380000 } } }),
+  ];
+  fs.writeFileSync(rolloutFile, rolloutLines.join('\n') + '\n', 'utf8');
+
+  const codexDb = new DatabaseSync(path.join(codexHomeDir, 'state_5.sqlite'));
+  codexDb.exec(`
+    CREATE TABLE threads (
+      id TEXT PRIMARY KEY,
+      rollout_path TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      source TEXT NOT NULL,
+      model_provider TEXT NOT NULL,
+      cwd TEXT NOT NULL,
+      title TEXT NOT NULL,
+      sandbox_policy TEXT NOT NULL,
+      approval_mode TEXT NOT NULL,
+      tokens_used INTEGER NOT NULL DEFAULT 0,
+      first_user_message TEXT NOT NULL DEFAULT '',
+      model TEXT,
+      reasoning_effort TEXT
+    );
+  `);
+  codexDb.prepare(`
+    INSERT INTO threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, tokens_used, first_user_message, model, reasoning_effort)
+    VALUES (?, ?, ?, ?, 'cli', 'openai', ?, 'desktop 담당', 'workspace-write', 'never', 228000, '중단된 지점부터 이어서 작업해줘.', 'GPT-6.1-Sol', 'xhigh')
+  `).run('thread-desktop-1', rolloutFile, 1700000000, 1700000100, projDir);
+  codexDb.close();
+
+  let cronTurnStarted = false;
+  const relayInstance = createRemoteServer({
+    mode: 'relay',
+    workspaceDir: path.join(tmpRoot, 'relay-workspace'),
+    token: 'relay-sync-token',
+    hostSecret: 'relay-sync-secret',
+  });
+
+  const relayPort = await new Promise<number>(resolve => {
+    relayInstance.server.listen(0, '127.0.0.1', () => {
+      const addr = relayInstance.server.address();
+      resolve(typeof addr === 'object' && addr ? addr.port : 0);
+    });
+  });
+  const relayBase = `http://127.0.0.1:${relayPort}`;
+
+  let registered = false;
+  const connector = startHostConnector({
+    relayUrl: relayBase,
+    hostSecret: 'relay-sync-secret',
+    workspaceDir: path.join(tmpRoot, 'host-workspace'),
+    desktopDbPath,
+    codexHomeDir,
+    allowPathDiscovery: false,
+    spawnProcess: false,
+    autoReconnect: false,
+    onRegistered: () => {
+      registered = true;
+    },
+    rpcTransport: async (method: string) => {
+      if (method === 'turn/start') {
+        cronTurnStarted = true;
+        return { turn: { id: 'cron-turn-1', status: 'inProgress', items: [] } };
+      }
+      return {};
+    },
+  });
+  for (let i = 0; i < 30 && !registered; i++) {
+    await new Promise(r => setTimeout(r, 50));
+  }
+  assert.equal(registered, true);
+
+  try {
+    const relayInvoke = async (cmd: string, args: Record<string, any> = {}) => {
+      const res = await fetch(`${relayBase}/api/invoke`, {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer relay-sync-token',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ command: cmd, args }),
+      });
+      const body = await res.json();
+      assert.equal(res.status, 200);
+      assert.equal(body.ok, true);
+      return body.result;
+    };
+
+    // Verify projects, layout, and active sessions mirrored from workspace.sqlite3
+    const projects = await relayInvoke('list_projects');
+    assert.equal(projects.some((p: any) => p.name === '개발자' && p.cwd === projDir), true);
+
+    const layout = await relayInvoke('load_layout');
+    assert.equal(layout.sessions.length, 2);
+
+    // Connect SSE stream to verify terminal-output forwarding over relay (FINDING-04)
+    const sseController = new AbortController();
+    const sseRes = await fetch(`${relayBase}/api/events?token=relay-sync-token`, {
+      signal: sseController.signal,
+    });
+    assert.equal(sseRes.status, 200);
+    const reader = sseRes.body!.getReader();
+    const decoder = new TextDecoder();
+    let sseBuffer = '';
+    const readPump = (async () => {
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          sseBuffer += decoder.decode(value, { stream: true });
+        }
+      } catch {
+        // aborted
+      }
+    })();
+
+    const sessions = await relayInvoke('list_sessions');
+    assert.equal(sessions.length, 2);
+    assert.equal(sessions.some((s: any) => s.title === 'desktop 담당' && s.threadId === 'thread-desktop-1'), true);
+    assert.equal(sessions.some((s: any) => s.title === 'CLI 담당' && s.threadId === 'thread-cli-1'), true);
+
+    // Verify conversation_request (attach + items) returns rollout turns/items from state_5.sqlite + rollout JSONL
+    const attachRes = await relayInvoke('conversation_request', {
+      id: 'sess-desktop',
+      generation: 1,
+      request: { type: 'attach' },
+    });
+    assert.equal(attachRes.threadId, 'thread-desktop-1');
+    assert.equal(attachRes.model, 'GPT-6.1-Sol');
+    assert.equal(attachRes.turns.length >= 1, true);
+
+    const itemsRes = await relayInvoke('conversation_request', {
+      id: 'sess-desktop',
+      generation: 1,
+      request: { type: 'items', turnId: attachRes.turns[0].id },
+    });
+    assert.equal(itemsRes.items.some((it: any) => it.type === 'userMessage' && it.text.includes('중단된 지점부터')), true);
+
+    // Wait briefly for scheduleMirroredSessionSnapshots to emit terminal-output over relay SSE
+    for (let i = 0; i < 25 && !sseBuffer.includes('terminal-output'); i++) {
+      await new Promise(r => setTimeout(r, 50));
+    }
+    assert.equal(sseBuffer.includes('terminal-output'), true);
+    assert.equal(sseBuffer.includes('desktop 담당'), true);
+
+    // Verify cron_request schedules and fires a real timer (FINDING-05)
+    await relayInvoke('cron_request', {
+      id: 'sess-desktop',
+      generation: 1,
+      request: { type: 'add', prompt: '주기적 상태 점검', schedule: { type: 'every', seconds: 1 } },
+    });
+    for (let i = 0; i < 25 && !cronTurnStarted; i++) {
+      await new Promise(r => setTimeout(r, 80));
+    }
+    assert.equal(cronTurnStarted, true);
+
+    sseController.abort();
+    await readPump;
+  } finally {
+    await connector.close();
+    await relayInstance.close();
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });

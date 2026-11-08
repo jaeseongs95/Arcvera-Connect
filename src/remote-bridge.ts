@@ -91,6 +91,9 @@ export function installRemoteBridge(): void {
         const parsed = JSON.parse(message.data) as { event?: string; payload?: unknown };
         if (typeof parsed.event === 'string') {
           emitLocal(parsed.event, parsed.payload);
+          if (parsed.event === 'session-output') {
+            emitLocal('terminal-output', parsed.payload);
+          }
         }
       } catch {
         // Ignore malformed keepalive or non-JSON frames.
@@ -132,13 +135,147 @@ export function installRemoteBridge(): void {
     return body.result ?? null;
   }
 
-  function promptRemotePath(koPrompt: string, enPrompt: string): string | null {
-    if (typeof window.prompt !== 'function') return null;
+  interface DirectoryListing {
+    currentPath: string;
+    parentPath: string | null;
+    roots: string[];
+    entries: { name: string; path: string; isDirectory: boolean }[];
+  }
+
+  function openRemotePathPicker(options: {
+    koTitle: string;
+    enTitle: string;
+    includeFiles?: boolean;
+  }): Promise<string | null> {
+    if (typeof document === 'undefined' || !document.body) {
+      return Promise.resolve(null);
+    }
     const lang = document.documentElement.lang === 'en' ? 'en' : 'ko';
-    const value = window.prompt(lang === 'en' ? enPrompt : koPrompt, '');
-    if (value === null) return null;
-    const trimmed = value.trim();
-    return trimmed ? trimmed : null;
+    const titleText = lang === 'en' ? options.enTitle : options.koTitle;
+    const includeFiles = Boolean(options.includeFiles);
+
+    return new Promise(resolve => {
+      const dialog = document.createElement('dialog');
+      dialog.className = 'remote-path-dialog';
+      dialog.innerHTML = `
+        <div class="dialog-heading">
+          <span class="eyebrow">${lang === 'en' ? 'REMOTE FILE SYSTEM' : '원격 호스트 경로 탐색'}</span>
+          <button type="button" class="icon-button remote-path-cancel" aria-label="${lang === 'en' ? 'Close' : '닫기'}">×</button>
+        </div>
+        <h2></h2>
+        <div class="remote-path-roots"></div>
+        <div class="remote-path-bar">
+          <input type="text" class="remote-path-input" placeholder="${lang === 'en' ? 'Absolute path on host PC' : '호스트 PC 절대 경로'}" />
+          <button type="button" class="quiet-button remote-path-go">${lang === 'en' ? 'Open' : '열기'}</button>
+        </div>
+        <p class="remote-path-error inline-error" hidden></p>
+        <div class="remote-path-entries" role="listbox"></div>
+        <div class="dialog-actions">
+          <button type="button" class="quiet-button remote-path-cancel-btn">${lang === 'en' ? 'Cancel' : '취소'}</button>
+          <button type="button" class="primary-button remote-path-select-btn">${
+            includeFiles
+              ? lang === 'en'
+                ? 'Select Path →'
+                : '이 경로 선택 →'
+              : lang === 'en'
+                ? 'Select Folder →'
+                : '이 폴더 선택 →'
+          }</button>
+        </div>
+      `;
+      dialog.querySelector('h2')!.textContent = titleText;
+      document.body.append(dialog);
+
+      const input = dialog.querySelector<HTMLInputElement>('.remote-path-input')!;
+      const rootsEl = dialog.querySelector<HTMLElement>('.remote-path-roots')!;
+      const entriesEl = dialog.querySelector<HTMLElement>('.remote-path-entries')!;
+      const errorEl = dialog.querySelector<HTMLElement>('.remote-path-error')!;
+
+      let settled = false;
+      function finish(val: string | null) {
+        if (settled) return;
+        settled = true;
+        try {
+          if (dialog.open) dialog.close();
+        } catch {}
+        dialog.remove();
+        resolve(val);
+      }
+
+      async function loadDir(targetPath = '') {
+        errorEl.hidden = true;
+        try {
+          const listing = (await remoteInvoke('list_directory', {
+            path: targetPath,
+            includeFiles,
+          })) as DirectoryListing;
+          input.value = listing.currentPath || targetPath;
+
+          rootsEl.replaceChildren();
+          for (const rootPath of listing.roots || []) {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'quiet-button remote-root-chip';
+            btn.textContent = rootPath;
+            btn.onclick = () => void loadDir(rootPath);
+            rootsEl.append(btn);
+          }
+
+          entriesEl.replaceChildren();
+          if (listing.parentPath) {
+            const upBtn = document.createElement('button');
+            upBtn.type = 'button';
+            upBtn.className = 'remote-entry-row';
+            upBtn.innerHTML = `<span class="remote-entry-icon">↰</span><span class="remote-entry-name">.. (${lang === 'en' ? 'Parent folder' : '상위 폴더'})</span>`;
+            upBtn.onclick = () => void loadDir(listing.parentPath!);
+            entriesEl.append(upBtn);
+          }
+          for (const item of listing.entries || []) {
+            const row = document.createElement('button');
+            row.type = 'button';
+            row.className = 'remote-entry-row';
+            const icon = document.createElement('span');
+            icon.className = 'remote-entry-icon';
+            icon.textContent = item.isDirectory ? '📁' : '📄';
+            const name = document.createElement('span');
+            name.className = 'remote-entry-name';
+            name.textContent = item.name;
+            row.append(icon, name);
+            row.onclick = () => {
+              if (item.isDirectory) {
+                void loadDir(item.path);
+              } else {
+                input.value = item.path;
+              }
+            };
+            entriesEl.append(row);
+          }
+        } catch (err) {
+          errorEl.hidden = false;
+          errorEl.textContent = err instanceof Error ? err.message : String(err);
+        }
+      }
+
+      dialog.querySelector<HTMLButtonElement>('.remote-path-go')!.onclick = () => {
+        void loadDir(input.value.trim());
+      };
+      input.onkeydown = e => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          finish(input.value.trim() || null);
+        }
+      };
+      dialog.querySelector<HTMLButtonElement>('.remote-path-cancel')!.onclick = () => finish(null);
+      dialog.querySelector<HTMLButtonElement>('.remote-path-cancel-btn')!.onclick = () => finish(null);
+      dialog.querySelector<HTMLButtonElement>('.remote-path-select-btn')!.onclick = () => {
+        const chosen = input.value.trim();
+        finish(chosen || null);
+      };
+      dialog.addEventListener('close', () => finish(null));
+
+      dialog.showModal();
+      void loadDir('');
+    });
   }
 
   state.__TAURI_EVENT_PLUGIN_INTERNALS__ = {
@@ -187,50 +324,75 @@ export function installRemoteBridge(): void {
         return null;
       }
       if (command === 'choose_project_folder') {
-        const path = promptRemotePath(
-          '원격 서버의 프로젝트 폴더 절대 경로를 입력하세요:',
-          'Enter the absolute project folder path on the remote server:',
-        );
+        const directPath = typeof args.path === 'string' && args.path.trim() ? args.path.trim() : null;
+        const path =
+          directPath ??
+          (await openRemotePathPicker({
+            koTitle: '프로젝트 폴더 선택',
+            enTitle: 'Select Project Folder',
+            includeFiles: false,
+          }));
         if (!path) return null;
         return remoteInvoke('choose_project_folder', { path });
       }
       if (command === 'choose_project') {
-        const cwd = promptRemotePath(
-          '가져올 원격 서버의 프로젝트 폴더 절대 경로를 입력하세요:',
-          'Enter the absolute project folder path to import from the remote server:',
-        );
+        const directCwd = typeof args.cwd === 'string' && args.cwd.trim() ? args.cwd.trim() : null;
+        const cwd =
+          directCwd ??
+          (await openRemotePathPicker({
+            koTitle: '가져올 프로젝트 폴더 선택',
+            enTitle: 'Import Project Folder',
+            includeFiles: false,
+          }));
         if (!cwd) return null;
         return remoteInvoke('choose_project', { cwd });
       }
       if (command === 'choose_skill_folder') {
-        const path = promptRemotePath(
-          '원격 서버의 스킬 폴더 절대 경로를 입력하세요:',
-          'Enter the absolute skill folder path on the remote server:',
-        );
+        const directPath = typeof args.path === 'string' && args.path.trim() ? args.path.trim() : null;
+        const path =
+          directPath ??
+          (await openRemotePathPicker({
+            koTitle: '스킬 폴더 선택',
+            enTitle: 'Select Skill Folder',
+            includeFiles: false,
+          }));
         if (!path) return null;
         return remoteInvoke('choose_skill_folder', { path });
       }
       if (command === 'choose_codex_executable') {
-        const path = promptRemotePath(
-          '원격 서버의 Codex CLI 실행 파일 절대 경로를 입력하세요:',
-          'Enter the absolute path to the Codex CLI executable on the remote server:',
-        );
+        const directPath = typeof args.path === 'string' && args.path.trim() ? args.path.trim() : null;
+        const path =
+          directPath ??
+          (await openRemotePathPicker({
+            koTitle: 'Codex CLI 실행 파일 선택',
+            enTitle: 'Select Codex CLI Executable',
+            includeFiles: true,
+          }));
         if (!path) return null;
         return remoteInvoke('set_codex_executable', { path });
       }
       if (command === 'choose_app_server_executable') {
-        const path = promptRemotePath(
-          '원격 서버의 Codex 앱 서버 실행 파일 절대 경로를 입력하세요:',
-          'Enter the absolute path to the Codex app-server executable on the remote server:',
-        );
+        const directPath = typeof args.path === 'string' && args.path.trim() ? args.path.trim() : null;
+        const path =
+          directPath ??
+          (await openRemotePathPicker({
+            koTitle: 'Codex 앱 서버 실행 파일 선택',
+            enTitle: 'Select Codex App-Server Executable',
+            includeFiles: true,
+          }));
         if (!path) return null;
         return remoteInvoke('set_app_server_executable', { path });
       }
       if (command === 'choose_conversation_attachments') {
-        const path = promptRemotePath(
-          '첨부할 원격 서버 파일의 절대 경로를 입력하세요 (이미지는 대화창에 직접 붙여넣기/끌어놓기 가능):',
-          'Enter the absolute file path on the remote server to attach (images can also be pasted/dropped directly):',
-        );
+        const directPaths = Array.isArray(args.paths) ? args.paths : null;
+        if (directPaths && directPaths.length > 0) {
+          return remoteInvoke('choose_conversation_attachments', { paths: directPaths });
+        }
+        const path = await openRemotePathPicker({
+          koTitle: '첨부할 파일 선택',
+          enTitle: 'Select File to Attach',
+          includeFiles: true,
+        });
         if (!path) return [];
         return remoteInvoke('choose_conversation_attachments', { paths: [path] });
       }
