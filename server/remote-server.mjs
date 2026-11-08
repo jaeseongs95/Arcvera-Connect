@@ -72,6 +72,8 @@ export const RELAY_COMMAND_ALLOWLIST = Object.freeze([
   'choose_project',
   'list_directory',
   'slash_commands_list',
+  'check_for_updates',
+  'apply_update',
 ]);
 
 export const RELAY_BLOCKED_COMMANDS = Object.freeze([
@@ -91,7 +93,244 @@ export const RELAY_EVENT_ALLOWLIST = Object.freeze([
   'session-changed',
   'host-connection-changed',
   'runtime-updated',
+  'update-available',
+  'update-status-changed',
 ]);
+
+export const GITHUB_REPO_SLUG = 'jaeseongs95/opendiy-remote';
+
+export function parseSemverTuple(rawVersion) {
+  const cleaned = String(rawVersion ?? '').trim().replace(/^v/i, '').split('-')[0];
+  const parts = cleaned.split('.').map(n => Number.parseInt(n, 10));
+  if (parts.length < 3 || parts.some(n => !Number.isFinite(n) || n < 0)) return null;
+  return [parts[0], parts[1], parts[2]];
+}
+
+export function compareSemver(a, b) {
+  const ta = parseSemverTuple(a);
+  const tb = parseSemverTuple(b);
+  if (!ta && !tb) return 0;
+  if (!ta) return -1;
+  if (!tb) return 1;
+  for (let i = 0; i < 3; i += 1) {
+    if (ta[i] !== tb[i]) return ta[i] > tb[i] ? 1 : -1;
+  }
+  return 0;
+}
+
+export function readInstalledVersion(rootDir = ROOT_DIR) {
+  try {
+    const pkgPath = path.join(rootDir, 'package.json');
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+    return String(pkg.version || '1.0.0').trim().replace(/^v/i, '');
+  } catch {
+    return '1.0.0';
+  }
+}
+
+export async function fetchLatestReleaseInfo(options = {}) {
+  const rootDir = options.rootDir || ROOT_DIR;
+  const currentVersion = options.currentVersion
+    ? String(options.currentVersion).trim().replace(/^v/i, '')
+    : readInstalledVersion(rootDir);
+  const repoSlug = options.repoSlug || process.env.OPENDIY_REMOTE_UPDATE_REPO || GITHUB_REPO_SLUG;
+  const releaseApiUrl =
+    options.releaseApiUrl ||
+    process.env.OPENDIY_REMOTE_RELEASE_API_URL ||
+    `https://api.github.com/repos/${repoSlug}/releases/latest`;
+  const fetchFn = options.fetchFn || globalThis.fetch;
+
+  const res = await fetchFn(releaseApiUrl, {
+    headers: {
+      Accept: 'application/vnd.github+json',
+      'User-Agent': `opendiy-remote/${currentVersion}`,
+    },
+  });
+  if (!res.ok) {
+    throw new Error(`GitHub Release 조회 실패 (HTTP ${res.status})`);
+  }
+  const release = await res.json();
+  const tagName = String(release.tag_name || release.tagName || '').trim();
+  const latestVersion = tagName.replace(/^v/i, '');
+  const assets = Array.isArray(release.assets) ? release.assets : [];
+  const tarAsset =
+    assets.find(a => typeof a?.name === 'string' && a.name.endsWith('-relay-bundle.tar.gz')) ||
+    assets.find(a => typeof a?.name === 'string' && a.name.endsWith('.tar.gz')) ||
+    null;
+  const rawDigest = String(tarAsset?.digest || '').trim();
+  const sha256 = rawDigest.toLowerCase().startsWith('sha256:')
+    ? rawDigest.slice('sha256:'.length).toLowerCase()
+    : /^[a-f0-9]{64}$/i.test(rawDigest)
+      ? rawDigest.toLowerCase()
+      : null;
+
+  const updateAvailable = Boolean(latestVersion && compareSemver(latestVersion, currentVersion) > 0);
+  return {
+    currentVersion,
+    latestVersion: latestVersion || currentVersion,
+    tagName: tagName || `v${currentVersion}`,
+    updateAvailable,
+    bundleUrl: tarAsset ? String(tarAsset.browser_download_url || tarAsset.url || '') : null,
+    bundleName: tarAsset ? String(tarAsset.name || '') : null,
+    bundleSize: tarAsset && Number.isFinite(Number(tarAsset.size)) ? Number(tarAsset.size) : null,
+    sha256,
+    publishedAt: release.published_at || release.created_at || null,
+    releaseUrl: release.html_url || release.url || `https://github.com/${repoSlug}/releases/tag/${tagName}`,
+    notes: String(release.body || '').trim(),
+    checkedAt: Date.now(),
+  };
+}
+
+let activeUpdatePromise = null;
+
+export async function performSelfUpdate(options = {}) {
+  if (activeUpdatePromise) return activeUpdatePromise;
+  activeUpdatePromise = (async () => {
+    const rootDir = path.resolve(options.rootDir || ROOT_DIR);
+    const fetchFn = options.fetchFn || globalThis.fetch;
+    const info = options.releaseInfo || (await fetchLatestReleaseInfo({ ...options, rootDir, fetchFn }));
+    if (!info.updateAvailable && !options.force) {
+      return {
+        updated: false,
+        alreadyUpToDate: true,
+        previousVersion: info.currentVersion,
+        version: info.currentVersion,
+        tagName: info.tagName,
+        restartScheduled: false,
+      };
+    }
+    if (!info.bundleUrl) {
+      throw new Error(`릴리스(${info.tagName})에서 업데이트 번들(.tar.gz)을 찾을 수 없습니다.`);
+    }
+
+    const bundleRes = await fetchFn(info.bundleUrl, {
+      headers: {
+        Accept: 'application/octet-stream',
+        'User-Agent': `opendiy-remote/${info.currentVersion}`,
+      },
+    });
+    if (!bundleRes.ok) {
+      throw new Error(`업데이트 번들 다운로드 실패 (HTTP ${bundleRes.status})`);
+    }
+    const arrayBuf = await bundleRes.arrayBuffer();
+    const bundleBuf = Buffer.from(arrayBuf);
+    if (bundleBuf.length < 128) {
+      throw new Error('다운로드된 업데이트 번들 크기가 비정상적으로 작습니다.');
+    }
+
+    const actualSha256 = crypto.createHash('sha256').update(bundleBuf).digest('hex').toLowerCase();
+    if (info.sha256 && actualSha256 !== info.sha256.toLowerCase()) {
+      throw new Error(`업데이트 번들 SHA-256 무결성 검증 실패 (기대값: ${info.sha256}, 실제값: ${actualSha256})`);
+    }
+
+    const tmpStageDir = fs.mkdtempSync(path.join(os.tmpdir(), 'opendiy-remote-update-'));
+    const archivePath = path.join(tmpStageDir, 'bundle.tar.gz');
+    const extractDir = path.join(tmpStageDir, 'extracted');
+    fs.mkdirSync(extractDir, { recursive: true });
+
+    try {
+      fs.writeFileSync(archivePath, bundleBuf);
+      execFileSync('tar', ['-xzf', archivePath, '-C', extractDir], {
+        stdio: 'pipe',
+        timeout: 30000,
+        windowsHide: true,
+      });
+
+      const extractedPkgPath = path.join(extractDir, 'package.json');
+      const extractedServerPath = path.join(extractDir, 'server', 'remote-server.mjs');
+      const extractedDistIndex = path.join(extractDir, 'dist', 'index.html');
+      if (!fs.existsSync(extractedPkgPath) || !fs.existsSync(extractedServerPath) || !fs.existsSync(extractedDistIndex)) {
+        throw new Error('업데이트 번들 구조 검증 실패: 필수 파일(package.json, server/remote-server.mjs, dist/index.html)이 누락되었습니다.');
+      }
+
+      const backupDir = path.join(rootDir, '.backup-prev');
+      try {
+        fs.rmSync(backupDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+      fs.mkdirSync(backupDir, { recursive: true });
+
+      const targets = ['dist', 'server', 'scripts', 'package.json', 'README.md', 'README.ko.md'];
+      for (const rel of targets) {
+        const currentTarget = path.join(rootDir, rel);
+        const backupTarget = path.join(backupDir, rel);
+        if (fs.existsSync(currentTarget)) {
+          fs.cpSync(currentTarget, backupTarget, { recursive: true, force: true });
+        }
+      }
+
+      try {
+        const nextDist = path.join(extractDir, 'dist');
+        const targetDist = path.join(rootDir, 'dist');
+        if (fs.existsSync(nextDist)) {
+          fs.rmSync(targetDist, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+          fs.cpSync(nextDist, targetDist, { recursive: true, force: true });
+        }
+        for (const rel of ['server', 'scripts', 'package.json', 'README.md', 'README.ko.md']) {
+          const srcPath = path.join(extractDir, rel);
+          const dstPath = path.join(rootDir, rel);
+          if (fs.existsSync(srcPath)) {
+            fs.cpSync(srcPath, dstPath, { recursive: true, force: true });
+          }
+        }
+      } catch (applyErr) {
+        // Rollback from backupDir on partial write failure
+        for (const rel of targets) {
+          const backupTarget = path.join(backupDir, rel);
+          const currentTarget = path.join(rootDir, rel);
+          if (fs.existsSync(backupTarget)) {
+            try {
+              fs.cpSync(backupTarget, currentTarget, { recursive: true, force: true });
+            } catch {}
+          }
+        }
+        throw applyErr;
+      }
+
+      const installedVersion = readInstalledVersion(rootDir);
+      const shouldScheduleRestart = options.scheduleRestart === true;
+      if (shouldScheduleRestart) {
+        const restartDelayMs = Math.max(100, Number(options.restartDelayMs || 600));
+        const timer = setTimeout(() => {
+          if (typeof options.onRestart === 'function') {
+            options.onRestart();
+            return;
+          }
+          if (process.env.INVOCATION_ID || process.env.OPENDIY_REMOTE_MANAGED_RESTART === '1') {
+            process.exit(0);
+          } else {
+            const child = spawn(process.execPath, process.argv.slice(1), {
+              cwd: process.cwd(),
+              env: process.env,
+              detached: true,
+              stdio: 'ignore',
+              windowsHide: true,
+            });
+            child.unref();
+            process.exit(0);
+          }
+        }, restartDelayMs);
+        timer.unref?.();
+      }
+
+      return {
+        updated: true,
+        alreadyUpToDate: false,
+        previousVersion: info.currentVersion,
+        version: installedVersion,
+        tagName: info.tagName,
+        sha256: actualSha256,
+        restartScheduled: shouldScheduleRestart,
+      };
+    } finally {
+      try {
+        fs.rmSync(tmpStageDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      } catch {}
+    }
+  })().finally(() => {
+    activeUpdatePromise = null;
+  });
+  return activeUpdatePromise;
+}
 
 const RELAY_COMMAND_SET = new Set(RELAY_COMMAND_ALLOWLIST);
 const RELAY_EVENT_SET = new Set(RELAY_EVENT_ALLOWLIST);
@@ -552,6 +791,7 @@ function serializeItemForPage(item) {
 }
 
 const rolloutSummaryCache = new Map(); // threadId -> { rolloutPath, mtimeMs, size, summary }
+let latestObservedRateLimits = null;
 
 function readCodexRolloutSummary(threadId, customCodexHome = null) {
   if (!threadId) return null;
@@ -586,8 +826,10 @@ function readCodexRolloutSummary(threadId, customCodexHome = null) {
       cwd: normalizeWindowsExtendedPath(String(row.cwd || '')),
       model: row.model ? String(row.model) : null,
       effort: row.reasoning_effort ? String(row.reasoning_effort) : null,
-      usedTokens: Number(row.tokens_used || 0),
+      usedTokens: 0,
+      cumulativeTokens: Number(row.tokens_used || 0),
       modelContextWindow: 380000,
+      rateLimits: null,
       createdAt: Number(row.created_at || Math.floor(Date.now() / 1000)),
       updatedAt: Number(row.updated_at || Math.floor(Date.now() / 1000)),
       turns: [],
@@ -596,8 +838,9 @@ function readCodexRolloutSummary(threadId, customCodexHome = null) {
     };
     out.rolloutPath = rolloutPath;
     out.rolloutSize = st ? st.size : 0;
+    out.rolloutMtimeMs = st ? st.mtimeMs : 0;
     if (st && st.size > 0) {
-      const readSize = Math.min(1536 * 1024, st.size);
+      const readSize = Math.min(2048 * 1024, st.size);
       if (readSize > 0) {
         const fd = fs.openSync(rolloutPath, 'r');
         const buf = Buffer.alloc(readSize);
@@ -614,6 +857,8 @@ function readCodexRolloutSummary(threadId, customCodexHome = null) {
         let currentTurnId = `${baseTurnPrefix}-${subTurnSeq}`;
         const terminalLines = [];
         const pendingCallMap = new Map();
+        let sawExplicitCompletion = false;
+        let sawActivitySinceCompletion = false;
 
         function ensureTurn(tid) {
           if (!turnsMap.has(tid)) {
@@ -631,6 +876,16 @@ function readCodexRolloutSummary(threadId, customCodexHome = null) {
           subTurnSeq += 1;
           currentTurnId = explicitId ? `${explicitId}-${subTurnSeq}` : `${baseTurnPrefix}-${subTurnSeq}`;
           return ensureTurn(currentTurnId);
+        }
+
+        function explicitIdOrNull(val) {
+          return val ? String(val) : null;
+        }
+
+        function markTurnActive(targetTurn) {
+          sawActivitySinceCompletion = true;
+          out.latestTurnStatus = 'inProgress';
+          if (targetTurn) targetTurn.status = 'inProgress';
         }
 
         function upsertTurnItem(turn, item) {
@@ -673,11 +928,10 @@ function readCodexRolloutSummary(threadId, customCodexHome = null) {
               obj.type === 'compacted'
             ) {
               if (turn.items.length > 0) {
-                turn = startNextSubTurn(explicitTurnId || null);
+                turn = startNextSubTurn(explicitIdOrNull(explicitTurnId));
               }
               if (obj.type === 'event_msg' && p.type === 'task_started') {
-                turn.status = 'inProgress';
-                out.latestTurnStatus = 'inProgress';
+                markTurnActive(turn);
                 if (p.model_context_window) {
                   out.modelContextWindow = Number(p.model_context_window);
                 }
@@ -686,14 +940,23 @@ function readCodexRolloutSummary(threadId, customCodexHome = null) {
               obj.type === 'event_msg' &&
               (p.type === 'task_complete' || p.type === 'turn_complete' || p.type === 'turn_aborted' || p.type === 'error')
             ) {
+              sawExplicitCompletion = true;
+              sawActivitySinceCompletion = false;
               turn.status = p.type === 'turn_aborted' ? 'interrupted' : 'completed';
               out.latestTurnStatus = turn.status;
-            } else if (obj.type === 'event_msg' && p.type === 'token_count' && p.info) {
-              if (p.info.last_token_usage?.total_tokens) {
+            } else if (obj.type === 'event_msg' && p.type === 'token_count') {
+              if (p.info?.last_token_usage?.total_tokens) {
                 out.usedTokens = Number(p.info.last_token_usage.total_tokens);
               }
-              if (p.info.model_context_window) {
+              if (p.info?.model_context_window) {
                 out.modelContextWindow = Number(p.info.model_context_window);
+              }
+              if (p.rate_limits && typeof p.rate_limits === 'object') {
+                out.rateLimits = p.rate_limits;
+                latestObservedRateLimits = {
+                  rateLimits: p.rate_limits,
+                  observedAt: Date.now(),
+                };
               }
             } else if (
               (obj.type === 'response_item' && p.type === 'message' && (p.role === 'user' || p.role === 'developer')) ||
@@ -706,7 +969,10 @@ function readCodexRolloutSummary(threadId, customCodexHome = null) {
                 p.role === 'developer' &&
                 (txt.includes('[agent-governance-suite') || txt.includes('peer message'));
               if (isDeveloperWake && turn.items.some(it => it.type === 'agentMessage' || it.type === 'commandExecution' || it.type === 'mcpToolCall')) {
-                turn = startNextSubTurn(explicitTurnId || null);
+                turn = startNextSubTurn(explicitIdOrNull(explicitTurnId));
+              }
+              if (isDeveloperWake) {
+                markTurnActive(turn);
               }
               if (
                 p.role !== 'developer' &&
@@ -715,8 +981,9 @@ function readCodexRolloutSummary(threadId, customCodexHome = null) {
                 !txt.startsWith('[AGS 단계 확인]')
               ) {
                 if (turn.items.some(it => it.type === 'agentMessage' || it.type === 'commandExecution' || it.type === 'mcpToolCall')) {
-                  turn = startNextSubTurn(explicitTurnId || null);
+                  turn = startNextSubTurn(explicitIdOrNull(explicitTurnId));
                 }
+                markTurnActive(turn);
                 const alreadyAdded = turn.items.some(it => it.type === 'userMessage' && it.text === txt);
                 if (!alreadyAdded) {
                   const uItem = normalizeConversationItem(
@@ -728,28 +995,53 @@ function readCodexRolloutSummary(threadId, customCodexHome = null) {
                   terminalLines.push(`\x1b[90m›\x1b[0m \x1b[1m${txt.split('\n')[0].slice(0, 160)}\x1b[0m`);
                 }
               }
-            } else if (obj.type === 'response_item' && p.type === 'function_call' && p.call_id) {
-              if (turn.items.length >= 25 || turn.items.some(it => it.type === 'agentMessage')) {
-                turn = startNextSubTurn(explicitTurnId || null);
+            } else if (
+              obj.type === 'response_item' &&
+              (p.type === 'function_call' || p.type === 'custom_tool_call' || p.type === 'reasoning')
+            ) {
+              markTurnActive(turn);
+              if ((p.type === 'function_call' || p.type === 'custom_tool_call') && (p.call_id || p.id)) {
+                if (turn.items.length >= 25 || turn.items.some(it => it.type === 'agentMessage')) {
+                  turn = startNextSubTurn(explicitIdOrNull(explicitTurnId));
+                  markTurnActive(turn);
+                }
+                const callId = String(p.call_id || p.id);
+                let cmd = String(p.name || 'command');
+                if (p.type === 'custom_tool_call' && typeof p.input === 'string' && p.input.trim()) {
+                  const firstInputLine = p.input.trim().split(/\r?\n/)[0].slice(0, 120);
+                  cmd = `${cmd}: ${firstInputLine}`;
+                } else {
+                  try {
+                    const parsedArgs = typeof p.arguments === 'string' ? JSON.parse(p.arguments) : p.arguments;
+                    if (parsedArgs?.cmd) cmd = String(parsedArgs.cmd);
+                    else if (Array.isArray(parsedArgs?.command)) cmd = parsedArgs.command.join(' ');
+                  } catch {}
+                }
+                const cItem = normalizeConversationItem(
+                  { id: callId, type: 'commandExecution', command: cmd, aggregatedOutput: '', status: 'completed' },
+                  turn.items.length,
+                  turn.id,
+                );
+                const stored = upsertTurnItem(turn, cItem);
+                pendingCallMap.set(callId, stored);
+                if (p.type === 'function_call') {
+                  terminalLines.push(`\x1b[38;5;114m• Ran\x1b[0m ${cmd.slice(0, 140)}`);
+                }
               }
-              let cmd = String(p.name || 'command');
-              try {
-                const parsedArgs = typeof p.arguments === 'string' ? JSON.parse(p.arguments) : p.arguments;
-                if (parsedArgs?.cmd) cmd = String(parsedArgs.cmd);
-                else if (Array.isArray(parsedArgs?.command)) cmd = parsedArgs.command.join(' ');
-              } catch {}
-              const cItem = normalizeConversationItem(
-                { id: String(p.call_id), type: 'commandExecution', command: cmd, aggregatedOutput: '', status: 'completed' },
-                turn.items.length,
-                turn.id,
-              );
-              const stored = upsertTurnItem(turn, cItem);
-              pendingCallMap.set(String(p.call_id), stored);
-              terminalLines.push(`\x1b[38;5;114m• Ran\x1b[0m ${cmd.slice(0, 140)}`);
-            } else if (obj.type === 'response_item' && p.type === 'function_call_output' && p.call_id) {
-              const target = pendingCallMap.get(String(p.call_id));
-              if (target) {
-                target.aggregatedOutput = String(p.output ?? '');
+            } else if (
+              obj.type === 'response_item' &&
+              (p.type === 'function_call_output' || p.type === 'custom_tool_call_output')
+            ) {
+              markTurnActive(turn);
+              if (p.call_id) {
+                const target = pendingCallMap.get(String(p.call_id));
+                if (target) {
+                  if (Array.isArray(p.output)) {
+                    target.aggregatedOutput = p.output.map(chunk => String(chunk?.text ?? '')).join('\n');
+                  } else {
+                    target.aggregatedOutput = String(p.output ?? '');
+                  }
+                }
               }
             } else if (
               (obj.type === 'event_msg' && p.type === 'agent_message' && p.message) ||
@@ -759,9 +1051,10 @@ function readCodexRolloutSummary(threadId, customCodexHome = null) {
                 ? p.content.map(c => String(c?.text ?? '')).join('\n').trim()
                 : String(p.message ?? '').trim();
               const itemId = String(p.id || `a-${turn.id}-${turn.items.length}`);
+              const phase = String(p.phase || '').toLowerCase();
               if (txt && !turn.items.some(it => it.id === itemId || (it.type === 'agentMessage' && it.text === txt))) {
                 if (turn.items.some(it => it.type === 'agentMessage')) {
-                  turn = startNextSubTurn(explicitTurnId || null);
+                  turn = startNextSubTurn(explicitIdOrNull(explicitTurnId));
                 }
                 const aItem = normalizeConversationItem(
                   { id: p.id || `a-${turn.id}-${turn.items.length}`, type: 'agentMessage', role: 'assistant', text: txt, status: 'completed' },
@@ -769,8 +1062,13 @@ function readCodexRolloutSummary(threadId, customCodexHome = null) {
                   turn.id,
                 );
                 upsertTurnItem(turn, aItem);
-                out.latestTurnStatus = 'completed';
-                turn.status = 'completed';
+                if (phase === 'commentary') {
+                  markTurnActive(turn);
+                } else {
+                  out.latestTurnStatus = 'completed';
+                  turn.status = 'completed';
+                  sawActivitySinceCompletion = false;
+                }
                 for (const al of txt.split(/\r?\n/).slice(0, 6)) {
                   terminalLines.push(`\x1b[38;5;252m• ${al}\x1b[0m`);
                 }
@@ -783,13 +1081,13 @@ function readCodexRolloutSummary(threadId, customCodexHome = null) {
                 !turn.items.some(it => it.id === rawId) &&
                 turn.items.some(it => it.type === 'agentMessage')
               ) {
-                turn = startNextSubTurn(explicitTurnId || null);
+                turn = startNextSubTurn(explicitIdOrNull(explicitTurnId));
               } else if (
                 turn.items.length >= 25 &&
                 !turn.items.some(it => it.id === rawId) &&
                 turn.items.some(it => it.type === 'agentMessage')
               ) {
-                turn = startNextSubTurn(explicitTurnId || null);
+                turn = startNextSubTurn(explicitIdOrNull(explicitTurnId));
               }
               const norm = normalizeConversationItem(p.item, turn.items.length, turn.id);
               const alreadyExisted = turn.items.some(it => it.id === norm.id);
@@ -797,20 +1095,33 @@ function readCodexRolloutSummary(threadId, customCodexHome = null) {
               if (stored.type === 'commandExecution' && stored.id) {
                 pendingCallMap.set(String(stored.id), stored);
               }
+              if (norm.type === 'commandExecution' || norm.type === 'mcpToolCall' || norm.type === 'fileChange' || norm.type === 'reasoning') {
+                markTurnActive(turn);
+              }
               if (!alreadyExisted) {
                 if (norm.type === 'commandExecution' && norm.command) {
                   terminalLines.push(`\x1b[38;5;114m• Ran\x1b[0m ${String(norm.command).slice(0, 140)}`);
                   if (norm.aggregatedOutput) {
-                    const firstOut = String(norm.aggregatedOutput).trim().split(/\r?\n/).slice(0, 3);
+                    const allOutLines = String(norm.aggregatedOutput).trim().split(/\r?\n/);
+                    const firstOut = allOutLines.slice(0, 3);
                     for (const ol of firstOut) terminalLines.push(`  \x1b[90m└ ${ol.slice(0, 140)}\x1b[0m`);
+                    if (allOutLines.length > 3) {
+                      terminalLines.push(`  \x1b[90m+ ${allOutLines.length - 3} lines (ctrl+o to expand)\x1b[0m`);
+                    }
                   }
                 } else if (norm.type === 'mcpToolCall' && norm.tool) {
                   terminalLines.push(`\x1b[38;5;114m• Called\x1b[0m ${norm.server}.${norm.tool}`);
                 } else if (norm.type === 'fileChange' && Array.isArray(norm.changes) && norm.changes.length) {
                   terminalLines.push(`\x1b[38;5;114m• Edited\x1b[0m ${norm.changes.map(c => c.path).join(', ')}`);
                 } else if (norm.type === 'agentMessage' && norm.text) {
-                  out.latestTurnStatus = 'completed';
-                  turn.status = 'completed';
+                  const itemPhase = String(p.item.phase || '').toLowerCase();
+                  if (itemPhase === 'commentary') {
+                    markTurnActive(turn);
+                  } else {
+                    out.latestTurnStatus = 'completed';
+                    turn.status = 'completed';
+                    sawActivitySinceCompletion = false;
+                  }
                   for (const al of String(norm.text).trim().split(/\r?\n/).slice(0, 6)) {
                     terminalLines.push(`\x1b[38;5;252m• ${al}\x1b[0m`);
                   }
@@ -821,6 +1132,12 @@ function readCodexRolloutSummary(threadId, customCodexHome = null) {
             // Skip truncated or unparseable JSONL line.
           }
         }
+        if (out.usedTokens === 0 && out.cumulativeTokens > 0 && out.cumulativeTokens <= out.modelContextWindow * 2) {
+          out.usedTokens = out.cumulativeTokens;
+        }
+        if (sawActivitySinceCompletion) {
+          out.latestTurnStatus = 'inProgress';
+        }
         // If the rollout file has not been modified for more than 120 seconds, any stale inProgress turn has settled.
         if (out.latestTurnStatus === 'inProgress' && st.mtimeMs && Date.now() - st.mtimeMs > 120 * 1000) {
           out.latestTurnStatus = 'completed';
@@ -829,14 +1146,25 @@ function readCodexRolloutSummary(threadId, customCodexHome = null) {
           }
         }
         out.turns = [...turnsMap.values()].filter(t => t.items.length > 0).slice(-50);
-        const modelLabel = out.model ? out.model.replace(/^gpt-6\.1-sol$/i, 'GPT-6.1-Sol') : 'Codex';
+        if (out.latestTurnStatus === 'inProgress' && out.turns.length > 0) {
+          out.turns[out.turns.length - 1].status = 'inProgress';
+        }
+        const modelLabel = out.model ? out.model.replace(/^gpt-6\.1-sol$/i, 'GPT-6.1-Sol') : 'GPT-6.1-Sol';
         const effortLabel = out.effort || 'high';
         const winK = Math.round((out.modelContextWindow || 380000) / 1000);
+        const weeklyUsedPct = out.rateLimits?.primary?.used_percent ?? latestObservedRateLimits?.rateLimits?.primary?.used_percent;
+        const weeklyLeftText = Number.isFinite(Number(weeklyUsedPct))
+          ? ` \x1b[90m·\x1b[0m \x1b[38;5;214mweekly ${Math.max(0, 100 - Math.round(Number(weeklyUsedPct)))}% left\x1b[0m`
+          : '';
         const tailLines = terminalLines.slice(-250);
+        if (out.latestTurnStatus === 'inProgress') {
+          tailLines.push('');
+          tailLines.push('\x1b[38;5;114m• Working (esc 중단)\x1b[0m');
+        }
         tailLines.push('');
         tailLines.push('\x1b[38;5;141m›\x1b[0m \x1b[90mAsk Codex to do anything\x1b[0m');
         tailLines.push(
-          `\x1b[38;5;214m${modelLabel} ${effortLabel}\x1b[0m \x1b[90m·\x1b[0m \x1b[38;5;141m${out.title || 'session'}\x1b[0m \x1b[90m· ${winK}K window\x1b[0m`,
+          `\x1b[38;5;214m${modelLabel} ${effortLabel}\x1b[0m \x1b[90m·\x1b[0m \x1b[38;5;141m${out.title || 'session'}\x1b[0m \x1b[90m· ${winK}K window\x1b[0m${weeklyLeftText}`,
         );
         out.terminalLines = tailLines;
       }
@@ -927,17 +1255,28 @@ function buildPendingQuestionEntry(session, notification) {
 }
 
 function extractWeeklyUsage(rateLimitsPayload) {
-  const rl = rateLimitsPayload?.rateLimits ?? rateLimitsPayload;
+  const rl = rateLimitsPayload?.rateLimits ?? rateLimitsPayload?.rate_limits ?? rateLimitsPayload;
   if (!rl || typeof rl !== 'object') return { limitName: null, weekly: null };
-  const limitName = typeof rl.limitName === 'string' ? rl.limitName : null;
+  const limitName =
+    typeof rl.limitName === 'string'
+      ? rl.limitName
+      : typeof rl.limit_name === 'string'
+        ? rl.limit_name
+        : typeof rl.limit_id === 'string'
+          ? rl.limit_id
+          : null;
   const candidates = [rl.weekly, rl.primary, rl.secondary].filter(Boolean);
   for (const entry of candidates) {
     if (!entry || typeof entry !== 'object') continue;
-    const isWeekly = entry === rl.weekly || entry.windowDurationMins === 10080 || entry.windowMinutes === 10080;
+    const isWeekly =
+      entry === rl.weekly ||
+      entry.windowDurationMins === 10080 ||
+      entry.windowMinutes === 10080 ||
+      entry.window_minutes === 10080;
     if (!isWeekly) continue;
-    const usedPercent = Number(entry.usedPercent ?? entry.percentUsed ?? 0);
+    const usedPercent = Number(entry.usedPercent ?? entry.percentUsed ?? entry.used_percent ?? 0);
     if (!Number.isFinite(usedPercent)) continue;
-    const rawReset = entry.resetsAt ?? entry.resetAt ?? null;
+    const rawReset = entry.resetsAt ?? entry.resetAt ?? entry.resets_at ?? null;
     const resetsAt = rawReset !== null && Number.isSafeInteger(Number(rawReset)) && Number(rawReset) > 0
       ? Number(rawReset)
       : null;
@@ -950,6 +1289,33 @@ function extractWeeklyUsage(rateLimitsPayload) {
     };
   }
   return { limitName, weekly: null };
+}
+
+function readLatestRateLimitsFromRollouts(customCodexHome = null) {
+  if (latestObservedRateLimits?.rateLimits) {
+    return latestObservedRateLimits.rateLimits;
+  }
+  const stateDbPath = path.join(customCodexHome || getCodexHome(), 'state_5.sqlite');
+  if (!fs.existsSync(stateDbPath)) return null;
+  let db = null;
+  try {
+    db = new DatabaseSync(stateDbPath, { readOnly: true });
+    const rows = db
+      .prepare('SELECT id FROM threads ORDER BY updated_at DESC LIMIT 5')
+      .all();
+    db.close();
+    db = null;
+    for (const r of rows) {
+      if (!r?.id) continue;
+      const summary = readCodexRolloutSummary(String(r.id), customCodexHome);
+      if (summary?.rateLimits) {
+        return summary.rateLimits;
+      }
+    }
+  } catch {} finally {
+    try { db?.close(); } catch {}
+  }
+  return null;
 }
 
 class AppServerBridge {
@@ -1625,20 +1991,29 @@ export function createRemoteServer(options = {}) {
   let cronJobSeq = 1;
   let sessionSeq = 1;
 
-  function resolveMirroredSessionState(session, rollout = null, thread = null) {
+  function resolveMirroredSessionState(session, rollout = null, thread = null, desktopMetaState = null) {
     if (!session) return 'idle';
     if (!session.active) return 'stopped';
-    const turns = Array.isArray(thread?.turns) && thread.turns.length > 0
-      ? thread.turns
-      : Array.isArray(rollout?.turns)
-        ? rollout.turns
+    const hasPendingApprovalOrQuestion = [...pendingQuestions.values()].some(
+      q => q.sessionId === session.id && !q.responded,
+    );
+    if (hasPendingApprovalOrQuestion || desktopMetaState === 'waiting') {
+      return 'waiting';
+    }
+    if (rollout && typeof rollout.latestTurnStatus === 'string') {
+      return rollout.latestTurnStatus === 'inProgress' ? 'running' : 'idle';
+    }
+    const turns = Array.isArray(rollout?.turns) && rollout.turns.length > 0
+      ? rollout.turns
+      : Array.isArray(thread?.turns) && thread.turns.length > 0
+        ? thread.turns
         : [];
     const latestTurn = turns.length > 0 ? turns[turns.length - 1] : null;
     if (latestTurn) {
       return latestTurn.status === 'inProgress' ? 'running' : 'idle';
     }
-    if (rollout && typeof rollout.latestTurnStatus === 'string') {
-      return rollout.latestTurnStatus === 'inProgress' ? 'running' : 'idle';
+    if (desktopMetaState === 'running' && rollout?.rolloutMtimeMs && Date.now() - rollout.rolloutMtimeMs <= 30 * 1000) {
+      return 'running';
     }
     return 'idle';
   }
@@ -1649,6 +2024,8 @@ export function createRemoteServer(options = {}) {
     broadcast('session-changed', publicSessionInfo(session));
     return true;
   }
+
+  const explicitlyStoppedMirroredIds = new Set();
 
   function materializeDesktopSessions() {
     const synced = syncFromDesktopDatabase();
@@ -1662,17 +2039,31 @@ export function createRemoteServer(options = {}) {
       const cwd = normalizeWindowsExtendedPath(String(ls.cwd || meta.cwd || os.homedir()));
       const title = String(ls.title || ls.name || meta.title || meta.name || '세션');
       const rollout = threadId ? readCodexRolloutSummary(String(threadId), codexHomeDir) : null;
+      const desktopMetaState = typeof meta.state === 'string' ? meta.state : null;
       if (existing) {
+        if (!existing.active && explicitlyStoppedMirroredIds.has(id)) {
+          continue;
+        }
         existing.title = title;
         existing.cwd = cwd;
         existing.projectId = ls.projectId ?? meta.projectId ?? existing.projectId ?? null;
         existing.projectAssigned = Boolean(ls.projectAssigned ?? meta.projectAssigned ?? existing.projectAssigned);
+        existing.desktopMetaState = desktopMetaState;
+        if (existing.threadId && rollout && state.threads[existing.threadId]) {
+          state.threads[existing.threadId].turns = rollout.turns;
+          state.threads[existing.threadId].updatedAt = rollout.updatedAt;
+          if (rollout.usedTokens > 0) state.threads[existing.threadId].usedTokens = rollout.usedTokens;
+        }
         const derivedState = resolveMirroredSessionState(
           existing,
           rollout,
           existing.threadId ? state.threads[existing.threadId] : null,
+          desktopMetaState,
         );
         updateSessionStateIfChanged(existing, derivedState);
+        continue;
+      }
+      if (explicitlyStoppedMirroredIds.has(id)) {
         continue;
       }
       const session = {
@@ -1694,6 +2085,7 @@ export function createRemoteServer(options = {}) {
         contextRevision: 0,
         seededRolloutTerminal: false,
         isDesktopMirrored: true,
+        desktopMetaState,
         rolloutTerminalLines: [],
         lastRolloutUpdatedAt: 0,
       };
@@ -1722,6 +2114,7 @@ export function createRemoteServer(options = {}) {
         session,
         rollout,
         session.threadId ? state.threads[session.threadId] : null,
+        desktopMetaState,
       );
       sessions.set(id, session);
     }
@@ -1742,7 +2135,7 @@ export function createRemoteServer(options = {}) {
       if (session.isDesktopMirrored) {
         updateSessionStateIfChanged(
           session,
-          resolveMirroredSessionState(session, rollout, state.threads[session.threadId]),
+          resolveMirroredSessionState(session, rollout, state.threads[session.threadId], session.desktopMetaState),
         );
       }
     }
@@ -1988,7 +2381,7 @@ export function createRemoteServer(options = {}) {
     if (session.isDesktopMirrored) {
       updateSessionStateIfChanged(
         session,
-        resolveMirroredSessionState(session, activeRollout, currentThread),
+        resolveMirroredSessionState(session, activeRollout, currentThread, session.desktopMetaState),
       );
     }
     return currentThread;
@@ -2301,8 +2694,8 @@ export function createRemoteServer(options = {}) {
 
     if (type === 'contextStatus') {
       await appServerBridge.ensureStarted().catch(() => {});
-      const connected = appServerBridge.isConnected();
-      if (connected) {
+      const rpcConnected = appServerBridge.isConnected();
+      if (rpcConnected) {
         try {
           const readRes = await appServerBridge.request('thread/read', { threadId, includeTurns: false });
           if (readRes?.thread) {
@@ -2313,34 +2706,46 @@ export function createRemoteServer(options = {}) {
           // Use cached thread values if read fails on unmaterialized thread.
         }
       }
-      if (session.isDesktopMirrored) {
-        const rollout = readCodexRolloutSummary(threadId, codexHomeDir);
-        updateSessionStateIfChanged(session, resolveMirroredSessionState(session, rollout, thread));
+      const rollout = threadId ? readCodexRolloutSummary(threadId, codexHomeDir) : null;
+      if (rollout) {
+        if (rollout.usedTokens > 0) thread.usedTokens = rollout.usedTokens;
+        if (rollout.modelContextWindow > 0) thread.modelContextWindow = rollout.modelContextWindow;
+        if (Array.isArray(rollout.turns) && rollout.turns.length > 0) {
+          thread.turns = rollout.turns;
+        }
       }
+      if (session.isDesktopMirrored) {
+        updateSessionStateIfChanged(
+          session,
+          resolveMirroredSessionState(session, rollout, thread, session.desktopMetaState),
+        );
+      }
+      const hasRolloutOrMirrored = Boolean(rollout || session.isDesktopMirrored || thread.usedTokens > 0);
+      const effectiveConnected = Boolean(rpcConnected || hasRolloutOrMirrored);
       const caps = appServerBridge.serverInfo?.opendiyCapabilities || {};
       const usedTokens = Number(thread.usedTokens || 0);
-      const modelContextWindow = Number(thread.modelContextWindow || 128000);
-      const compactSupported = Boolean(caps.compactStartIfIdle ?? connected);
+      const modelContextWindow = Number(thread.modelContextWindow || 380000);
+      const compactSupported = Boolean(caps.compactStartIfIdle ?? effectiveConnected);
       const isIdle = session.state === 'idle';
       session.contextRevision = (session.contextRevision || 0) + 1;
       return {
-        connected,
-        guiConnected: connected,
-        supported: connected,
+        connected: effectiveConnected,
+        guiConnected: effectiveConnected,
+        supported: effectiveConnected,
         usedTokens,
         modelContextWindow,
         tokenUsage: {
           last: { totalTokens: usedTokens },
           modelContextWindow,
         },
-        tokenUsageFresh: connected,
+        tokenUsageFresh: effectiveConnected,
         compacting: false,
         active: !isIdle,
-        canCompact: connected && compactSupported && isIdle,
-        canCompactIfIdle: connected && compactSupported,
+        canCompact: effectiveConnected && compactSupported && isIdle,
+        canCompactIfIdle: effectiveConnected && compactSupported,
         idle: isIdle,
-        passiveSubscriptionSupported: Boolean(caps.passiveSubscription ?? connected),
-        subagentsSupported: Boolean(appServerBridge.serverInfo?.supportsSubagentManagement ?? connected),
+        passiveSubscriptionSupported: Boolean(caps.passiveSubscription ?? effectiveConnected),
+        subagentsSupported: Boolean(appServerBridge.serverInfo?.supportsSubagentManagement ?? effectiveConnected),
         cronSupported: true,
         compactSupported,
         revision: session.contextRevision,
@@ -2502,6 +2907,15 @@ export function createRemoteServer(options = {}) {
         descriptionEn: 'Open the scheduled jobs (Cron) dialog for this session.',
         category: 'ui',
         action: 'cron',
+      },
+      {
+        command: '/update',
+        titleKo: '최신 버전 확인 및 자동 업데이트',
+        titleEn: 'Check & apply updates',
+        descriptionKo: 'GitHub Releases에서 최신 버전을 확인하고 즉시 업데이트합니다.',
+        descriptionEn: 'Check GitHub Releases for a newer version and apply the update.',
+        category: 'builtin',
+        action: 'update',
       },
       {
         command: '/help',
@@ -2670,6 +3084,33 @@ export function createRemoteServer(options = {}) {
       return { handled: false, rewrittenPrompt };
     }
 
+    if (cmd === '/update') {
+      try {
+        const info = await fetchLatestReleaseInfo({
+          rootDir: updateRootDir,
+          releaseApiUrl: releaseApiUrl || undefined,
+          fetchFn: updateFetchFn,
+        });
+        if (!info.updateAvailable && rest.toLowerCase() !== 'apply' && rest.toLowerCase() !== 'force') {
+          const msg = `• 현재 최신 버전(v${info.currentVersion})을 실행 중입니다.`;
+          writeTerm(msg);
+          return { handled: true, outputText: msg };
+        }
+        if (rest.toLowerCase() === 'apply' || rest.toLowerCase() === 'now' || info.updateAvailable) {
+          const res = await dispatchCommand('apply_update', { target: 'both' });
+          const msg = res.updated
+            ? `• v${res.version} 자동 업데이트가 적용되었습니다. 잠시 후 서비스가 재시작됩니다.`
+            : `• 현재 최신 버전(v${res.version || info.currentVersion})입니다.`;
+          writeTerm(msg);
+          return { handled: true, outputText: msg };
+        }
+      } catch (err) {
+        const msg = `• 업데이트 확인/적용 실패: ${err.message || err}`;
+        writeTerm(msg);
+        return { handled: true, outputText: msg };
+      }
+    }
+
     const { commands } = buildSlashCommandsList(session.cwd);
     const matchedSkill = commands.find(c => c.category === 'skill' && c.command.toLowerCase() === cmd);
     if (matchedSkill) {
@@ -2745,8 +3186,66 @@ export function createRemoteServer(options = {}) {
     }
   }
 
+  const updateRootDir = path.resolve(options.updateRootDir || ROOT_DIR);
+  const releaseApiUrl = options.releaseApiUrl || process.env.OPENDIY_REMOTE_RELEASE_API_URL || '';
+  const updateFetchFn = options.updateFetchFn || globalThis.fetch;
+
   async function dispatchCommand(command, args = {}) {
     if (mode === 'relay') {
+      if (command === 'check_for_updates') {
+        const relayInfo = await fetchLatestReleaseInfo({
+          rootDir: updateRootDir,
+          releaseApiUrl: releaseApiUrl || undefined,
+          fetchFn: updateFetchFn,
+        });
+        let hostInfo = null;
+        if (activeHostLease && activeHostLease.streamRes && !activeHostLease.streamRes.writableEnded) {
+          try {
+            hostInfo = await invokeRelayHost('check_for_updates', args, 10000);
+          } catch {}
+        }
+        return {
+          ...relayInfo,
+          relayVersion: relayInfo.currentVersion,
+          hostVersion: hostInfo?.currentVersion ?? null,
+          hostUpdateAvailable: Boolean(hostInfo?.updateAvailable),
+          updateAvailable: Boolean(relayInfo.updateAvailable || hostInfo?.updateAvailable),
+        };
+      }
+      if (command === 'apply_update') {
+        const target = String(args.target || 'both');
+        let hostResult = null;
+        if ((target === 'both' || target === 'host') && activeHostLease && activeHostLease.streamRes && !activeHostLease.streamRes.writableEnded) {
+          try {
+            hostResult = await invokeRelayHost('apply_update', { ...args, target: 'host' }, 45000);
+          } catch (err) {
+            if (target === 'host') throw err;
+            hostResult = { updated: false, error: String(err.message || err) };
+          }
+        }
+        let relayResult = null;
+        if (target === 'both' || target === 'relay') {
+          relayResult = await performSelfUpdate({
+            rootDir: updateRootDir,
+            releaseApiUrl: releaseApiUrl || undefined,
+            fetchFn: updateFetchFn,
+            scheduleRestart: options.scheduleRestartOnUpdate !== false,
+            onRestart: options.onRestart,
+          });
+          staticAssetCache.clear();
+          broadcast('update-status-changed', {
+            target: 'relay',
+            updated: relayResult.updated,
+            version: relayResult.version,
+            restartScheduled: relayResult.restartScheduled,
+          });
+        }
+        return {
+          ...(relayResult || hostResult || { updated: false }),
+          relay: relayResult,
+          host: hostResult,
+        };
+      }
       return invokeRelayHost(command, args);
     }
 
@@ -2958,6 +3457,16 @@ export function createRemoteServer(options = {}) {
         const existingSession = req.threadId
           ? [...sessions.values()].find(s => s.threadId === String(req.threadId) && s.active)
           : null;
+        let wasDesktopMirrored = false;
+        if (req.threadId) {
+          for (const [sid, s] of sessions) {
+            if (s.threadId === String(req.threadId) && !s.active) {
+              if (s.isDesktopMirrored) wasDesktopMirrored = true;
+              explicitlyStoppedMirroredIds.delete(sid);
+              sessions.delete(sid);
+            }
+          }
+        }
         if (existingSession) {
           existingSession.title = title;
           existingSession.cwd = cwd;
@@ -2987,6 +3496,7 @@ export function createRemoteServer(options = {}) {
           eventSeq: 0,
           deliveredEventSeq: 0,
           contextRevision: 0,
+          ...(wasDesktopMirrored ? { isDesktopMirrored: true } : {}),
         };
         await syncThreadFromServer(session, false);
         sessions.set(id, session);
@@ -2994,13 +3504,15 @@ export function createRemoteServer(options = {}) {
 
         const info = publicSessionInfo(session);
         broadcast('session-changed', info);
-        emitTerminalOutput(
-          session,
-          `\x1b[38;5;141m╭─ [OpenDIY Remote] ${title} · ${cwd}\x1b[0m\r\n`,
-        );
+        if (!wasDesktopMirrored) {
+          emitTerminalOutput(
+            session,
+            `\x1b[38;5;141m╭─ [OpenDIY Remote] ${title} · ${cwd}\x1b[0m\r\n`,
+          );
+        }
 
         const settings = computeSettings();
-        const shouldSpawnProcess = options.spawnProcess !== false;
+        const shouldSpawnProcess = options.spawnProcess !== false && !wasDesktopMirrored;
         if (shouldSpawnProcess) {
           const useCodex = Boolean(settings.resolvedPath && options.useCodexCli === true);
           const cmdBin = useCodex
@@ -3148,6 +3660,9 @@ export function createRemoteServer(options = {}) {
         if (session && session.generation === Number(args.generation)) {
           session.state = 'stopped';
           session.active = false;
+          if (session.isDesktopMirrored) {
+            explicitlyStoppedMirroredIds.add(session.id);
+          }
           const proc = sessionProcesses.get(session.id);
           if (proc) {
             sessionProcesses.delete(session.id);
@@ -3376,6 +3891,43 @@ export function createRemoteServer(options = {}) {
         const cwd = args.cwd ? String(args.cwd) : session?.cwd || null;
         return buildSlashCommandsList(cwd);
       }
+      case 'check_for_updates': {
+        const info = await fetchLatestReleaseInfo({
+          rootDir: updateRootDir,
+          releaseApiUrl: releaseApiUrl || undefined,
+          fetchFn: updateFetchFn,
+        });
+        if (info.updateAvailable) {
+          broadcast('update-available', info);
+        }
+        return {
+          ...info,
+          relayVersion: null,
+          hostVersion: info.currentVersion,
+          hostUpdateAvailable: info.updateAvailable,
+        };
+      }
+      case 'apply_update': {
+        const res = await performSelfUpdate({
+          rootDir: updateRootDir,
+          releaseApiUrl: releaseApiUrl || undefined,
+          fetchFn: updateFetchFn,
+          scheduleRestart: options.scheduleRestartOnUpdate !== false,
+          onRestart: options.onRestart,
+        });
+        staticAssetCache.clear();
+        broadcast('update-status-changed', {
+          target: 'host',
+          updated: res.updated,
+          version: res.version,
+          restartScheduled: res.restartScheduled,
+        });
+        return {
+          ...res,
+          host: res,
+          relay: null,
+        };
+      }
       case 'extensions_mutate': {
         const cwd = args.cwd ? String(args.cwd) : null;
         if (appServerBridge.isConnected() && args.request) {
@@ -3450,12 +4002,13 @@ export function createRemoteServer(options = {}) {
         }
         const req = args.request || {};
         await appServerBridge.ensureStarted().catch(() => {});
-        const connected = appServerBridge.isConnected();
-        const supported = Boolean(appServerBridge.serverInfo?.supportsSubagentManagement ?? connected);
+        const rpcConnected = appServerBridge.isConnected();
+        const effectiveConnected = Boolean(rpcConnected || session.isDesktopMirrored || session.threadId);
+        const supported = Boolean(appServerBridge.serverInfo?.supportsSubagentManagement ?? effectiveConnected);
         if (!req.type || req.type === 'list') {
           let agents = [];
           let nextCursor = null;
-          if (connected && supported) {
+          if (rpcConnected && supported) {
             try {
               const rpcRes = await appServerBridge.request('thread/subagents/list', {
                 threadId: session.threadId,
@@ -3470,7 +4023,7 @@ export function createRemoteServer(options = {}) {
           }
           return {
             supported,
-            connected,
+            connected: effectiveConnected,
             parentRuntimeId: appServerBridge.runtimeId,
             agents,
             nextCursor,
@@ -3478,7 +4031,7 @@ export function createRemoteServer(options = {}) {
             reconciledRequestId: req.requestId ?? null,
           };
         }
-        if (connected && supported) {
+        if (rpcConnected && supported) {
           try {
             const rpcRes = await appServerBridge.request('thread/subagents/control', {
               threadId: session.threadId,
@@ -3726,7 +4279,15 @@ export function createRemoteServer(options = {}) {
             limitName = parsed.limitName;
             weekly = parsed.weekly;
           } catch {
-            // Leave weekly null if account rate limits are unavailable.
+            // Fall through to rollout rate_limits fallback.
+          }
+        }
+        if (!weekly) {
+          const fallbackLimits = readLatestRateLimitsFromRollouts(codexHomeDir);
+          if (fallbackLimits) {
+            const parsed = extractWeeklyUsage(fallbackLimits);
+            limitName = parsed.limitName ?? limitName;
+            weekly = parsed.weekly;
           }
         }
         return {
@@ -4402,12 +4963,46 @@ export function createRemoteServer(options = {}) {
     try { socket.setNoDelay(true); } catch {}
   });
 
+  const autoUpdateEnabled =
+    options.autoUpdate !== undefined
+      ? Boolean(options.autoUpdate)
+      : process.env.OPENDIY_REMOTE_AUTO_UPDATE === '1' || process.env.OPENDIY_REMOTE_AUTO_UPDATE === 'true';
+  const autoUpdateIntervalMs = Math.max(
+    60 * 1000,
+    Number(options.autoUpdateIntervalMs || process.env.OPENDIY_REMOTE_AUTO_UPDATE_INTERVAL_MS || 6 * 60 * 60 * 1000),
+  );
+  const autoUpdateTimer = autoUpdateEnabled
+    ? setInterval(() => {
+        void (async () => {
+          try {
+            const info = await fetchLatestReleaseInfo({
+              rootDir: updateRootDir,
+              releaseApiUrl: releaseApiUrl || undefined,
+              fetchFn: updateFetchFn,
+            });
+            if (info.updateAvailable) {
+              broadcast('update-available', info);
+              await performSelfUpdate({
+                rootDir: updateRootDir,
+                releaseInfo: info,
+                fetchFn: updateFetchFn,
+                scheduleRestart: options.scheduleRestartOnUpdate !== false,
+                onRestart: options.onRestart,
+              });
+            }
+          } catch {}
+        })();
+      }, autoUpdateIntervalMs)
+    : null;
+  autoUpdateTimer?.unref?.();
+
   return {
     server,
     dispatchCommand,
     broadcast,
     close: async () => {
-      if ( desktopWatchInterval ) clearInterval(desktopWatchInterval);
+      if (autoUpdateTimer) clearInterval(autoUpdateTimer);
+      if (desktopWatchInterval) clearInterval(desktopWatchInterval);
       for (const jobId of [...cronTimers.keys()]) {
         clearCronTimer(jobId);
       }
@@ -4803,6 +5398,9 @@ if (isMain) {
   let googleClientId = process.env.OPENDIY_REMOTE_GOOGLE_CLIENT_ID || '';
   let googleClientSecret = process.env.OPENDIY_REMOTE_GOOGLE_CLIENT_SECRET || '';
   let allowedEmail = process.env.OPENDIY_REMOTE_ALLOWED_EMAIL || '';
+  let autoUpdate = process.env.OPENDIY_REMOTE_AUTO_UPDATE === '1' || process.env.OPENDIY_REMOTE_AUTO_UPDATE === 'true';
+  let checkUpdateOnly = false;
+  let applyUpdateNow = false;
 
   const argv = process.argv.slice(2);
   for (let i = 0; i < argv.length; i++) {
@@ -4857,15 +5455,49 @@ if (isMain) {
       allowedEmail = argv[++i];
     } else if (argv[i].startsWith('--allowed-email=')) {
       allowedEmail = argv[i].slice('--allowed-email='.length);
+    } else if (argv[i] === '--auto-update') {
+      autoUpdate = true;
+    } else if (argv[i] === '--no-auto-update') {
+      autoUpdate = false;
+    } else if (argv[i] === '--check-update') {
+      checkUpdateOnly = true;
+    } else if (argv[i] === '--update') {
+      applyUpdateNow = true;
     }
   }
 
-  if (mode === 'connect' || connectUrl) {
+  if (checkUpdateOnly || applyUpdateNow) {
+    (async () => {
+      try {
+        const info = await fetchLatestReleaseInfo();
+        if (checkUpdateOnly && !applyUpdateNow) {
+          console.log(
+            info.updateAvailable
+              ? `[OpenDIY Remote] 새 업데이트가 있습니다: v${info.currentVersion} -> v${info.latestVersion} (${info.releaseUrl})`
+              : `[OpenDIY Remote] 현재 최신 버전(v${info.currentVersion})입니다.`,
+          );
+          process.exit(0);
+        }
+        if (!info.updateAvailable) {
+          console.log(`[OpenDIY Remote] 이미 최신 버전(v${info.currentVersion})입니다.`);
+          process.exit(0);
+        }
+        console.log(`[OpenDIY Remote] v${info.currentVersion} -> v${info.latestVersion} 자동 업데이트를 다운로드 및 적용합니다...`);
+        const res = await performSelfUpdate({ releaseInfo: info, scheduleRestart: false });
+        console.log(`[OpenDIY Remote] v${res.version} 업데이트 완료 (SHA-256: ${res.sha256}).`);
+        process.exit(0);
+      } catch (err) {
+        console.error(`[OpenDIY Remote] 업데이트 오류: ${err.message || err}`);
+        process.exit(1);
+      }
+    })();
+  } else if (mode === 'connect' || connectUrl) {
     const connector = startHostConnector({
       relayUrl: connectUrl,
       hostSecret: hostSecret || token,
       workspaceDir: workspaceDir || undefined,
       tlsRejectUnauthorized: !tlsInsecure,
+      autoUpdate,
       onRegistered: ({ hostId }) => {
         console.log(`OpenDIY Remote Host Connector registered with relay (${connectUrl}) [hostId=${hostId}]`);
       },
@@ -4891,6 +5523,7 @@ if (isMain) {
       googleClientId: googleClientId || undefined,
       googleClientSecret: googleClientSecret || undefined,
       allowedEmail: allowedEmail || undefined,
+      autoUpdate,
     });
     instance.server.listen(port, host, () => {
       const addr = instance.server.address();

@@ -63,7 +63,7 @@ npm run build
 #### 방법 1 — 원클릭 간편 설치 스크립트 (Ubuntu / Debian 깡통 서버 권장)
 새로 만든 Ubuntu/Debian 서버 터미널에서 아래 한 줄만 실행하면 Node.js 22 설치, 릴리즈 빌드 번들 다운로드, `systemd` 자동 재시작 서비스(`opendiy-remote.service`) 등록, 난수 토큰·비밀키 생성 및 출력까지 자동으로 완료됩니다:
 ```bash
-curl -fsSL https://github.com/jaeseongs95/opendiy-remote/releases/download/v1.1.0/install-relay.sh | bash
+curl -fsSL https://github.com/jaeseongs95/opendiy-remote/releases/download/v1.2.0/install-relay.sh | bash
 ```
 
 #### 방법 2 — 수동으로 중계 서버(VPS)에서 실행 (`codex` 설치 불필요)
@@ -123,6 +123,8 @@ npm start -- --bind 0.0.0.0:3210 --token "my-secret-access-token"
 | `--allowed-email <emails>` | `OPENDIY_REMOTE_ALLOWED_EMAIL` | (없음) | 접속을 허용할 소유자 Google 이메일 주소 (쉼표 구분 가능) |
 | `--tls-cert <path>` | `OPENDIY_REMOTE_TLS_CERT` | (없음) | 자체 HTTPS 가동용 TLS 인증서(PEM) 파일 경로 |
 | `--tls-key <path>` | `OPENDIY_REMOTE_TLS_KEY` | (없음) | 자체 HTTPS 가동용 TLS 개인키(PEM) 파일 경로 |
+| `--auto-update` | `OPENDIY_REMOTE_AUTO_UPDATE` | `false` | GitHub Releases 최신 버전을 주기적으로 확인하고 SHA-256 검증 후 자동 업데이트 |
+| `--check-update` / `--update` | - | - | CLI에서 즉시 최신 릴리스 확인 또는 자동 업데이트 적용 |
 | `--workspace <dir>` | `OPENDIY_REMOTE_DATA_DIR` | OS 임시/작업 경로 | 레이아웃·프로젝트·세션 메타데이터 저장 디렉터리(절대 경로) |
 | - | `OPENDIY_CODEX_BIN` | 자동 탐색 | 사용할 `codex` / `opendiy-codex-launcher` 실행 파일 절대 경로 |
 | - | `OPENDIY_REMOTE_DIST` | `./dist` | 서빙할 프런트엔드 빌드 산출물 디렉터리 경로 |
