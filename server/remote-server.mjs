@@ -539,8 +539,8 @@ function scanSkillsInDir(baseDir, scope, pluginId = null) {
   return results;
 }
 
-function scanCodexExtensions(cwd, executablePath) {
-  const codexHome = getCodexHome();
+function scanCodexExtensions(cwd, executablePath, customCodexHome = null) {
+  const codexHome = customCodexHome || getCodexHome();
   const skills = [
     ...scanSkillsInDir(path.join(codexHome, 'skills'), 'user'),
     ...(cwd ? scanSkillsInDir(path.join(cwd, '.codex', 'skills'), 'project') : []),
@@ -3039,7 +3039,7 @@ export function createRemoteServer(options = {}) {
       title: b.titleKo,
       ...b,
     }));
-    const ext = scanCodexExtensions(cwd || null, computeSettings().resolvedPath);
+    const ext = scanCodexExtensions(cwd || null, computeSettings().resolvedPath, codexHomeDir);
     const seen = new Set(builtins.map(b => b.command));
     const skills = [];
     for (const sk of ext.skills || []) {
@@ -3991,7 +3991,7 @@ export function createRemoteServer(options = {}) {
       }
       case 'extensions_list': {
         const cwd = args.cwd ? String(args.cwd) : null;
-        return scanCodexExtensions(cwd, computeSettings().resolvedPath);
+        return scanCodexExtensions(cwd, computeSettings().resolvedPath, codexHomeDir);
       }
       case 'slash_commands_list': {
         const session = args.id ? sessions.get(args.id) : null;
@@ -4044,7 +4044,7 @@ export function createRemoteServer(options = {}) {
             // Ignore if app-server does not support direct extensions/mutate RPC.
           }
         }
-        return scanCodexExtensions(cwd, computeSettings().resolvedPath);
+        return scanCodexExtensions(cwd, computeSettings().resolvedPath, codexHomeDir);
       }
       case 'mobile_control': {
         const session = sessions.get(args.id);
