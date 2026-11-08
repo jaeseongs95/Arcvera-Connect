@@ -63,7 +63,7 @@ npm run build
 #### 방법 1 — 원클릭 간편 설치 스크립트 (Ubuntu / Debian 깡통 서버 권장)
 새로 만든 Ubuntu/Debian 서버 터미널에서 아래 한 줄만 실행하면 Node.js 22 설치, 릴리즈 빌드 번들 다운로드, `systemd` 자동 재시작 서비스(`opendiy-remote.service`) 등록, 난수 토큰·비밀키 생성 및 출력까지 자동으로 완료됩니다:
 ```bash
-curl -fsSL https://github.com/jaeseongs95/opendiy-remote/releases/download/v1.2.0/install-relay.sh | bash
+curl -fsSL https://github.com/jaeseongs95/opendiy-remote/releases/download/v1.2.1/install-relay.sh | bash
 ```
 
 #### 방법 2 — 수동으로 중계 서버(VPS)에서 실행 (`codex` 설치 불필요)
