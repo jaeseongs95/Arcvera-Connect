@@ -78,7 +78,7 @@ test('remote browser bridge renders REMOTE WORKSPACE and bridges project, sessio
     expect(errors).toEqual([]);
   } finally {
     await remote.close();
-    fs.rmSync(tmpRoot, { recursive: true, force: true });
+    try { fs.rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch {}
   }
 });
 
@@ -187,7 +187,7 @@ test('mobile viewport (390x844) renders dedicated mobile UI with slide-over draw
     expect(touchAction).toBe('pan-y');
   } finally {
     await remote.close();
-    fs.rmSync(tmpRoot, { recursive: true, force: true });
+    try { fs.rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch {}
   }
 });
 
@@ -474,6 +474,6 @@ test('relay + host connector mode renders mirrored desktop terminal rollout on i
   } finally {
     await connector.close();
     await relay.close();
-    fs.rmSync(tmpRoot, { recursive: true, force: true });
+    try { fs.rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch {}
   }
 });

@@ -57,11 +57,13 @@ export class TerminalInputQueue<T extends { data: string }> {
   private bytes = 0;
   private pressure = false;
   private closed = false;
+  private coalesce: boolean;
   private send: (value: T) => Promise<void>;
   private changed: () => void;
-  constructor(send: (value: T) => Promise<void>, changed: () => void) {
+  constructor(send: (value: T) => Promise<void>, changed: () => void, options?: { coalesce?: boolean }) {
     this.send = send;
     this.changed = changed;
+    this.coalesce = Boolean(options?.coalesce);
   }
   get size() { return this.count; }
   get byteLength() { return this.bytes; }
@@ -100,7 +102,7 @@ export class TerminalInputQueue<T extends { data: string }> {
         let combinedData = first.value.data;
         let combinedBytes = first.bytes;
         const firstRec = first.value as Record<string, unknown>;
-        while (this.pending.length) {
+        while (this.coalesce && this.pending.length) {
           const next = this.pending[0];
           const nextRec = next.value as Record<string, unknown>;
           if (

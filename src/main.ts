@@ -926,7 +926,7 @@ function createTerminal(session: Session) {
     const current = sessions.get(session.id);
     if (!current || value.selectionVersion !== projectSelectionVersion || current.generation !== value.generation || (!canType(session.id) || conversationOwners.has(session.id))) throw new InputQueueError('cancelled');
     await call<void>('session_write', { id: session.id, generation: value.generation, data: value.data });
-  }, () => refreshInputState(session.id));
+  }, () => refreshInputState(session.id), { coalesce: remoteMode });
   const resize = new TerminalResizeQueue<QueuedResize>(async value => {
     const current = sessions.get(session.id);
     if (!current || value.selectionVersion !== projectSelectionVersion || current.generation !== value.generation || !canType(session.id)) return;

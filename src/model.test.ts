@@ -857,7 +857,7 @@ test('remote server mirrors OpenDIY Desktop workspace.sqlite3 projects, active s
   } finally {
     await connector.close();
     await relayInstance.close();
-    fs.rmSync(tmpRoot, { recursive: true, force: true });
+    try { fs.rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch {}
   }
 });
 
@@ -877,6 +877,7 @@ test('TerminalInputQueue coalesces rapid typing bursts over high-RTT links into 
       }
     },
     () => {},
+    { coalesce: true },
   );
 
   const p1 = queue.enqueue({ data: '안', generation: 1, selectionVersion: 1 });
@@ -1137,6 +1138,6 @@ test('Host Connector OAuth login flow (--connect without --host-secret), slash_c
     if (connector) await connector.close();
     await relayInstance.close();
     await new Promise<void>(resolve => mockGoogleServer.close(() => resolve()));
-    fs.rmSync(tmpRoot, { recursive: true, force: true });
+    try { fs.rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch {}
   }
 });
