@@ -2106,8 +2106,12 @@ export function createRemoteServer(options = {}) {
     });
   }
 
-  const server = http.createServer((req, res) => {
-    const reqUrl = new URL(req.url || '/', `http://${req.headers.host || '127.0.0.1'}`);
+  const tlsCert = options.tlsCert || (options.tlsCertFile ? fs.readFileSync(options.tlsCertFile, 'utf8') : '');
+  const tlsKey = options.tlsKey || (options.tlsKeyFile ? fs.readFileSync(options.tlsKeyFile, 'utf8') : '');
+  const useTls = Boolean(tlsCert && tlsKey);
+
+  const requestHandler = (req, res) => {
+    const reqUrl = new URL(req.url || '/', `${useTls ? 'https' : 'http'}://${req.headers.host || '127.0.0.1'}`);
     const pathname = reqUrl.pathname;
     const clientIp = String(req.socket?.remoteAddress || 'unknown');
 
@@ -2323,7 +2327,8 @@ export function createRemoteServer(options = {}) {
         };
         const urlToken = reqUrl.searchParams.get('token') || '';
         if (urlToken && verifyToken(tokenSha256, urlToken)) {
-          headers['Set-Cookie'] = `${AUTH_COOKIE_NAME}=${encodeURIComponent(urlToken.trim())}; HttpOnly; SameSite=Strict; Path=/`;
+          const isHttps = useTls || String(req.headers['x-forwarded-proto'] || '').toLowerCase() === 'https';
+          headers['Set-Cookie'] = `${AUTH_COOKIE_NAME}=${encodeURIComponent(urlToken.trim())}; HttpOnly; SameSite=Strict; Path=/${isHttps ? '; Secure' : ''}`;
         }
         if (path.basename(filePath) === 'index.html') {
           const html = injectRemoteFlag(fs.readFileSync(filePath, 'utf8'));
@@ -2342,7 +2347,11 @@ export function createRemoteServer(options = {}) {
 
     res.writeHead(405, { 'Content-Type': 'text/plain; charset=utf-8' });
     res.end('Method Not Allowed');
-  });
+  };
+
+  const server = useTls
+    ? https.createServer({ cert: tlsCert, key: tlsKey }, requestHandler)
+    : http.createServer(requestHandler);
 
   return {
     server,
@@ -2377,9 +2386,16 @@ export function startHostConnector(options = {}) {
   const relayUrl = normalizeRelayBaseUrl(options.relayUrl || process.env.OPENDIY_REMOTE_RELAY_URL || '');
   const hostSecret = String(options.hostSecret ?? process.env.OPENDIY_REMOTE_HOST_SECRET ?? process.env.OPENDIY_REMOTE_TOKEN ?? '').trim();
   const hostId = options.hostId || crypto.randomUUID();
+  const rejectUnauthorized = options.tlsRejectUnauthorized !== undefined
+    ? Boolean(options.tlsRejectUnauthorized)
+    : process.env.OPENDIY_REMOTE_TLS_INSECURE !== '1' && process.env.OPENDIY_REMOTE_TLS_INSECURE !== 'true';
   const localRuntime = createRemoteServer({
     ...options,
     mode: 'direct',
+    tlsCert: '',
+    tlsKey: '',
+    tlsCertFile: '',
+    tlsKeyFile: '',
   });
 
   let stopped = false;
@@ -2405,6 +2421,7 @@ export function startHostConnector(options = {}) {
         target,
         {
           method: 'POST',
+          ...(target.protocol === 'https:' ? { rejectUnauthorized } : {}),
           headers: {
             'Content-Type': 'application/json; charset=utf-8',
             'Content-Length': bodyBuf.length,
@@ -2443,6 +2460,7 @@ export function startHostConnector(options = {}) {
       streamUrl,
       {
         method: 'GET',
+        ...(streamUrl.protocol === 'https:' ? { rejectUnauthorized } : {}),
         headers: {
           Accept: 'text/event-stream',
           'X-OpenDIY-Host-Id': hostId,
@@ -2562,6 +2580,9 @@ if (isMain) {
   let token = process.env.OPENDIY_REMOTE_TOKEN || '';
   let hostSecret = process.env.OPENDIY_REMOTE_HOST_SECRET || '';
   let workspaceDir = process.env.OPENDIY_REMOTE_DATA_DIR || process.env.AGENT_GRID_WORKSPACE_DIR || '';
+  let tlsCertFile = process.env.OPENDIY_REMOTE_TLS_CERT || '';
+  let tlsKeyFile = process.env.OPENDIY_REMOTE_TLS_KEY || '';
+  let tlsInsecure = process.env.OPENDIY_REMOTE_TLS_INSECURE === '1' || process.env.OPENDIY_REMOTE_TLS_INSECURE === 'true';
 
   const argv = process.argv.slice(2);
   for (let i = 0; i < argv.length; i++) {
@@ -2594,6 +2615,16 @@ if (isMain) {
       hostSecret = argv[++i];
     } else if (argv[i] === '--workspace' && argv[i + 1]) {
       workspaceDir = argv[++i];
+    } else if (argv[i] === '--tls-cert' && argv[i + 1]) {
+      tlsCertFile = argv[++i];
+    } else if (argv[i].startsWith('--tls-cert=')) {
+      tlsCertFile = argv[i].slice('--tls-cert='.length);
+    } else if (argv[i] === '--tls-key' && argv[i + 1]) {
+      tlsKeyFile = argv[++i];
+    } else if (argv[i].startsWith('--tls-key=')) {
+      tlsKeyFile = argv[i].slice('--tls-key='.length);
+    } else if (argv[i] === '--tls-insecure') {
+      tlsInsecure = true;
     }
   }
 
@@ -2602,6 +2633,7 @@ if (isMain) {
       relayUrl: connectUrl,
       hostSecret: hostSecret || token,
       workspaceDir: workspaceDir || undefined,
+      tlsRejectUnauthorized: !tlsInsecure,
       onRegistered: ({ hostId }) => {
         console.log(`OpenDIY Remote Host Connector registered with relay (${connectUrl}) [hostId=${hostId}]`);
       },
@@ -2621,11 +2653,14 @@ if (isMain) {
       token,
       hostSecret: hostSecret || token,
       workspaceDir: workspaceDir || undefined,
+      tlsCertFile: tlsCertFile || undefined,
+      tlsKeyFile: tlsKeyFile || undefined,
     });
     instance.server.listen(port, host, () => {
       const addr = instance.server.address();
       const actualPort = typeof addr === 'object' && addr ? addr.port : port;
-      console.log(`OpenDIY Remote (${mode} mode) listening on http://${host}:${actualPort}`);
+      const scheme = tlsCertFile && tlsKeyFile ? 'https' : 'http';
+      console.log(`OpenDIY Remote (${mode} mode) listening on ${scheme}://${host}:${actualPort}`);
     });
   }
 }
