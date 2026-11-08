@@ -441,13 +441,15 @@ function resolveCodexBinary(savedPath, allowPathDiscovery = true) {
   const codexHome = getCodexHome();
   const exeName = process.platform === 'win32' ? 'codex.exe' : 'codex';
   const managedCandidates = [
+    path.join(codexHome, 'packages', 'app-server-daemon', 'current', 'bin', exeName),
+    path.join(codexHome, 'packages', 'app-server-daemon', 'current', exeName),
     path.join(codexHome, 'packages', 'standalone', 'current', 'bin', exeName),
     path.join(codexHome, 'packages', 'standalone', 'current', exeName),
   ];
   for (const candidate of managedCandidates) {
     try {
       if (fs.statSync(candidate).isFile()) {
-        return { savedPath: null, resolvedPath: candidate, source: 'managed', error: null };
+        return { savedPath: null, resolvedPath: candidate, source: 'path', error: null };
       }
     } catch {
       // Continue searching.
@@ -511,7 +513,7 @@ function readExecutableVersion(binPath) {
   }
 }
 
-function scanSkillsInDir(baseDir, scope) {
+function scanSkillsInDir(baseDir, scope, pluginId = null) {
   const results = [];
   if (!baseDir || !fs.existsSync(baseDir)) return results;
   try {
@@ -523,12 +525,12 @@ function scanSkillsInDir(baseDir, scope) {
       const nameMatch = /^name:\s*(.+)$/m.exec(content);
       const descMatch = /^description:\s*(.+)$/m.exec(content);
       results.push({
-        name: (nameMatch ? nameMatch[1] : entry.name).trim(),
-        description: (descMatch ? descMatch[1] : '').trim(),
+        name: (nameMatch ? nameMatch[1] : entry.name).trim().replace(/^["']|["']$/g, ''),
+        description: (descMatch ? descMatch[1] : '').trim().replace(/^["']|["']$/g, ''),
         path: skillMd,
         scope,
         enabled: true,
-        pluginId: null,
+        pluginId,
       });
     }
   } catch {
@@ -544,24 +546,114 @@ function scanCodexExtensions(cwd, executablePath) {
     ...(cwd ? scanSkillsInDir(path.join(cwd, '.codex', 'skills'), 'project') : []),
   ];
   const installedPlugins = [];
+  const seenPluginKeys = new Set();
+  const addPluginFromDir = (pluginDir, marketplaceName = 'local', fallbackId = null, fallbackVer = null) => {
+    try {
+      const manifestCandidates = [
+        path.join(pluginDir, '.codex-plugin', 'plugin.json'),
+        path.join(pluginDir, '.gemini-plugin', 'plugin.json'),
+        path.join(pluginDir, 'plugin.json'),
+      ];
+      let manifest = null;
+      for (const mp of manifestCandidates) {
+        if (fs.existsSync(mp)) {
+          manifest = JSON.parse(fs.readFileSync(mp, 'utf8'));
+          break;
+        }
+      }
+      const pluginId = String(manifest?.id || manifest?.name || fallbackId || path.basename(pluginDir));
+      const version = manifest?.version ? String(manifest.version) : fallbackVer;
+      const key = `${marketplaceName}:${pluginId}`;
+      if (seenPluginKeys.has(key)) return;
+      seenPluginKeys.add(key);
+      installedPlugins.push({
+        pluginId,
+        name: String(manifest?.name || pluginId),
+        marketplaceName,
+        version: version || null,
+        enabled: true,
+        source: pluginDir,
+        installPolicy: null,
+        authPolicy: null,
+      });
+      const skillsSubdir = path.join(pluginDir, 'skills');
+      if (fs.existsSync(skillsSubdir)) {
+        skills.push(...scanSkillsInDir(skillsSubdir, 'plugin', pluginId));
+      }
+    } catch {
+      // Ignore malformed plugin directory.
+    }
+  };
   const pluginsDir = path.join(codexHome, 'plugins');
   if (fs.existsSync(pluginsDir)) {
     try {
+      const cacheDir = path.join(pluginsDir, 'cache');
+      if (fs.existsSync(cacheDir)) {
+        for (const mpEntry of fs.readdirSync(cacheDir, { withFileTypes: true })) {
+          if (!mpEntry.isDirectory() || mpEntry.name.startsWith('.')) continue;
+          const mpPath = path.join(cacheDir, mpEntry.name);
+          for (const plugEntry of fs.readdirSync(mpPath, { withFileTypes: true })) {
+            if (!plugEntry.isDirectory() || plugEntry.name.startsWith('.') || plugEntry.name.startsWith('plugin-backup-') || plugEntry.name.startsWith('plugin-install-')) continue;
+            const plugPath = path.join(mpPath, plugEntry.name);
+            const verEntries = fs.readdirSync(plugPath, { withFileTypes: true })
+              .filter(e => e.isDirectory() && !e.name.startsWith('.'))
+              .map(e => e.name)
+              .sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
+            if (verEntries.length > 0) {
+              addPluginFromDir(path.join(plugPath, verEntries[0]), mpEntry.name, plugEntry.name, verEntries[0]);
+            } else {
+              addPluginFromDir(plugPath, mpEntry.name, plugEntry.name, null);
+            }
+          }
+        }
+      }
       for (const entry of fs.readdirSync(pluginsDir, { withFileTypes: true })) {
-        if (!entry.isDirectory()) continue;
-        installedPlugins.push({
-          pluginId: entry.name,
-          name: entry.name,
-          marketplaceName: 'local',
-          version: null,
-          enabled: true,
-          source: path.join(pluginsDir, entry.name),
-          installPolicy: null,
-          authPolicy: null,
-        });
+        if (!entry.isDirectory() || entry.name.startsWith('.') || entry.name === 'cache' || entry.name === 'data') continue;
+        addPluginFromDir(path.join(pluginsDir, entry.name), 'local', entry.name, null);
       }
     } catch {
       // Ignore unreadable plugin directories.
+    }
+  }
+  const hookItems = [];
+  const hookErrors = [];
+  const hooksJsonPath = path.join(codexHome, 'hooks.json');
+  if (fs.existsSync(hooksJsonPath)) {
+    try {
+      const rawHooks = fs.readFileSync(hooksJsonPath, 'utf8');
+      const parsedHooks = JSON.parse(rawHooks);
+      const hooksObj = parsedHooks?.hooks && typeof parsedHooks.hooks === 'object' ? parsedHooks.hooks : {};
+      const hash = crypto.createHash('sha256').update(rawHooks).digest('hex').slice(0, 16);
+      for (const [eventName, groups] of Object.entries(hooksObj)) {
+        if (!Array.isArray(groups)) continue;
+        groups.forEach((group, gIdx) => {
+          const handlers = Array.isArray(group?.hooks) ? group.hooks : [];
+          handlers.forEach((h, hIdx) => {
+            hookItems.push({
+              key: `${eventName}:${gIdx}:${hIdx}`,
+              eventName,
+              handlerType: h.type === 'mcpTool' || h.type === 'prompt' || h.type === 'agent' ? h.type : 'command',
+              command: h.command || h.commandWindows || null,
+              server: h.server || null,
+              tool: h.tool || null,
+              async: Boolean(h.async),
+              matcher: group?.matcher || null,
+              timeoutSec: Number(h.timeout || 10),
+              statusMessage: h.statusMessage || null,
+              additionalContextLimit: h.additionalContextLimit ?? null,
+              sourcePath: hooksJsonPath,
+              source: 'user',
+              pluginId: null,
+              enabled: true,
+              isManaged: false,
+              currentHash: hash,
+              trustStatus: 'trusted',
+            });
+          });
+        });
+      }
+    } catch (err) {
+      hookErrors.push({ path: hooksJsonPath, message: String(err.message || err) });
     }
   }
   return {
@@ -574,9 +666,9 @@ function scanCodexExtensions(cwd, executablePath) {
     marketplaces: [],
     skills,
     hooks: {
-      items: [],
+      items: hookItems,
       warnings: [],
-      errors: [],
+      errors: hookErrors,
     },
     skillDestinations: {
       user: path.join(codexHome, 'skills'),
@@ -1754,6 +1846,9 @@ export function createRemoteServer(options = {}) {
       if (settingsMap.get('codex_executable') && !state.codexSavedPath) {
         state.codexSavedPath = normalizeWindowsExtendedPath(settingsMap.get('codex_executable'));
       }
+      if (settingsMap.get('app_server_executable') && !state.appServerSavedPath) {
+        state.appServerSavedPath = normalizeWindowsExtendedPath(settingsMap.get('app_server_executable'));
+      }
       if (syncedCrons.length > 0) {
         const existingIds = new Set(state.savedCrons.map(c => c.id));
         for (const sc of syncedCrons) {
@@ -2456,8 +2551,14 @@ export function createRemoteServer(options = {}) {
           requestId: q.requestId,
           responded: Boolean(q.responded),
         }));
+      const effectiveConnected = Boolean(
+        appServerBridge.isConnected() ||
+          session.isDesktopMirrored ||
+          session.threadId ||
+          (Array.isArray(thread.turns) && thread.turns.length > 0),
+      );
       return {
-        connected: appServerBridge.isConnected(),
+        connected: effectiveConnected,
         unknownResult: false,
         gap: false,
         events: freshEvents,
@@ -2478,9 +2579,15 @@ export function createRemoteServer(options = {}) {
       const turnsList = Array.isArray(thread.turns) ? thread.turns.slice(-20) : [];
       const latestTurn = turnsList[turnsList.length - 1];
       const activeTurnId = latestTurn?.status === 'inProgress' ? String(latestTurn.id) : '';
+      const effectiveConnected = Boolean(
+        appServerBridge.isConnected() ||
+          session.isDesktopMirrored ||
+          session.threadId ||
+          turnsList.length > 0,
+      );
       return {
         attached: true,
-        connected: appServerBridge.isConnected(),
+        connected: effectiveConnected,
         threadId,
         model: thread.model ?? null,
         reasoningEffort: thread.effort ?? null,
@@ -4053,7 +4160,12 @@ export function createRemoteServer(options = {}) {
         }
         const req = args.request || {};
         await appServerBridge.ensureStarted().catch(() => {});
-        const connected = appServerBridge.isConnected();
+        const connected = Boolean(
+          appServerBridge.isConnected() ||
+            session.isDesktopMirrored ||
+            session.threadId ||
+            session.active,
+        );
         const threadKey = String(session.threadId || session.id);
         if (!cronJobsByThread.has(threadKey)) cronJobsByThread.set(threadKey, []);
         const jobs = cronJobsByThread.get(threadKey);

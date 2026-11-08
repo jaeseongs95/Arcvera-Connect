@@ -1481,6 +1481,30 @@ test('Auto-update (T-0003) and live session state sync / Desktop parity (D-0008)
       assert.equal(subagents.connected, true);
       assert.equal(typeof subagents.parentRuntimeId, 'string');
 
+      // D-0009: conversation_request attach & poll and cron_request list return connected=true for mirrored sessions even without live app-server
+      const convAttach = await invokeRelay('conversation_request', {
+        id: 'sess-desktop-live',
+        generation: 1,
+        request: { type: 'attach' },
+      });
+      assert.equal(convAttach.attached, true);
+      assert.equal(convAttach.connected, true);
+
+      const convPoll = await invokeRelay('conversation_request', {
+        id: 'sess-desktop-live',
+        generation: 1,
+        request: { type: 'poll' },
+      });
+      assert.equal(convPoll.connected, true);
+
+      const cronList = await invokeRelay('cron_request', {
+        id: 'sess-desktop-live',
+        generation: 1,
+        request: { type: 'list' },
+      });
+      assert.equal(cronList.supported, true);
+      assert.equal(cronList.connected, true);
+
       // E. T-0003: check_for_updates and apply_update across Relay + Host Connector
       const updateCheck = await invokeRelay('check_for_updates');
       assert.equal(updateCheck.updateAvailable, true);

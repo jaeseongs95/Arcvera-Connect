@@ -612,6 +612,10 @@ export function createConversation(options: ConversationOptions) {
     { command: '/model', description: '사용 가능한 모델 목록 또는 모델 변경 (/model <이름>)', category: 'command', action: 'model' },
     { command: '/diff', description: '현재 작업 폴더의 Git 변경 사항을 확인합니다', category: 'command', action: 'diff' },
     { command: '/review', description: '현재 Git 변경 사항에 대한 코드 리뷰를 요청합니다', category: 'command', action: 'review' },
+    { command: '/update', description: '최신 릴리즈 확인 및 서버 자동 업데이트 (/update check | apply)', category: 'command', action: 'update' },
+    { command: '/subagents', description: '하위 에이전트 관리 창을 엽니다', category: 'ui', action: 'subagents' },
+    { command: '/cron', description: '예약 작업(Cron) 관리 창을 엽니다', category: 'ui', action: 'cron' },
+    { command: '/conversation', description: '터미널/대화 보기 화면을 전환합니다', category: 'ui', action: 'conversation' },
     { command: '/clear', description: '대화 표시 화면을 새로 고칩니다', category: 'command', action: 'clear' },
     { command: '/help', description: '사용 가능한 슬래시 명령어와 스킬 목록을 표시합니다', category: 'command', action: 'help' },
   ];
@@ -660,6 +664,24 @@ export function createConversation(options: ConversationOptions) {
       input.value = '';
       updateControls();
       void loadPage();
+      return;
+    }
+    if (item.action === 'conversation') {
+      input.value = '';
+      updateControls();
+      host.closest('.terminal-card')?.querySelector<HTMLButtonElement>('.conversation-toggle')?.click();
+      return;
+    }
+    if (item.action === 'subagents') {
+      input.value = '';
+      updateControls();
+      host.closest('.terminal-card')?.querySelector<HTMLButtonElement>('.subagents-open')?.click();
+      return;
+    }
+    if (item.action === 'cron') {
+      input.value = '';
+      updateControls();
+      host.closest('.terminal-card')?.querySelector<HTMLButtonElement>('.cron-open')?.click();
       return;
     }
     if (item.category === 'skill') {
@@ -751,7 +773,7 @@ export function createConversation(options: ConversationOptions) {
         }
         if (event.key === 'Enter' && !event.shiftKey) {
           const chosen = list[slashSelectedIdx] ?? list[0];
-          if (chosen && chosen.command.toLowerCase() !== input.value.trim().toLowerCase()) {
+          if (chosen) {
             event.preventDefault();
             applySlashItem(chosen);
             return;

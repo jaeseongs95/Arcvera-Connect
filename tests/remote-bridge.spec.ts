@@ -310,6 +310,36 @@ test('relay + host connector mode renders mirrored desktop terminal rollout on i
     .run('thread-relay-1', rolloutPath, 'gpt-5.4', 'xhigh');
   stateDb.close();
 
+  // D-0010: Setup nested plugin cache, plugin skill, and hooks.json in codexHomeDir
+  const pluginVerDir = path.join(codexHomeDir, 'plugins', 'cache', 'agent-governance', 'agent-governance-suite', '5.1.0');
+  fs.mkdirSync(path.join(pluginVerDir, '.codex-plugin'), { recursive: true });
+  fs.writeFileSync(
+    path.join(pluginVerDir, '.codex-plugin', 'plugin.json'),
+    JSON.stringify({ id: 'agent-governance-suite', name: 'agent-governance-suite', version: '5.1.0' }),
+    'utf8',
+  );
+  const pluginSkillDir = path.join(pluginVerDir, 'skills', 'code-review');
+  fs.mkdirSync(pluginSkillDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(pluginSkillDir, 'SKILL.md'),
+    '---\nname: code-review\ndescription: "Find defects in a fixed change set"\n---\n# Code Review\n',
+    'utf8',
+  );
+  fs.writeFileSync(
+    path.join(codexHomeDir, 'hooks.json'),
+    JSON.stringify({
+      hooks: {
+        PreToolUse: [
+          {
+            matcher: '^mcp__.+_ledger_',
+            hooks: [{ type: 'command', command: 'node ledger-attestation.mjs', timeout: 10 }],
+          },
+        ],
+      },
+    }),
+    'utf8',
+  );
+
   const desktopDb = new DatabaseSync(desktopDbPath);
   desktopDb.exec(`
     CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -468,6 +498,17 @@ test('relay + host connector mode renders mirrored desktop terminal rollout on i
     await expect(card.locator('.conversation-message').nth(1)).toContainText('git status --short');
     await expect(card.locator('.conversation-message').nth(2)).toContainText('릴레이 미러링 복원 완료했습니다.');
     await expect(card.locator('.conversation-input')).toBeEnabled();
+
+    // D-0009: In Conversation View, typing '/cron' and pressing Enter opens the Cron dialog instead of sending chat text
+    await card.locator('.conversation-input').fill('/cron');
+    await expect(card.locator('.conversation-compose .slash-command-menu')).toBeVisible();
+    await card.locator('.conversation-input').press('Enter');
+    const cronDialog = page.locator('#cron-dialog');
+    await expect(cronDialog).toBeVisible();
+    await expect(cronDialog.locator('.cron-add')).toBeEnabled();
+    await cronDialog.locator('.cron-close').click();
+    await expect(cronDialog).toBeHidden();
+
     await card.locator('.conversation-toggle').click();
 
     // BLKR-02: Browser refresh (F5) in relay mode preserves and re-renders the mirrored terminal snapshot
@@ -547,6 +588,18 @@ test('relay + host connector mode renders mirrored desktop terminal rollout on i
     await expect(settingsDialog.locator('#update-card-status')).toContainText('v9.9.9');
     await expect(settingsDialog.locator('#update-apply-btn')).toBeVisible();
     await expect(page.locator('#update-banner')).toBeVisible();
+
+    // D-0010: Extensions dialog lists nested cache plugin (5.1.0), plugin skill, and hooks.json
+    await settingsDialog.locator('#extensions-open').click();
+    const extDialog = page.locator('#extensions-dialog');
+    await expect(extDialog).toBeVisible();
+    await expect(extDialog.locator('.extensions-row', { hasText: 'agent-governance-suite' })).toContainText('5.1.0');
+    await extDialog.locator('#extensions-tab-skills').click();
+    await expect(extDialog.locator('.extensions-row', { hasText: 'code-review' })).toBeVisible();
+    await extDialog.locator('#extensions-tab-hooks').click();
+    await expect(extDialog.locator('.extensions-row', { hasText: 'PreToolUse' })).toBeVisible();
+    await extDialog.locator('#extensions-close').click();
+    await settingsDialog.locator('#settings-close').click();
   } finally {
     await connector.close();
     await relay.close();
