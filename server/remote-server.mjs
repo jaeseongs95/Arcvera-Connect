@@ -2539,6 +2539,10 @@ export function createRemoteServer(options = {}) {
 
         const info = publicSessionInfo(session);
         broadcast('session-changed', info);
+        emitTerminalOutput(
+          session,
+          `\x1b[38;5;141m╭─ [OpenDIY Remote] ${title} · ${cwd}\x1b[0m\r\n`,
+        );
 
         const settings = computeSettings();
         const shouldSpawnProcess = options.spawnProcess !== false;
@@ -2557,11 +2561,11 @@ export function createRemoteServer(options = {}) {
                   '-NoProfile',
                   '-NoExit',
                   '-Command',
-                  '[Console]::InputEncoding = [System.Text.Encoding]::UTF8; [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; [Console]::WriteLine("[OpenDIY Remote] " + $env:OPENDIY_SESSION_TITLE + " (" + $env:OPENDIY_SESSION_CWD + ")")',
+                  '[Console]::InputEncoding = [System.Text.Encoding]::UTF8; [Console]::OutputEncoding = [System.Text.Encoding]::UTF8',
                 ]
               : [
                   '-c',
-                  'printf "[OpenDIY Remote] %s (%s)\\n" "$OPENDIY_SESSION_TITLE" "$OPENDIY_SESSION_CWD"; exec /bin/sh -i',
+                  'exec /bin/sh -i',
                 ];
           try {
             const child = spawn(cmdBin, cmdArgs, {
