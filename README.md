@@ -63,7 +63,7 @@ npm run build
 #### Option 1 — One-Click VPS Install (Ubuntu / Debian)
 Run a single command on your fresh Ubuntu/Debian VPS to install Node.js 22+, download the pre-built release bundle, register the `systemd` service (`opendiy-remote.service`), and generate random access credentials automatically:
 ```bash
-curl -fsSL https://github.com/jaeseongs95/opendiy-remote/releases/download/v1.1.0/install-relay.sh | bash
+curl -fsSL https://github.com/jaeseongs95/opendiy-remote/releases/download/v1.2.0/install-relay.sh | bash
 ```
 
 #### Option 2 — Manual Relay Startup (No `codex` binary required)
@@ -123,6 +123,8 @@ npm start -- --bind 0.0.0.0:3210 --token "my-secret-access-token"
 | `--allowed-email <emails>` | `OPENDIY_REMOTE_ALLOWED_EMAIL` | (none) | Comma-separated owner Google email(s) allowed to sign in |
 | `--tls-cert <path>` | `OPENDIY_REMOTE_TLS_CERT` | (none) | TLS certificate PEM path for native HTTPS server |
 | `--tls-key <path>` | `OPENDIY_REMOTE_TLS_KEY` | (none) | TLS private key PEM path for native HTTPS server |
+| `--auto-update` | `OPENDIY_REMOTE_AUTO_UPDATE` | `false` | Periodically check GitHub Releases and self-update with SHA-256 verification |
+| `--check-update` / `--update` | - | - | Check for the latest release or immediately apply self-update from CLI |
 | `--workspace <dir>` | `OPENDIY_REMOTE_DATA_DIR` | OS temp/work dir | Absolute directory path for persisted layout, projects, and session metadata |
 | - | `OPENDIY_CODEX_BIN` | auto-detected | Absolute path to the `codex` / `opendiy-codex-launcher` executable |
 | - | `OPENDIY_REMOTE_DIST` | `./dist` | Directory path of built frontend assets to serve |

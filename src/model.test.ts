@@ -1141,3 +1141,368 @@ test('Host Connector OAuth login flow (--connect without --host-secret), slash_c
     try { fs.rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch {}
   }
 });
+
+test('Auto-update (T-0003) and live session state sync / Desktop parity (D-0008)', async () => {
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const crypto = await import('node:crypto');
+  const { execFileSync } = await import('node:child_process');
+  const { DatabaseSync } = await import('node:sqlite');
+  const {
+    compareSemver,
+    fetchLatestReleaseInfo,
+    performSelfUpdate,
+    createRemoteServer,
+    startHostConnector,
+  } = await import('../server/remote-server.mjs');
+
+  assert.equal(compareSemver('1.2.0', '1.1.0'), 1);
+  assert.equal(compareSemver('1.1.0', '1.1.0'), 0);
+  assert.equal(compareSemver('1.1.0', '1.2.0'), -1);
+
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'opendiy-remote-update-parity-'));
+  try {
+    // 1. Create a fake release bundle tar.gz for v9.9.9
+    const bundleStaging = path.join(tmpRoot, 'bundle-src');
+    fs.mkdirSync(path.join(bundleStaging, 'dist'), { recursive: true });
+    fs.mkdirSync(path.join(bundleStaging, 'server'), { recursive: true });
+    fs.mkdirSync(path.join(bundleStaging, 'scripts'), { recursive: true });
+    fs.writeFileSync(path.join(bundleStaging, 'package.json'), JSON.stringify({ name: 'opendiy-remote', version: '9.9.9' }, null, 2));
+    fs.writeFileSync(path.join(bundleStaging, 'dist', 'index.html'), '<!doctype html><html><body>v9.9.9</body></html>');
+    fs.writeFileSync(path.join(bundleStaging, 'server', 'remote-server.mjs'), '// v9.9.9 server\n');
+    fs.writeFileSync(path.join(bundleStaging, 'scripts', 'install-relay.sh'), '#!/usr/bin/env bash\n');
+    fs.writeFileSync(path.join(bundleStaging, 'README.md'), '# v9.9.9\n');
+    fs.writeFileSync(path.join(bundleStaging, 'README.ko.md'), '# v9.9.9 ko\n');
+
+    const bundleTarGz = path.join(tmpRoot, 'opendiy-remote-v9.9.9-relay-bundle.tar.gz');
+    execFileSync('tar', ['-czf', bundleTarGz, '-C', bundleStaging, 'package.json', 'dist', 'server', 'scripts', 'README.md', 'README.ko.md']);
+    const tarBytes = fs.readFileSync(bundleTarGz);
+    const tarSha256 = crypto.createHash('sha256').update(tarBytes).digest('hex');
+
+    // Create install target root with v1.1.0
+    const installRoot = path.join(tmpRoot, 'install-root');
+    fs.mkdirSync(path.join(installRoot, 'dist'), { recursive: true });
+    fs.mkdirSync(path.join(installRoot, 'server'), { recursive: true });
+    fs.writeFileSync(path.join(installRoot, 'package.json'), JSON.stringify({ name: 'opendiy-remote', version: '1.1.0' }, null, 2));
+    fs.writeFileSync(path.join(installRoot, 'dist', 'index.html'), '<!doctype html><html><body>v1.1.0</body></html>');
+    fs.writeFileSync(path.join(installRoot, 'server', 'remote-server.mjs'), '// v1.1.0 server\n');
+
+    const mockFetch = async (url: string) => {
+      if (url.endsWith('/releases/latest')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            tag_name: 'v9.9.9',
+            html_url: 'https://github.com/jaeseongs95/opendiy-remote/releases/tag/v9.9.9',
+            body: 'Auto-update test release',
+            published_at: '2026-11-08T13:00:00Z',
+            assets: [
+              {
+                name: 'opendiy-remote-v9.9.9-relay-bundle.tar.gz',
+                browser_download_url: 'https://mock.local/opendiy-remote-v9.9.9-relay-bundle.tar.gz',
+                size: tarBytes.length,
+                digest: `sha256:${tarSha256}`,
+              },
+            ],
+          }),
+        } as any;
+      }
+      if (url === 'https://mock.local/opendiy-remote-v9.9.9-relay-bundle.tar.gz') {
+        return {
+          ok: true,
+          status: 200,
+          arrayBuffer: async () => tarBytes.buffer.slice(tarBytes.byteOffset, tarBytes.byteOffset + tarBytes.byteLength),
+        } as any;
+      }
+      throw new Error(`Unexpected URL: ${url}`);
+    };
+
+    const checkInfo = await fetchLatestReleaseInfo({
+      rootDir: installRoot,
+      releaseApiUrl: 'https://mock.local/releases/latest',
+      fetchFn: mockFetch,
+    });
+    assert.equal(checkInfo.currentVersion, '1.1.0');
+    assert.equal(checkInfo.latestVersion, '9.9.9');
+    assert.equal(checkInfo.updateAvailable, true);
+    assert.equal(checkInfo.sha256, tarSha256);
+
+    // Verify SHA-256 mismatch rejection
+    await assert.rejects(
+      () =>
+        performSelfUpdate({
+          rootDir: installRoot,
+          releaseApiUrl: 'https://mock.local/releases/latest',
+          fetchFn: async (url: string) => {
+            if (url.endsWith('/releases/latest')) {
+              return {
+                ok: true,
+                status: 200,
+                json: async () => ({
+                  tag_name: 'v9.9.9',
+                  assets: [
+                    {
+                      name: 'opendiy-remote-v9.9.9-relay-bundle.tar.gz',
+                      browser_download_url: 'https://mock.local/opendiy-remote-v9.9.9-relay-bundle.tar.gz',
+                      digest: 'sha256:0000000000000000000000000000000000000000000000000000000000000000',
+                    },
+                  ],
+                }),
+              } as any;
+            }
+            return mockFetch(url);
+          },
+          scheduleRestart: false,
+        }),
+      /무결성 검증 실패/,
+    );
+
+    // 2. Test D-0008 live session state sync + Desktop parity + Relay/Host update coordination
+    const desktopDbPath = path.join(tmpRoot, 'workspace.sqlite3');
+    const codexHome = path.join(tmpRoot, '.codex');
+    fs.mkdirSync(codexHome, { recursive: true });
+    const projCwd = path.join(tmpRoot, 'proj');
+    fs.mkdirSync(projCwd, { recursive: true });
+
+    const rolloutPath = path.join(codexHome, 'rollout-live.jsonl');
+    const rolloutLines = [
+      JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-live-1', model_context_window: 285000 } }),
+      JSON.stringify({ type: 'event_msg', payload: { type: 'user_message', turn_id: 'turn-live-1', message: '진행상황 확인해줘' } }),
+      JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'item_completed',
+          turn_id: 'turn-live-1',
+          item: {
+            id: 'msg-commentary-1',
+            type: 'AgentMessage',
+            phase: 'commentary',
+            content: [{ type: 'Text', text: '네이티브 본시험 결과를 확인하겠습니다.' }],
+          },
+        },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'custom_tool_call',
+          id: 'ctc-1',
+          call_id: 'call-live-1',
+          name: 'exec',
+          input: 'gh run view 4248358002 --repo jaeseongs95/opendiy-desktop',
+        },
+      }),
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'custom_tool_call_output',
+          id: 'ctco-1',
+          call_id: 'call-live-1',
+          output: [{ type: 'input_text', text: 'conclusion: success\nline2\nline3\nline4' }],
+        },
+      }),
+      JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: {
+            total_token_usage: { total_tokens: 3487294112 },
+            last_token_usage: { total_tokens: 176700 },
+            model_context_window: 285000,
+          },
+          rate_limits: {
+            limit_id: 'codex',
+            primary: {
+              used_percent: 90,
+              window_minutes: 10080,
+              resets_at: 1794379004,
+            },
+          },
+        },
+      }),
+    ];
+    fs.writeFileSync(rolloutPath, rolloutLines.join('\n') + '\n', 'utf8');
+
+    const stateDb = new DatabaseSync(path.join(codexHome, 'state_5.sqlite'));
+    stateDb.exec(`
+      CREATE TABLE threads (
+        id TEXT PRIMARY KEY,
+        rollout_path TEXT,
+        created_at INTEGER,
+        updated_at INTEGER,
+        cwd TEXT,
+        title TEXT,
+        tokens_used INTEGER,
+        model TEXT,
+        reasoning_effort TEXT
+      );
+    `);
+    const nowSec = Math.floor(Date.now() / 1000);
+    stateDb
+      .prepare('INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run('thread-desktop-live', rolloutPath, nowSec - 60, nowSec, projCwd, 'desktop 담당', 3487294112, 'gpt-6.1-sol', 'high');
+    stateDb.close();
+
+    const ddb = new DatabaseSync(desktopDbPath);
+    ddb.exec(`
+      CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE projects (id TEXT PRIMARY KEY, cwd TEXT, canonical_cwd TEXT, name TEXT NOT NULL, created_at INTEGER NOT NULL, favorite INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE workspace_layout (id INTEGER PRIMARY KEY, layout TEXT NOT NULL, updated_at INTEGER NOT NULL);
+      CREATE TABLE session_metadata (id TEXT PRIMARY KEY, generation INTEGER NOT NULL, metadata TEXT NOT NULL, updated_at INTEGER NOT NULL);
+    `);
+    ddb.prepare('INSERT INTO projects VALUES (?, ?, ?, ?, ?, ?)').run('proj-dev', projCwd, projCwd, '개발자', nowSec, 0);
+    ddb.prepare('INSERT INTO workspace_layout VALUES (1, ?, ?)').run(
+      JSON.stringify({
+        version: 1,
+        columns: 2,
+        columnSizes: [1, 1],
+        rowSizes: [1, 1],
+        sessions: [
+          {
+            sessionId: 'sess-desktop-live',
+            title: 'desktop 담당',
+            cwd: projCwd,
+            threadId: 'thread-desktop-live',
+            projectId: 'proj-dev',
+            projectAssigned: true,
+          },
+        ],
+      }),
+      nowSec,
+    );
+    ddb.prepare('INSERT INTO session_metadata VALUES (?, 1, ?, ?)').run(
+      'sess-desktop-live',
+      JSON.stringify({
+        id: 'sess-desktop-live',
+        generation: 1,
+        title: 'desktop 담당',
+        cwd: projCwd,
+        threadId: 'thread-desktop-live',
+        projectId: 'proj-dev',
+        projectAssigned: true,
+        state: 'running',
+        active: true,
+      }),
+      nowSec,
+    );
+    ddb.close();
+
+    const relayInstallRoot = path.join(tmpRoot, 'relay-install-root');
+    fs.cpSync(installRoot, relayInstallRoot, { recursive: true });
+
+    const relayServer = createRemoteServer({
+      mode: 'relay',
+      token: 'tok-parity',
+      hostSecret: 'sec-parity',
+      workspaceDir: path.join(tmpRoot, 'relay-ws'),
+      updateRootDir: relayInstallRoot,
+      releaseApiUrl: 'https://mock.local/releases/latest',
+      updateFetchFn: mockFetch,
+      scheduleRestartOnUpdate: false,
+      allowPathDiscovery: false,
+    });
+    const relayPort = await new Promise<number>(resolve => {
+      relayServer.server.listen(0, '127.0.0.1', () => {
+        const addr = relayServer.server.address();
+        resolve(typeof addr === 'object' && addr ? addr.port : 0);
+      });
+    });
+    const relayBase = `http://127.0.0.1:${relayPort}`;
+
+    let hostRegisteredResolve!: () => void;
+    const hostRegistered = new Promise<void>(r => { hostRegisteredResolve = r; });
+    const connector = startHostConnector({
+      relayUrl: relayBase,
+      hostSecret: 'sec-parity',
+      workspaceDir: path.join(tmpRoot, 'host-ws'),
+      desktopDbPath,
+      codexHomeDir: codexHome,
+      updateRootDir: installRoot,
+      releaseApiUrl: 'https://mock.local/releases/latest',
+      updateFetchFn: mockFetch,
+      scheduleRestartOnUpdate: false,
+      spawnProcess: false,
+      allowPathDiscovery: false,
+      silent: true,
+      onRegistered: () => hostRegisteredResolve(),
+    });
+
+    try {
+      await hostRegistered;
+      const invokeRelay = async (cmd: string, args: Record<string, unknown> = {}) => {
+        const res = await fetch(`${relayBase}/api/invoke`, {
+          method: 'POST',
+          headers: {
+            Authorization: 'Bearer tok-parity',
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ command: cmd, args }),
+        });
+        const body = await res.json();
+        assert.equal(res.status, 200);
+        assert.equal(body.ok, true);
+        return body.result;
+      };
+
+      // A. D-0008: Session with commentary message + custom_tool_call is 'running', NOT 'idle'!
+      const sessionsList = await invokeRelay('list_sessions');
+      assert.equal(sessionsList.length, 1);
+      assert.equal(sessionsList[0].id, 'sess-desktop-live');
+      assert.equal(sessionsList[0].state, 'running');
+
+      // B. Desktop Parity: contextStatus returns last_token_usage.total_tokens (176700 / 285000 = 62%) and connected=true
+      const ctxStatus = await invokeRelay('conversation_request', {
+        id: 'sess-desktop-live',
+        generation: 1,
+        request: { type: 'contextStatus' },
+      });
+      assert.equal(ctxStatus.connected, true);
+      assert.equal(ctxStatus.tokenUsageFresh, true);
+      assert.equal(ctxStatus.usedTokens, 176700);
+      assert.equal(ctxStatus.modelContextWindow, 285000);
+      assert.equal(Math.round((ctxStatus.usedTokens / ctxStatus.modelContextWindow) * 100), 62);
+      assert.equal(ctxStatus.passiveSubscriptionSupported, true);
+      assert.equal(ctxStatus.subagentsSupported, true);
+      assert.equal(ctxStatus.compactSupported, true);
+
+      // C. Desktop Parity: weekly_usage reads rate_limits from rollout when app-server is not connected
+      const weekly = await invokeRelay('weekly_usage', { manual: true });
+      assert.equal(weekly.weekly.usedPercent, 90);
+      assert.equal(weekly.weekly.resetsAt, 1794379004);
+
+      // D. Desktop Parity: subagents_request returns connected=true and valid parentRuntimeId
+      const subagents = await invokeRelay('subagents_request', {
+        id: 'sess-desktop-live',
+        generation: 1,
+        request: { type: 'list' },
+      });
+      assert.equal(subagents.supported, true);
+      assert.equal(subagents.connected, true);
+      assert.equal(typeof subagents.parentRuntimeId, 'string');
+
+      // E. T-0003: check_for_updates and apply_update across Relay + Host Connector
+      const updateCheck = await invokeRelay('check_for_updates');
+      assert.equal(updateCheck.updateAvailable, true);
+      assert.equal(updateCheck.latestVersion, '9.9.9');
+      assert.equal(updateCheck.relayVersion, '1.1.0');
+      assert.equal(updateCheck.hostVersion, '1.1.0');
+
+      const updateApplied = await invokeRelay('apply_update', { target: 'both' });
+      assert.equal(updateApplied.updated, true);
+      assert.equal(updateApplied.version, '9.9.9');
+      assert.equal(updateApplied.relay.updated, true);
+      assert.equal(updateApplied.host.updated, true);
+
+      const updatedHostPkg = JSON.parse(fs.readFileSync(path.join(installRoot, 'package.json'), 'utf8'));
+      const updatedRelayPkg = JSON.parse(fs.readFileSync(path.join(relayInstallRoot, 'package.json'), 'utf8'));
+      assert.equal(updatedHostPkg.version, '9.9.9');
+      assert.equal(updatedRelayPkg.version, '9.9.9');
+    } finally {
+      await connector.close();
+      await relayServer.close();
+    }
+  } finally {
+    try { fs.rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch {}
+  }
+});

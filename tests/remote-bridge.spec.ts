@@ -280,6 +280,25 @@ test('relay + host connector mode renders mirrored desktop terminal rollout on i
           content: [{ type: 'output_text', text: '릴레이 미러링 복원 완료했습니다.' }],
         },
       }),
+      JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: {
+            total_token_usage: { total_tokens: 5000000 },
+            last_token_usage: { total_tokens: 176700 },
+            model_context_window: 285000,
+          },
+          rate_limits: {
+            limit_id: 'codex',
+            primary: {
+              used_percent: 90,
+              window_minutes: 10080,
+              resets_at: 1794379004,
+            },
+          },
+        },
+      }),
     ].join('\n') + '\n',
     'utf8',
   );
@@ -323,11 +342,37 @@ test('relay + host connector mode renders mirrored desktop terminal rollout on i
   );
   desktopDb.close();
 
+  const mockReleaseFetch = async (url: string) => {
+    if (url.endsWith('/releases/latest')) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          tag_name: 'v9.9.9',
+          html_url: 'https://github.com/jaeseongs95/opendiy-remote/releases/tag/v9.9.9',
+          body: 'Auto-update E2E verification',
+          published_at: '2026-11-08T13:00:00Z',
+          assets: [
+            {
+              name: 'opendiy-remote-v9.9.9-relay-bundle.tar.gz',
+              browser_download_url: 'https://mock.local/opendiy-remote-v9.9.9-relay-bundle.tar.gz',
+              size: 1024,
+              digest: 'sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+            },
+          ],
+        }),
+      } as any;
+    }
+    throw new Error(`Unexpected URL: ${url}`);
+  };
+
   const relay = createRemoteServer({
     mode: 'relay',
     workspaceDir: path.join(tmpRoot, 'relay-workspace'),
     token: 'relay-user-token',
     hostSecret: 'relay-connector-secret',
+    releaseApiUrl: 'https://mock.local/releases/latest',
+    updateFetchFn: mockReleaseFetch,
     allowPathDiscovery: false,
   });
   await new Promise<void>(resolve => relay.server.listen(0, '127.0.0.1', () => resolve()));
@@ -341,6 +386,8 @@ test('relay + host connector mode renders mirrored desktop terminal rollout on i
     workspaceDir: path.join(tmpRoot, 'host-workspace'),
     desktopDbPath,
     codexHomeDir,
+    releaseApiUrl: 'https://mock.local/releases/latest',
+    updateFetchFn: mockReleaseFetch,
     allowPathDiscovery: false,
     rpcTransport: Object.assign(
       async (method: string, params: any) => {
@@ -471,6 +518,35 @@ test('relay + host connector mode renders mirrored desktop terminal rollout on i
     await expect(catalogDialog.locator('#catalog-list-status')).toContainText('1개 세션');
     await catalogDialog.locator('#catalog-close').click();
     await expect(catalogDialog).toBeHidden();
+
+    // Desktop Parity: Context usage ring shows 62% (176700 / 285000) and Weekly Usage sidebar shows 90%
+    await expect(card.locator('.context-usage span')).toHaveText('62%');
+    await expect(page.locator('#weekly-usage-value')).toHaveText('90%');
+
+    // D-0008: When the session appends an active tool call / commentary in rollout, state badge updates to '실행 중' (running)
+    fs.appendFileSync(
+      rolloutPath,
+      JSON.stringify({
+        type: 'response_item',
+        payload: {
+          type: 'custom_tool_call',
+          id: 'ctc-live-e2e',
+          call_id: 'call-live-e2e',
+          name: 'exec',
+          input: 'npm test',
+        },
+      }) + '\n',
+      'utf8',
+    );
+    await expect(card.locator('.session-state')).toHaveText('실행 중', { timeout: 5000 });
+
+    // T-0003: Settings dialog checks for updates and displays update banner + apply button
+    await page.locator('#settings-open').click();
+    const settingsDialog = page.locator('#settings-dialog');
+    await expect(settingsDialog).toBeVisible();
+    await expect(settingsDialog.locator('#update-card-status')).toContainText('v9.9.9');
+    await expect(settingsDialog.locator('#update-apply-btn')).toBeVisible();
+    await expect(page.locator('#update-banner')).toBeVisible();
   } finally {
     await connector.close();
     await relay.close();

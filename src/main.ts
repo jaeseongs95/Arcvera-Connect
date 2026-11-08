@@ -190,6 +190,47 @@ if (typeof document !== 'undefined' && document.head && !document.getElementById
       color: #8eaafb;
       white-space: nowrap;
     }
+    .update-banner {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 8px 16px;
+      background: rgba(99, 102, 241, 0.14);
+      border-bottom: 1px solid rgba(129, 140, 248, 0.35);
+      color: #e0e7ff;
+      font-size: 12px;
+    }
+    .update-banner[hidden] { display: none !important; }
+    .update-card {
+      margin-top: 12px;
+      padding: 12px;
+      border-radius: 8px;
+      background: #171c28;
+      border: 1px solid #2b3448;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .update-card-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 12px;
+      font-weight: 600;
+      color: #e2e8f0;
+    }
+    .update-card-status {
+      font-size: 11px;
+      color: #94a3b8;
+      line-height: 1.45;
+    }
+    .update-card-actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
     @media (max-width: 768px) {
       .terminal-card:not([hidden]) { min-height: 0 !important; }
       .terminal-host { min-height: 0 !important; }
@@ -223,6 +264,7 @@ $('#app').innerHTML = `
     <div id="project-tabs" class="project-tabs" role="tablist" aria-label="프로젝트별 세션"></div>
     <nav id="mobile-session-bar" class="mobile-session-bar mobile-only" aria-label="모바일 빠른 세션 전환" hidden></nav>
     <section class="toolbar" aria-label="그리드 도구"><div class="session-summary"><span class="connection-dot"></span><strong id="running-count">0</strong> 실행 중 <span class="divider"></span><span id="total-count">0개 세션</span></div><div class="layout-tools"><button id="search-toggle" class="quiet-button" title="활성 터미널 검색 (Ctrl+Shift+F)">⌕ <span>검색</span></button><span class="divider"></span><span class="layout-label">열</span><div id="column-options" class="segmented" role="group" aria-label="그리드 열 수"><button data-columns="1" aria-label="1열">▯</button><button data-columns="2" class="active" aria-label="2열">▥</button><button data-columns="3" aria-label="3열">▥▯</button><button data-columns="4" aria-label="4열">▥▥</button></div></div></section>
+    <div id="update-banner" class="update-banner" role="status" hidden><span id="update-banner-text">새 업데이트가 있습니다.</span><div class="update-card-actions"><button id="update-banner-apply" class="primary-button" type="button">지금 업데이트</button><button id="update-banner-dismiss" class="quiet-button" type="button">닫기</button></div></div>
     <div id="runtime-banner" class="runtime-banner" role="status" hidden><span id="runtime-status"></span> <button id="runtime-retry" class="quiet-button" hidden>다시 시도</button> <button id="runtime-settings" class="quiet-button" hidden>서버 확인·복구</button></div>
     <div id="restore-banner" class="restore-banner" hidden><span>자동으로 연결하지 못한 저장 세션이 있습니다. 목록에서 다시 연결하거나 제거할 수 있습니다.</span><button id="restore-open" class="quiet-button">저장 세션 보기 →</button></div>
     <section id="search-bar" class="search-bar" hidden><label for="terminal-search">활성 터미널 검색</label><input id="terminal-search" placeholder="검색어 입력"/><button id="search-prev" class="quiet-button" aria-label="이전 검색 결과">↑</button><button id="search-next" class="quiet-button" aria-label="다음 검색 결과">↓</button><span id="search-result" role="status"></span><button id="search-close" class="icon-button" aria-label="검색 닫기">×</button></section>
@@ -230,7 +272,7 @@ $('#app').innerHTML = `
     <footer><span class="footer-hints">드래그로 순서 변경 <i>·</i> 경계선으로 크기 조절 <i>·</i> Alt + 1–9</span><span id="save-status">레이아웃 자동 저장</span></footer>
   </main>
   <div id="toast-area" class="toast-area" role="status" aria-live="polite"></div>
-  <dialog id="settings-dialog" aria-labelledby="settings-title"><div class="dialog-heading"><h2 id="settings-title">설정</h2><button id="settings-close" class="icon-button" data-close aria-label="설정 닫기" autofocus>×</button></div><div class="settings-options"><button id="codex-settings-open" class="side-link" aria-haspopup="dialog" aria-controls="codex-settings-dialog"><span>⚙</span> 실행 파일 설정</button><button id="attachment-storage-open" class="side-link" aria-haspopup="dialog" aria-controls="attachment-storage-dialog"><span>▣</span> 첨부 저장 공간</button><button id="extensions-open" class="side-link" aria-haspopup="dialog" aria-controls="extensions-dialog"><span>◇</span> <span id="extensions-open-label">플러그인·스킬·Hook</span></button><button id="external-toggle" class="side-link" aria-haspopup="dialog" aria-controls="external-dialog"><span>◉</span> 외부 세션 <span class="readonly">읽기 전용</span></button></div><div class="language-setting"><label for="language-select">언어</label><select id="language-select"><option value="ko">한국어</option><option value="en">English</option></select><small id="language-error" role="alert" hidden></small></div></dialog>
+  <dialog id="settings-dialog" aria-labelledby="settings-title"><div class="dialog-heading"><h2 id="settings-title">설정</h2><button id="settings-close" class="icon-button" data-close aria-label="설정 닫기" autofocus>×</button></div><div class="settings-options"><button id="codex-settings-open" class="side-link" aria-haspopup="dialog" aria-controls="codex-settings-dialog"><span>⚙</span> 실행 파일 설정</button><button id="attachment-storage-open" class="side-link" aria-haspopup="dialog" aria-controls="attachment-storage-dialog"><span>▣</span> 첨부 저장 공간</button><button id="extensions-open" class="side-link" aria-haspopup="dialog" aria-controls="extensions-dialog"><span>◇</span> <span id="extensions-open-label">플러그인·스킬·Hook</span></button><button id="external-toggle" class="side-link" aria-haspopup="dialog" aria-controls="external-dialog"><span>◉</span> 외부 세션 <span class="readonly">읽기 전용</span></button></div><div id="update-settings-card" class="update-card" ${remoteMode ? '' : 'hidden'}><div class="update-card-header"><span id="update-card-title">버전 및 자동 업데이트</span><span class="version">v${version}</span></div><div id="update-card-status" class="update-card-status">현재 버전 v${version} 실행 중</div><div class="update-card-actions"><button id="update-check-btn" class="quiet-button" type="button">업데이트 확인</button><button id="update-apply-btn" class="primary-button" type="button" hidden>지금 업데이트 적용</button></div></div><div class="language-setting"><label for="language-select">언어</label><select id="language-select"><option value="ko">한국어</option><option value="en">English</option></select><small id="language-error" role="alert" hidden></small></div></dialog>
   <dialog id="create-dialog"><form id="create-form"><div class="dialog-heading"><span class="eyebrow">NEW SESSION</span><button type="button" class="icon-button" data-close aria-label="닫기">×</button></div><h2>새 세션 만들기</h2><p>선택한 프로젝트에서 로컬 에이전트를 시작합니다.</p><label for="session-title">세션 이름</label><input id="session-title" name="title" placeholder="예: API 개선" required maxlength="120"/><label for="session-cwd">프로젝트 경로</label><input id="session-cwd" name="cwd" placeholder="C:\\work\\my-project" required/><small>실제로 존재하는 로컬 디렉터리의 절대 경로를 입력하세요.</small><label for="session-thread">이어갈 스레드 ID <span class="optional">선택</span></label><input id="session-thread" name="thread" placeholder="비워 두면 새 대화로 시작합니다"/><div id="create-error" class="inline-error" role="alert" hidden></div><div class="dialog-actions"><button type="button" class="quiet-button" data-close>취소</button><button id="create-submit" class="primary-button" type="submit">세션 시작 →</button></div></form></dialog>
   <dialog id="restore-dialog"><div class="dialog-heading"><span class="eyebrow">SAVED WORKSPACE</span><button class="icon-button" data-close aria-label="닫기">×</button></div><h2>저장된 세션</h2><p>이전에 실행 중이던 대화는 자동으로 연결합니다. 남은 항목은 선택해서 다시 연결할 수 있습니다.</p><div id="restore-list" class="restore-list"></div></dialog>
   <dialog id="external-dialog"><div class="dialog-heading"><span class="eyebrow">READ ONLY</span><button class="icon-button" data-close aria-label="닫기">×</button></div><h2>외부 세션</h2><p>다른 앱에서 발견한 기록입니다. 관측 정보이며 현재 실행 상태는 미확인입니다. 입력하거나 종료할 수 없습니다.</p><button id="external-refresh" class="quiet-button">새로 고침</button><div id="external-list" class="external-list"></div></dialog>
@@ -662,6 +704,7 @@ const DEFAULT_SLASH_COMMANDS: SlashCommandItem[] = [
   { command: '/conversation', description: '대화 보기 / 터미널 보기를 전환합니다', category: 'ui', action: 'conversation' },
   { command: '/subagents', description: '서브에이전트 관리 창을 엽니다', category: 'ui', action: 'subagents' },
   { command: '/cron', description: '예약 작업(Cron) 관리 창을 엽니다', category: 'ui', action: 'cron' },
+  { command: '/update', description: 'GitHub Releases에서 최신 버전을 확인하고 자동 업데이트합니다', category: 'command', action: 'update' },
   { command: '/help', description: '사용 가능한 슬래시 명령어와 스킬 목록을 표시합니다', category: 'command', action: 'help' },
 ];
 
@@ -1501,9 +1544,137 @@ const executableSettings = createExecutableSettings(async <T>(command: string, a
     }
   }
 });
+interface RemoteUpdateInfo {
+  currentVersion: string;
+  latestVersion: string;
+  tagName: string;
+  updateAvailable: boolean;
+  relayVersion?: string | null;
+  hostVersion?: string | null;
+  hostUpdateAvailable?: boolean;
+  releaseUrl?: string;
+  notes?: string;
+}
+
+let latestUpdateInfo: RemoteUpdateInfo | null = null;
+let updateDismissedVersion = '';
+
+function renderUpdateStatus(info: RemoteUpdateInfo | null, errorMsg = '') {
+  const cardStatus = document.querySelector<HTMLElement>('#update-card-status');
+  const applyBtn = document.querySelector<HTMLButtonElement>('#update-apply-btn');
+  const banner = document.querySelector<HTMLElement>('#update-banner');
+  const bannerText = document.querySelector<HTMLElement>('#update-banner-text');
+  if (errorMsg) {
+    if (cardStatus) cardStatus.textContent = errorMsg;
+    return;
+  }
+  if (!info) return;
+  latestUpdateInfo = info;
+  if (info.updateAvailable) {
+    const summary = t(
+      `새 버전 v${info.latestVersion} 업데이트가 준비되었습니다 (현재 v${info.currentVersion}).`,
+      `Update v${info.latestVersion} is available (current v${info.currentVersion}).`,
+    );
+    if (cardStatus) cardStatus.textContent = summary;
+    if (applyBtn) applyBtn.hidden = false;
+    if (banner && bannerText && updateDismissedVersion !== info.latestVersion) {
+      bannerText.textContent = summary;
+      banner.hidden = false;
+    }
+  } else {
+    if (cardStatus) {
+      cardStatus.textContent = t(
+        `최신 버전(v${info.currentVersion})을 실행 중입니다.`,
+        `Running the latest version (v${info.currentVersion}).`,
+      );
+    }
+    if (applyBtn) applyBtn.hidden = true;
+    if (banner) banner.hidden = true;
+  }
+}
+
+async function checkRemoteUpdates(silent = false) {
+  if (!remoteMode) return;
+  const checkBtn = document.querySelector<HTMLButtonElement>('#update-check-btn');
+  const cardStatus = document.querySelector<HTMLElement>('#update-card-status');
+  if (checkBtn) checkBtn.disabled = true;
+  if (!silent && cardStatus) {
+    cardStatus.textContent = t('GitHub Releases에서 최신 버전을 확인하는 중…', 'Checking GitHub Releases for updates…');
+  }
+  try {
+    const info = await call<RemoteUpdateInfo>('check_for_updates');
+    renderUpdateStatus(info);
+    if (!silent) {
+      if (info.updateAvailable) {
+        notify(`새 업데이트 v${info.latestVersion}이 있습니다.`, false, `New update v${info.latestVersion} is available.`);
+      } else {
+        notify(`현재 최신 버전(v${info.currentVersion})입니다.`, false, `Already up to date (v${info.currentVersion}).`);
+      }
+    }
+  } catch (error) {
+    const msg = `${t('업데이트 확인 실패', 'Update check failed')}: ${message(error, 'ko')}`;
+    renderUpdateStatus(null, msg);
+    if (!silent) notifyError('업데이트 확인 실패', 'Could not check for updates', error);
+  } finally {
+    if (checkBtn) checkBtn.disabled = false;
+  }
+}
+
+async function applyRemoteUpdate() {
+  if (!remoteMode) return;
+  const applyBtn = document.querySelector<HTMLButtonElement>('#update-apply-btn');
+  const bannerApplyBtn = document.querySelector<HTMLButtonElement>('#update-banner-apply');
+  const cardStatus = document.querySelector<HTMLElement>('#update-card-status');
+  if (applyBtn) applyBtn.disabled = true;
+  if (bannerApplyBtn) bannerApplyBtn.disabled = true;
+  if (cardStatus) {
+    cardStatus.textContent = t('업데이트 번들을 다운로드하고 무결성(SHA-256)을 검증하는 중…', 'Downloading update bundle and verifying SHA-256…');
+  }
+  try {
+    const res = await call<{ updated?: boolean; version?: string; restartScheduled?: boolean }>('apply_update', { target: 'both' });
+    const nextVer = res?.version || latestUpdateInfo?.latestVersion || version;
+    const doneMsg = t(
+      `v${nextVer} 업데이트 적용 완료! 잠시 후 화면을 새로고침합니다…`,
+      `Updated to v${nextVer}! Reloading shortly…`,
+    );
+    if (cardStatus) cardStatus.textContent = doneMsg;
+    notify(doneMsg, false, doneMsg);
+    const banner = document.querySelector<HTMLElement>('#update-banner');
+    if (banner) banner.hidden = true;
+    if (applyBtn) applyBtn.hidden = true;
+    setTimeout(() => {
+      window.location.reload();
+    }, 1500);
+  } catch (error) {
+    const msg = `${t('업데이트 적용 실패', 'Update failed')}: ${message(error, 'ko')}`;
+    renderUpdateStatus(null, msg);
+    notifyError('업데이트 적용 실패', 'Could not apply update', error);
+  } finally {
+    if (applyBtn) applyBtn.disabled = false;
+    if (bannerApplyBtn) bannerApplyBtn.disabled = false;
+  }
+}
+
 $('#codex-settings-open').onclick = () => void executableSettings.open();
 $('#runtime-settings').onclick = () => void executableSettings.open({ checkServer: true });
-$('#settings-open').onclick = () => $<HTMLDialogElement>('#settings-dialog').showModal();
+$('#settings-open').onclick = () => {
+  $<HTMLDialogElement>('#settings-dialog').showModal();
+  if (remoteMode) void checkRemoteUpdates(true);
+};
+const updateCheckBtn = document.querySelector<HTMLButtonElement>('#update-check-btn');
+if (updateCheckBtn) updateCheckBtn.onclick = () => void checkRemoteUpdates(false);
+const updateApplyBtn = document.querySelector<HTMLButtonElement>('#update-apply-btn');
+if (updateApplyBtn) updateApplyBtn.onclick = () => void applyRemoteUpdate();
+const updateBannerApply = document.querySelector<HTMLButtonElement>('#update-banner-apply');
+if (updateBannerApply) updateBannerApply.onclick = () => void applyRemoteUpdate();
+const updateBannerDismiss = document.querySelector<HTMLButtonElement>('#update-banner-dismiss');
+if (updateBannerDismiss) {
+  updateBannerDismiss.onclick = () => {
+    if (latestUpdateInfo?.latestVersion) updateDismissedVersion = latestUpdateInfo.latestVersion;
+    const banner = document.querySelector<HTMLElement>('#update-banner');
+    if (banner) banner.hidden = true;
+  };
+}
 for (const button of document.querySelectorAll<HTMLElement>('[data-close]')) button.onclick = () => button.closest('dialog')?.close();
 $('#column-options').onclick = event => { const button = (event.target as HTMLElement).closest<HTMLElement>('[data-columns]'); if (button) { columns = Number(button.dataset.columns); maximized = ''; renderGrid(); scheduleSave(); } };
 
@@ -1528,7 +1699,12 @@ async function restartSession(id: string): Promise<void> {
       await call('session_stop', { id, generation: replacement.generation });
       const latest = await call<SessionInfo[]>('list_sessions');
       for (const info of latest) if (sessions.has(info.id)) receiveSession(info);
-      const stopped = latest.find(info => info.id === id && info.generation === replacement.generation);
+      const stopped = latest.find(info => info.id === id && info.generation === replacement.generation) ?? (
+        remoteMode ? { ...current, state: 'stopped' as const, active: false } : undefined
+      );
+      if (remoteMode && stopped && sessions.get(id)?.generation === replacement.generation) {
+        receiveSession(stopped, false);
+      }
       if (!stopped || stopped.active || !replacementCurrent(replacement)) throw new UiError('이전 세션의 종료 또는 상태를 확인하지 못했습니다. 현재 세션을 확인한 뒤 다시 시도하세요.', 'Could not confirm that the previous session stopped or remained unchanged. Check its state and retry.');
       if (exitInProgress) return;
       const request = savedSessionMetadata({ ...stopped, resumeOnStartup: true });
@@ -1742,6 +1918,9 @@ async function initialize() {
     await initializeNativeLanguage();
     unlisteners.push(await listen<Output>('terminal-output', event => receiveOutput(event.payload)));
     unlisteners.push(await listen<SessionInfo>('session-changed', event => receiveSession(event.payload)));
+    if (remoteMode) {
+      unlisteners.push(await listen<RemoteUpdateInfo>('update-available', event => renderUpdateStatus(event.payload)));
+    }
     unlisteners.push(await listen<string>('application-error', event => notify(event.payload, true)));
     unlisteners.push(await listen<boolean>('application-visibility', event => { nativeWindowVisible = event.payload; weeklyUsage.setVisible(event.payload && runtimeReady); questionCenter.setVisible(event.payload); cronManager.setVisible(event.payload); subagentManager.setVisible(event.payload); updateConversationVisibility(); }));
     unlisteners.push(await listen('exit-requested', openExitDialog));
@@ -1760,6 +1939,9 @@ async function initialize() {
     updateRestoreBanner();
     renderAll();
     void sessionBrowser.refreshProjects().catch(error => notifyError('프로젝트 목록 조회 실패', 'Could not load projects', error));
+    if (remoteMode) {
+      setTimeout(() => { void checkRemoteUpdates(true); }, 2500);
+    }
     await resumeWorkspace();
   } catch (error) { notifyError('초기화 실패', 'Could not initialize', error); }
   finally { $('#app').setAttribute('aria-busy', 'false'); }
