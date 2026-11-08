@@ -112,7 +112,12 @@ npm start -- --bind 0.0.0.0:3210 --token "my-secret-access-token"
 | `--bind <host[:port]>` | `OPENDIY_REMOTE_BIND` | `127.0.0.1:3210` | 바인드할 호스트(및 포트) 주소 |
 | `--host <host>` | `OPENDIY_REMOTE_HOST` | `127.0.0.1` | 바인드할 호스트 주소 |
 | `--port <port>` | `OPENDIY_REMOTE_PORT` | `3210` | HTTP + SSE 리스닝 포트 |
-| `--token <secret>` | `OPENDIY_REMOTE_TOKEN` | (없음) | 브라우저 원격 접속 인증용 토큰 (비루프백 바인드 시 필수) |
+| `--token <secret>` | `OPENDIY_REMOTE_TOKEN` | (없음) | 브라우저 원격 접속 인증용 토큰 (Google OAuth 미사용 시 비루프백 바인드 필수) |
+| `--google-client-id <id>` | `OPENDIY_REMOTE_GOOGLE_CLIENT_ID` | (없음) | 브라우저 Google 로그인용 OAuth 2.0 Client ID |
+| `--google-client-secret <sec>` | `OPENDIY_REMOTE_GOOGLE_CLIENT_SECRET` | (없음) | Google OAuth 2.0 Client Secret |
+| `--allowed-email <emails>` | `OPENDIY_REMOTE_ALLOWED_EMAIL` | (없음) | 접속을 허용할 소유자 Google 이메일 주소 (쉼표 구분 가능) |
+| `--tls-cert <path>` | `OPENDIY_REMOTE_TLS_CERT` | (없음) | 자체 HTTPS 가동용 TLS 인증서(PEM) 파일 경로 |
+| `--tls-key <path>` | `OPENDIY_REMOTE_TLS_KEY` | (없음) | 자체 HTTPS 가동용 TLS 개인키(PEM) 파일 경로 |
 | `--workspace <dir>` | `OPENDIY_REMOTE_DATA_DIR` | OS 임시/작업 경로 | 레이아웃·프로젝트·세션 메타데이터 저장 디렉터리(절대 경로) |
 | - | `OPENDIY_CODEX_BIN` | 자동 탐색 | 사용할 `codex` / `opendiy-codex-launcher` 실행 파일 절대 경로 |
 | - | `OPENDIY_REMOTE_DIST` | `./dist` | 서빙할 프런트엔드 빌드 산출물 디렉터리 경로 |

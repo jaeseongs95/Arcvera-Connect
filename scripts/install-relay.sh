@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# OpenDIY Remote 1:1 Relay — One-Click VPS Installer (Ubuntu / Debian, Full TLS by default)
+# OpenDIY Remote 1:1 Relay — One-Click VPS Installer (Ubuntu / Debian, Full TLS + Google OAuth support)
 # Usage:
 #   curl -fsSL https://github.com/jaeseongs95/opendiy-remote/releases/download/v1.0.0/install-relay.sh | bash
+# Optional Google OAuth flags (via env vars):
+#   OPENDIY_REMOTE_GOOGLE_CLIENT_ID="..." \
+#   OPENDIY_REMOTE_GOOGLE_CLIENT_SECRET="..." \
+#   OPENDIY_REMOTE_ALLOWED_EMAIL="me@gmail.com" \
+#   bash <(curl -fsSL https://github.com/jaeseongs95/opendiy-remote/releases/download/v1.0.0/install-relay.sh)
 
 VERSION="${OPENDIY_REMOTE_VERSION:-v1.0.0}"
 PORT="${OPENDIY_REMOTE_PORT:-3210}"
@@ -51,18 +56,34 @@ else
   echo "    Reusing existing TLS certificate."
 fi
 
-# Preserve existing tokens on upgrade unless explicitly overridden
+# Preserve existing tokens and Google OAuth settings on upgrade unless explicitly overridden
 EXISTING_TOKEN=""
 EXISTING_SECRET=""
+EXISTING_GOOGLE_ID=""
+EXISTING_GOOGLE_SECRET=""
+EXISTING_ALLOWED_EMAIL=""
 if [ -f "${SERVICE_FILE}" ]; then
   EXISTING_TOKEN="$(sed -n 's/.*--token "\([^"]*\)".*/\1/p' "${SERVICE_FILE}" | head -n 1 || true)"
   EXISTING_SECRET="$(sed -n 's/.*--host-secret "\([^"]*\)".*/\1/p' "${SERVICE_FILE}" | head -n 1 || true)"
+  EXISTING_GOOGLE_ID="$(sed -n 's/.*--google-client-id "\([^"]*\)".*/\1/p' "${SERVICE_FILE}" | head -n 1 || true)"
+  EXISTING_GOOGLE_SECRET="$(sed -n 's/.*--google-client-secret "\([^"]*\)".*/\1/p' "${SERVICE_FILE}" | head -n 1 || true)"
+  EXISTING_ALLOWED_EMAIL="$(sed -n 's/.*--allowed-email "\([^"]*\)".*/\1/p' "${SERVICE_FILE}" | head -n 1 || true)"
 fi
 
 BROWSER_TOKEN="${OPENDIY_REMOTE_TOKEN:-${EXISTING_TOKEN:-$(openssl rand -hex 24)}}"
 PC_SECRET="${OPENDIY_REMOTE_HOST_SECRET:-${EXISTING_SECRET:-$(openssl rand -hex 24)}}"
+GOOGLE_CLIENT_ID="${OPENDIY_REMOTE_GOOGLE_CLIENT_ID:-${EXISTING_GOOGLE_ID}}"
+GOOGLE_CLIENT_SECRET="${OPENDIY_REMOTE_GOOGLE_CLIENT_SECRET:-${EXISTING_GOOGLE_SECRET}}"
+ALLOWED_EMAIL="${OPENDIY_REMOTE_ALLOWED_EMAIL:-${EXISTING_ALLOWED_EMAIL}}"
 RUN_USER="$(id -un)"
 NODE_BIN="$(command -v node)"
+
+OAUTH_ARGS=""
+if [ -n "${GOOGLE_CLIENT_ID}" ] && [ -n "${GOOGLE_CLIENT_SECRET}" ] && [ -n "${ALLOWED_EMAIL}" ]; then
+  OAUTH_ARGS="  --google-client-id \"${GOOGLE_CLIENT_ID}\" \\
+  --google-client-secret \"${GOOGLE_CLIENT_SECRET}\" \\
+  --allowed-email \"${ALLOWED_EMAIL}\" \\"
+fi
 
 echo "==> [4/5] Registering systemd service (${SERVICE_NAME}.service with Full TLS)..."
 sudo tee "${SERVICE_FILE}" > /dev/null <<EOF
@@ -79,6 +100,7 @@ ExecStart=${NODE_BIN} ${INSTALL_DIR}/server/remote-server.mjs \\
   --bind ${BIND_HOST}:${PORT} \\
   --tls-cert "${TLS_CERT}" \\
   --tls-key "${TLS_KEY}" \\
+${OAUTH_ARGS}
   --token "${BROWSER_TOKEN}" \\
   --host-secret "${PC_SECRET}"
 Restart=always
@@ -101,14 +123,10 @@ echo " OpenDIY Remote 1:1 Relay (${VERSION}) is running with HTTPS (TLS)!"
 echo "======================================================================"
 echo "[1] Browser Access Token (--token):"
 echo "    ${BROWSER_TOKEN}"
+if [ -n "${GOOGLE_CLIENT_ID}" ] && [ -n "${ALLOWED_EMAIL}" ]; then
+  echo "    (Google OAuth Enabled for: ${ALLOWED_EMAIL})"
+fi
 echo ""
 echo "[2] Workstation PC Host Secret (--host-secret):"
 echo "    ${PC_SECRET}"
-echo ""
-echo "[3] Connect from your Workstation PC (via Cloudflare Full TLS domain):"
-echo "    node server/remote-server.mjs --connect https://<your-domain> --host-secret \"${PC_SECRET}\""
-echo "    (or direct IP with self-signed TLS: --connect https://${PUBLIC_IP}:${PORT} --tls-insecure --host-secret \"${PC_SECRET}\")"
-echo ""
-echo "[4] Open in Web Browser (Desktop / Tablet / Mobile):"
-echo "    https://<your-domain>/?token=${BROWSER_TOKEN}"
 echo "======================================================================"

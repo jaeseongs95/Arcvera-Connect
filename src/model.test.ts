@@ -115,6 +115,7 @@ test('remote server injects browser flag, enforces token auth, and bridges sessi
   const os = await import('node:os');
   const path = await import('node:path');
   const crypto = await import('node:crypto');
+  const http = await import('node:http');
   const {
     injectRemoteFlag,
     verifyToken,
@@ -433,6 +434,93 @@ test('remote server injects browser flag, enforces token auth, and bridges sessi
     const healthAfterClose = (await (await fetch(`${relayUrl}/api/health`)).json()) as { hostConnected: boolean };
     assert.equal(healthAfterClose.hostConnected, false);
     await relayInstance.close();
+
+    // Google OAuth 2.0 (OIDC) login + allowed-email allowlist verification
+    let mockOAuthEmail = 'owner@jaeseong.dev';
+    let mockOAuthVerified = true;
+    const mockGoogleServer = http.createServer((req, res) => {
+      if (req.url === '/token' && req.method === 'POST') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ access_token: 'mock-google-access-token' }));
+        return;
+      }
+      if (req.url === '/userinfo') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ email: mockOAuthEmail, email_verified: mockOAuthVerified }));
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+    const mockGooglePort = await new Promise<number>(resolve => {
+      mockGoogleServer.listen(0, '127.0.0.1', () => {
+        const addr = mockGoogleServer.address();
+        resolve(typeof addr === 'object' && addr ? addr.port : 0);
+      });
+    });
+
+    const fakeDistDir = path.join(tmpRoot, 'dist');
+    fs.mkdirSync(fakeDistDir, { recursive: true });
+    fs.writeFileSync(path.join(fakeDistDir, 'index.html'), '<!doctype html><html><head><title>OpenDIY</title></head><body></body></html>', 'utf8');
+
+    const oauthRelay = createRemoteServer({
+      mode: 'relay',
+      distDir: fakeDistDir,
+      token: 'fallback-token',
+      hostSecret: 'relay-host-secret',
+      googleClientId: 'test-google-client-id',
+      googleClientSecret: 'test-google-client-secret',
+      allowedEmail: 'owner@jaeseong.dev',
+      googleOAuthTokenUrl: `http://127.0.0.1:${mockGooglePort}/token`,
+      googleOAuthUserInfoUrl: `http://127.0.0.1:${mockGooglePort}/userinfo`,
+    });
+    const oauthPort = await new Promise<number>(resolve => {
+      oauthRelay.server.listen(0, '127.0.0.1', () => {
+        const addr = oauthRelay.server.address();
+        resolve(typeof addr === 'object' && addr ? addr.port : 0);
+      });
+    });
+    const oauthBase = `http://127.0.0.1:${oauthPort}`;
+
+    // Unauthenticated root visit returns the Google Sign-In Gate page
+    const gateRes = await fetch(`${oauthBase}/`);
+    assert.equal(gateRes.status, 200);
+    const gateHtml = await gateRes.text();
+    assert.equal(gateHtml.includes('/auth/google'), true);
+
+    // Redirects to Google OAuth with state parameter
+    const startAuthRes = await fetch(`${oauthBase}/auth/google`, { redirect: 'manual' });
+    assert.equal(startAuthRes.status, 302);
+    const redirectLoc = new URL(startAuthRes.headers.get('location') || '');
+    const stateVal = redirectLoc.searchParams.get('state') || '';
+    assert.equal(stateVal.length > 10, true);
+
+    // Non-owner Google account is rejected with 403
+    mockOAuthEmail = 'intruder@example.com';
+    const intruderRes = await fetch(
+      `${oauthBase}/auth/google/callback?code=test-code&state=${encodeURIComponent(stateVal)}`,
+      { redirect: 'manual' },
+    );
+    assert.equal(intruderRes.status, 403);
+
+    // Owner Google account succeeds (302 + signed session cookie) and unlocks workspace
+    const startAuthRes2 = await fetch(`${oauthBase}/auth/google`, { redirect: 'manual' });
+    const stateVal2 = new URL(startAuthRes2.headers.get('location') || '').searchParams.get('state') || '';
+    mockOAuthEmail = 'owner@jaeseong.dev';
+    const ownerRes = await fetch(
+      `${oauthBase}/auth/google/callback?code=test-code-2&state=${encodeURIComponent(stateVal2)}`,
+      { redirect: 'manual' },
+    );
+    assert.equal(ownerRes.status, 302);
+    const oauthCookie = (ownerRes.headers.get('set-cookie') || '').split(';')[0];
+    assert.equal(oauthCookie.startsWith('opendiy_remote_auth='), true);
+
+    const authedIndexRes = await fetch(`${oauthBase}/`, { headers: { Cookie: oauthCookie } });
+    const authedHtml = await authedIndexRes.text();
+    assert.equal(authedHtml.includes('window.__OPENDIY_REMOTE__=true;'), true);
+
+    await oauthRelay.close();
+    await new Promise<void>(resolve => mockGoogleServer.close(() => resolve()));
 
     const chosenFolder = await invoke('choose_project_folder', { path: projDir });
     assert.equal(chosenFolder, projDir);

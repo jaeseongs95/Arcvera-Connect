@@ -113,7 +113,12 @@ npm start -- --bind 0.0.0.0:3210 --token "my-secret-access-token"
 | `--bind <host[:port]>` | `OPENDIY_REMOTE_BIND` | `127.0.0.1:3210` | Host (and optional port) to bind |
 | `--host <host>` | `OPENDIY_REMOTE_HOST` | `127.0.0.1` | Host address to bind |
 | `--port <port>` | `OPENDIY_REMOTE_PORT` | `3210` | HTTP + SSE listening port |
-| `--token <secret>` | `OPENDIY_REMOTE_TOKEN` | (none) | Browser authentication token (required for non-loopback binds) |
+| `--token <secret>` | `OPENDIY_REMOTE_TOKEN` | (none) | Browser authentication token (required for non-loopback binds unless Google OAuth is enabled) |
+| `--google-client-id <id>` | `OPENDIY_REMOTE_GOOGLE_CLIENT_ID` | (none) | Google OAuth 2.0 Client ID for browser login |
+| `--google-client-secret <sec>` | `OPENDIY_REMOTE_GOOGLE_CLIENT_SECRET` | (none) | Google OAuth 2.0 Client Secret |
+| `--allowed-email <emails>` | `OPENDIY_REMOTE_ALLOWED_EMAIL` | (none) | Comma-separated owner Google email(s) allowed to sign in |
+| `--tls-cert <path>` | `OPENDIY_REMOTE_TLS_CERT` | (none) | TLS certificate PEM path for native HTTPS server |
+| `--tls-key <path>` | `OPENDIY_REMOTE_TLS_KEY` | (none) | TLS private key PEM path for native HTTPS server |
 | `--workspace <dir>` | `OPENDIY_REMOTE_DATA_DIR` | OS temp/work dir | Absolute directory path for persisted layout, projects, and session metadata |
 | - | `OPENDIY_CODEX_BIN` | auto-detected | Absolute path to the `codex` / `opendiy-codex-launcher` executable |
 | - | `OPENDIY_REMOTE_DIST` | `./dist` | Directory path of built frontend assets to serve |

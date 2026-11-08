@@ -656,6 +656,135 @@ export function createRemoteServer(options = {}) {
     ? crypto.createHash('sha256').update(rawHostSecret.trim(), 'utf8').digest()
     : null;
 
+  const googleClientId = String(options.googleClientId ?? process.env.OPENDIY_REMOTE_GOOGLE_CLIENT_ID ?? '').trim();
+  const googleClientSecret = String(options.googleClientSecret ?? process.env.OPENDIY_REMOTE_GOOGLE_CLIENT_SECRET ?? '').trim();
+  const allowedEmails = new Set(
+    String(options.allowedEmail ?? process.env.OPENDIY_REMOTE_ALLOWED_EMAIL ?? '')
+      .split(',')
+      .map(s => s.trim().toLowerCase())
+      .filter(Boolean),
+  );
+  const googleOAuthEnabled = Boolean(googleClientId && googleClientSecret && allowedEmails.size > 0);
+  const googleOAuthTokenUrl = String(options.googleOAuthTokenUrl || 'https://oauth2.googleapis.com/token');
+  const googleOAuthUserInfoUrl = String(options.googleOAuthUserInfoUrl || 'https://openidconnect.googleapis.com/v1/userinfo');
+  const sessionHmacSecret = crypto
+    .createHash('sha256')
+    .update(rawToken.trim() || rawHostSecret.trim() || googleClientSecret || crypto.randomBytes(32))
+    .digest();
+  const oauthStates = new Map(); // state -> expiresAtUnixMs
+
+  function signOAuthSessionToken(email) {
+    const payload = Buffer.from(
+      JSON.stringify({
+        email: String(email).toLowerCase(),
+        exp: Date.now() + 7 * 24 * 60 * 60 * 1000,
+      }),
+      'utf8',
+    ).toString('base64url');
+    const sig = crypto.createHmac('sha256', sessionHmacSecret).update(payload, 'utf8').digest('base64url');
+    return `oauth.${payload}.${sig}`;
+  }
+
+  function verifyOAuthSessionToken(cookieVal) {
+    if (!googleOAuthEnabled || typeof cookieVal !== 'string' || !cookieVal.startsWith('oauth.')) return false;
+    const parts = cookieVal.split('.');
+    if (parts.length !== 3) return false;
+    const [, payload, sig] = parts;
+    const expectedSig = crypto.createHmac('sha256', sessionHmacSecret).update(payload, 'utf8').digest('base64url');
+    const a = Buffer.from(sig, 'utf8');
+    const b = Buffer.from(expectedSig, 'utf8');
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return false;
+    try {
+      const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+      if (!parsed || typeof parsed.email !== 'string' || typeof parsed.exp !== 'number') return false;
+      if (Date.now() > parsed.exp) return false;
+      return allowedEmails.has(parsed.email.toLowerCase());
+    } catch {
+      return false;
+    }
+  }
+
+  function isClientCredentialValid(provided) {
+    if (verifyOAuthSessionToken(provided)) return true;
+    return verifyToken(tokenSha256, provided);
+  }
+
+  function renderAuthGatePage({ errorMsg = '' } = {}) {
+    const safeErr = String(errorMsg)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+    return `<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OpenDIY Remote — 로그인</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+      background: #0b0f17; color: #e5e7eb; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      padding: 20px;
+    }
+    .card {
+      width: 100%; max-width: 400px; background: #151c28; border: 1px solid #263248;
+      border-radius: 14px; padding: 28px 24px; box-shadow: 0 20px 50px rgba(0,0,0,0.5);
+    }
+    h1 { margin: 0 0 6px; font-size: 20px; font-weight: 700; color: #f9fafb; }
+    p.sub { margin: 0 0 22px; font-size: 13px; color: #9ca3af; line-height: 1.5; }
+    .err {
+      margin-bottom: 16px; padding: 10px 12px; border-radius: 8px;
+      background: rgba(239, 68, 68, 0.14); border: 1px solid rgba(239, 68, 68, 0.4);
+      color: #fca5a5; font-size: 13px;
+    }
+    .google-btn {
+      display: flex; align-items: center; justify-content: center; gap: 10px;
+      width: 100%; padding: 12px 16px; border-radius: 9px; border: 1px solid #374151;
+      background: #ffffff; color: #111827; font-size: 14px; font-weight: 600;
+      text-decoration: none; cursor: pointer; transition: opacity 0.15s;
+    }
+    .google-btn:hover { opacity: 0.92; }
+    .divider {
+      display: flex; align-items: center; gap: 10px; margin: 18px 0; color: #6b7280; font-size: 12px;
+    }
+    .divider::before, .divider::after { content: ""; flex: 1; height: 1px; background: #263248; }
+    form { display: flex; flex-direction: column; gap: 10px; }
+    input[type="password"] {
+      width: 100%; padding: 11px 12px; border-radius: 8px; border: 1px solid #2e3c56;
+      background: #0f1520; color: #f3f4f6; font-size: 14px;
+    }
+    button.tok-btn {
+      width: 100%; padding: 11px 14px; border-radius: 8px; border: none;
+      background: #2563eb; color: #fff; font-size: 14px; font-weight: 600; cursor: pointer;
+    }
+    button.tok-btn:hover { background: #1d4ed8; }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1>OpenDIY Remote</h1>
+    <p class="sub">소유자 전용 1:1 원격 작업 공간입니다. 허용된 계정으로 로그인하세요.</p>
+    ${safeErr ? `<div class="err" role="alert">${safeErr}</div>` : ''}
+    ${googleOAuthEnabled ? `
+      <a class="google-btn" href="/auth/google">
+        <svg width="18" height="18" viewBox="0 0 48 48" aria-hidden="true"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>
+        Google 계정으로 로그인
+      </a>
+    ` : ''}
+    ${tokenSha256 ? `
+      ${googleOAuthEnabled ? '<div class="divider">또는 접속 토큰 사용</div>' : ''}
+      <form method="GET" action="/">
+        <input type="password" name="token" placeholder="브라우저 접속 토큰 (--token)" required autocomplete="current-password" />
+        <button type="submit" class="tok-btn">토큰으로 접속</button>
+      </form>
+    ` : ''}
+  </main>
+</body>
+</html>`;
+  }
+
   fs.mkdirSync(workspaceDir, { recursive: true });
   const attachmentsDir = path.join(workspaceDir, 'attachments');
   fs.mkdirSync(attachmentsDir, { recursive: true });
@@ -694,7 +823,7 @@ export function createRemoteServer(options = {}) {
 
   const authRateMap = new Map();
   function checkAndRecordAuth(ip, valid) {
-    if (!tokenSha256 && !hostSecretSha256) return { allowed: true };
+    if (!tokenSha256 && !hostSecretSha256 && !googleOAuthEnabled) return { allowed: true };
     const now = Date.now();
     let record = authRateMap.get(ip);
     if (record && record.lockedUntil > now) {
@@ -2256,6 +2385,118 @@ export function createRemoteServer(options = {}) {
       }
     }
 
+    if (req.method === 'GET' && pathname === '/auth/google') {
+      if (!googleOAuthEnabled) {
+        res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('Google OAuth is not configured on this server.');
+        return;
+      }
+      const now = Date.now();
+      for (const [k, exp] of oauthStates) {
+        if (exp < now) oauthStates.delete(k);
+      }
+      if (oauthStates.size >= 256) {
+        const oldest = oauthStates.keys().next().value;
+        if (oldest) oauthStates.delete(oldest);
+      }
+      const stateNonce = crypto.randomBytes(24).toString('hex');
+      oauthStates.set(stateNonce, now + 10 * 60 * 1000);
+      const isHttps = useTls || String(req.headers['x-forwarded-proto'] || '').toLowerCase() === 'https';
+      const origin = `${isHttps ? 'https' : 'http'}://${req.headers.host || '127.0.0.1'}`;
+      const redirectUri = `${origin}/auth/google/callback`;
+      const authUrl = new URL('https://accounts.google.com/o/oauth2/v2/auth');
+      authUrl.searchParams.set('client_id', googleClientId);
+      authUrl.searchParams.set('redirect_uri', redirectUri);
+      authUrl.searchParams.set('response_type', 'code');
+      authUrl.searchParams.set('scope', 'openid email profile');
+      authUrl.searchParams.set('state', stateNonce);
+      authUrl.searchParams.set('prompt', 'select_account');
+      res.writeHead(302, { Location: authUrl.toString(), 'Cache-Control': 'no-store' });
+      res.end();
+      return;
+    }
+
+    if (req.method === 'GET' && pathname === '/auth/google/callback') {
+      if (!googleOAuthEnabled) {
+        res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('Google OAuth is not configured on this server.');
+        return;
+      }
+      const stateParam = reqUrl.searchParams.get('state') || '';
+      const codeParam = reqUrl.searchParams.get('code') || '';
+      const exp = oauthStates.get(stateParam);
+      oauthStates.delete(stateParam);
+      if (!stateParam || !codeParam || !exp || Date.now() > exp) {
+        res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+        res.end(renderAuthGatePage({ errorMsg: 'OAuth 인증 상태(state)가 만료되었거나 유효하지 않습니다. 다시 시도해 주세요.' }));
+        return;
+      }
+      const isHttps = useTls || String(req.headers['x-forwarded-proto'] || '').toLowerCase() === 'https';
+      const origin = `${isHttps ? 'https' : 'http'}://${req.headers.host || '127.0.0.1'}`;
+      const redirectUri = `${origin}/auth/google/callback`;
+      (async () => {
+        try {
+          const tokenRes = await fetch(googleOAuthTokenUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({
+              code: codeParam,
+              client_id: googleClientId,
+              client_secret: googleClientSecret,
+              redirect_uri: redirectUri,
+              grant_type: 'authorization_code',
+            }).toString(),
+          });
+          if (!tokenRes.ok) {
+            throw new Error(`Google 토큰 교환 실패 (HTTP ${tokenRes.status})`);
+          }
+          const tokenJson = await tokenRes.json();
+          const accessToken = String(tokenJson.access_token || '');
+          if (!accessToken) {
+            throw new Error('Google 액세스 토큰을 받지 못했습니다.');
+          }
+          const userRes = await fetch(googleOAuthUserInfoUrl, {
+            headers: { Authorization: `Bearer ${accessToken}` },
+          });
+          if (!userRes.ok) {
+            throw new Error(`Google 사용자 정보 조회 실패 (HTTP ${userRes.status})`);
+          }
+          const userInfo = await userRes.json();
+          const email = String(userInfo.email || '').trim().toLowerCase();
+          const verified = userInfo.email_verified === true || userInfo.verified_email === true;
+          if (!email || !verified || !allowedEmails.has(email)) {
+            checkAndRecordAuth(`client:${clientIp}`, false);
+            res.writeHead(403, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+            res.end(renderAuthGatePage({ errorMsg: `허용되지 않은 Google 계정(${email || '알 수 없음'})입니다. 소유자 계정으로만 접속할 수 있습니다.` }));
+            return;
+          }
+          checkAndRecordAuth(`client:${clientIp}`, true);
+          const sessionCookieVal = signOAuthSessionToken(email);
+          res.writeHead(302, {
+            Location: '/',
+            'Cache-Control': 'no-store',
+            'Set-Cookie': `${AUTH_COOKIE_NAME}=${encodeURIComponent(sessionCookieVal)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800${isHttps ? '; Secure' : ''}`,
+          });
+          res.end();
+        } catch (err) {
+          res.writeHead(502, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+          res.end(renderAuthGatePage({ errorMsg: `Google 로그인 처리 중 오류가 발생했습니다: ${String(err.message || err)}` }));
+        }
+      })();
+      return;
+    }
+
+    if ((req.method === 'GET' || req.method === 'POST') && pathname === '/auth/logout') {
+      const isHttps = useTls || String(req.headers['x-forwarded-proto'] || '').toLowerCase() === 'https';
+      res.writeHead(302, {
+        Location: '/',
+        'Cache-Control': 'no-store',
+        'Set-Cookie': `${AUTH_COOKIE_NAME}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0${isHttps ? '; Secure' : ''}`,
+      });
+      res.end();
+      return;
+    }
+
     if (pathname.startsWith('/api/')) {
       const authHeader = req.headers.authorization || '';
       const bearer = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
@@ -2263,7 +2504,7 @@ export function createRemoteServer(options = {}) {
       const cookies = parseCookies(req.headers.cookie);
       const cookieToken = cookies[AUTH_COOKIE_NAME] || '';
       const provided = bearer || queryToken || cookieToken;
-      const valid = verifyToken(tokenSha256, provided);
+      const valid = isClientCredentialValid(provided);
       const rate = checkAndRecordAuth(`client:${clientIp}`, valid);
       if (!rate.allowed) {
         res.writeHead(rate.locked ? 429 : 401, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
@@ -2271,7 +2512,7 @@ export function createRemoteServer(options = {}) {
           ok: false,
           error: rate.locked
             ? '반복된 인증 실패로 접속이 일시 차단되었습니다. 잠시 후 다시 시도하세요.'
-            : '유효한 원격 접속 토큰이 필요합니다.',
+            : '유효한 원격 접속 인증(Google 로그인 또는 접속 토큰)이 필요합니다.',
         }));
         return;
       }
@@ -2326,11 +2567,20 @@ export function createRemoteServer(options = {}) {
           'Referrer-Policy': 'no-referrer',
         };
         const urlToken = reqUrl.searchParams.get('token') || '';
+        const cookies = parseCookies(req.headers.cookie);
+        const cookieToken = cookies[AUTH_COOKIE_NAME] || '';
+        const isHttps = useTls || String(req.headers['x-forwarded-proto'] || '').toLowerCase() === 'https';
+        let hasValidAuth = isClientCredentialValid(cookieToken);
         if (urlToken && verifyToken(tokenSha256, urlToken)) {
-          const isHttps = useTls || String(req.headers['x-forwarded-proto'] || '').toLowerCase() === 'https';
-          headers['Set-Cookie'] = `${AUTH_COOKIE_NAME}=${encodeURIComponent(urlToken.trim())}; HttpOnly; SameSite=Strict; Path=/${isHttps ? '; Secure' : ''}`;
+          headers['Set-Cookie'] = `${AUTH_COOKIE_NAME}=${encodeURIComponent(urlToken.trim())}; HttpOnly; SameSite=Lax; Path=/${isHttps ? '; Secure' : ''}`;
+          hasValidAuth = true;
         }
         if (path.basename(filePath) === 'index.html') {
+          if (googleOAuthEnabled && !hasValidAuth) {
+            res.writeHead(200, headers);
+            res.end(renderAuthGatePage(), 'utf8');
+            return;
+          }
           const html = injectRemoteFlag(fs.readFileSync(filePath, 'utf8'));
           res.writeHead(200, headers);
           res.end(html, 'utf8');
@@ -2583,6 +2833,9 @@ if (isMain) {
   let tlsCertFile = process.env.OPENDIY_REMOTE_TLS_CERT || '';
   let tlsKeyFile = process.env.OPENDIY_REMOTE_TLS_KEY || '';
   let tlsInsecure = process.env.OPENDIY_REMOTE_TLS_INSECURE === '1' || process.env.OPENDIY_REMOTE_TLS_INSECURE === 'true';
+  let googleClientId = process.env.OPENDIY_REMOTE_GOOGLE_CLIENT_ID || '';
+  let googleClientSecret = process.env.OPENDIY_REMOTE_GOOGLE_CLIENT_SECRET || '';
+  let allowedEmail = process.env.OPENDIY_REMOTE_ALLOWED_EMAIL || '';
 
   const argv = process.argv.slice(2);
   for (let i = 0; i < argv.length; i++) {
@@ -2625,6 +2878,18 @@ if (isMain) {
       tlsKeyFile = argv[i].slice('--tls-key='.length);
     } else if (argv[i] === '--tls-insecure') {
       tlsInsecure = true;
+    } else if (argv[i] === '--google-client-id' && argv[i + 1]) {
+      googleClientId = argv[++i];
+    } else if (argv[i].startsWith('--google-client-id=')) {
+      googleClientId = argv[i].slice('--google-client-id='.length);
+    } else if (argv[i] === '--google-client-secret' && argv[i + 1]) {
+      googleClientSecret = argv[++i];
+    } else if (argv[i].startsWith('--google-client-secret=')) {
+      googleClientSecret = argv[i].slice('--google-client-secret='.length);
+    } else if (argv[i] === '--allowed-email' && argv[i + 1]) {
+      allowedEmail = argv[++i];
+    } else if (argv[i].startsWith('--allowed-email=')) {
+      allowedEmail = argv[i].slice('--allowed-email='.length);
     }
   }
 
@@ -2643,8 +2908,9 @@ if (isMain) {
     });
   } else {
     const isLoopback = host === '127.0.0.1' || host === 'localhost' || host === '::1';
-    if (!isLoopback && !token.trim()) {
-      console.error(`Error: Refusing to bind non-loopback address (${host}:${port}) without --token or OPENDIY_REMOTE_TOKEN.`);
+    const hasOAuth = Boolean(googleClientId.trim() && googleClientSecret.trim() && allowedEmail.trim());
+    if (!isLoopback && !token.trim() && !hasOAuth) {
+      console.error(`Error: Refusing to bind non-loopback address (${host}:${port}) without --token or Google OAuth (--google-client-id, --google-client-secret, --allowed-email).`);
       process.exit(1);
     }
 
@@ -2655,6 +2921,9 @@ if (isMain) {
       workspaceDir: workspaceDir || undefined,
       tlsCertFile: tlsCertFile || undefined,
       tlsKeyFile: tlsKeyFile || undefined,
+      googleClientId: googleClientId || undefined,
+      googleClientSecret: googleClientSecret || undefined,
+      allowedEmail: allowedEmail || undefined,
     });
     instance.server.listen(port, host, () => {
       const addr = instance.server.address();
