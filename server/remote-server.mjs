@@ -505,8 +505,11 @@ function readCodexRolloutSummary(threadId, customCodexHome = null) {
       terminalLines: [],
     };
     const rolloutPath = row.rollout_path ? normalizeWindowsExtendedPath(String(row.rollout_path)) : '';
+    out.rolloutPath = rolloutPath;
+    out.rolloutSize = 0;
     if (rolloutPath && fs.existsSync(rolloutPath)) {
       const st = fs.statSync(rolloutPath);
+      out.rolloutSize = st.size;
       const readSize = Math.min(1536 * 1024, st.size);
       if (readSize > 0) {
         const fd = fs.openSync(rolloutPath, 'r');
@@ -728,6 +731,11 @@ class AppServerBridge {
     this.getSettings = getSettings;
     this.onNotification = onNotification;
     this.customTransport = customTransport;
+    if (customTransport && typeof customTransport.subscribe === 'function') {
+      customTransport.subscribe(msg => {
+        if (msg && msg.method) this.onNotification(msg);
+      });
+    }
     this.proc = null;
     this.nextId = 1;
     this.pending = new Map();
@@ -1292,7 +1300,23 @@ export function createRemoteServer(options = {}) {
   }
 
   const sseClients = new Set();
+  const relayTerminalBuffers = new Map(); // sessionId -> { id, generation, seq, data }
   function broadcast(event, payload) {
+    if (event === 'terminal-output' && payload && typeof payload === 'object' && payload.id) {
+      const sid = String(payload.id);
+      const chunk = String(payload.data ?? '');
+      const prev = relayTerminalBuffers.get(sid);
+      let nextData = chunk;
+      if (prev && prev.generation === payload.generation && !chunk.includes('\x1b[2J')) {
+        nextData = (prev.data + chunk).slice(-262144);
+      }
+      relayTerminalBuffers.set(sid, {
+        id: sid,
+        generation: Number(payload.generation || 1),
+        seq: Number(payload.seq || 1),
+        data: nextData,
+      });
+    }
     if (typeof options.onBroadcast === 'function') {
       try {
         options.onBroadcast(event, payload);
@@ -1369,6 +1393,8 @@ export function createRemoteServer(options = {}) {
         if (rollout) {
           session.rolloutTerminalLines = rollout.terminalLines || [];
           session.lastRolloutUpdatedAt = rollout.updatedAt || 0;
+          session.lastRolloutSize = rollout.rolloutSize || 0;
+          session.lastRolloutDigest = JSON.stringify(session.rolloutTerminalLines);
           state.threads[session.threadId] = {
             id: session.threadId,
             title: rollout.title || session.title,
@@ -1391,29 +1417,61 @@ export function createRemoteServer(options = {}) {
 
   materializeDesktopSessions();
 
+  function emitMirroredSessionSnapshot(session, force = false) {
+    if (!session || !session.threadId) return false;
+    const rollout = readCodexRolloutSummary(session.threadId, codexHomeDir);
+    const lines = rollout?.terminalLines?.length ? rollout.terminalLines : session.rolloutTerminalLines;
+    if (!lines || lines.length === 0) return false;
+    const digest = JSON.stringify(lines);
+    if (!force && session.seededRolloutTerminal && session.lastRolloutDigest === digest) {
+      return false;
+    }
+    session.seededRolloutTerminal = true;
+    session.rolloutTerminalLines = lines;
+    session.lastRolloutDigest = digest;
+    if (rollout) {
+      session.lastRolloutUpdatedAt = rollout.updatedAt || session.lastRolloutUpdatedAt || 0;
+      session.lastRolloutSize = rollout.rolloutSize || session.lastRolloutSize || 0;
+      if (state.threads[session.threadId] && rollout.turns?.length) {
+        state.threads[session.threadId].turns = rollout.turns;
+        state.threads[session.threadId].updatedAt = rollout.updatedAt;
+      }
+    }
+    emitTerminalOutput(
+      session,
+      `\x1b[2J\x1b[H\x1b[38;5;141m╭─ ${session.title} · ${session.cwd}\x1b[0m\r\n` +
+        lines.join('\r\n') +
+        '\r\n',
+    );
+    return true;
+  }
+
   let mirroredSnapshotTimer = null;
-  function scheduleMirroredSessionSnapshots() {
+  function scheduleMirroredSessionSnapshots(force = false) {
     if (mirroredSnapshotTimer) clearTimeout(mirroredSnapshotTimer);
     mirroredSnapshotTimer = setTimeout(() => {
       mirroredSnapshotTimer = null;
       for (const session of sessions.values()) {
         if (!session.isDesktopMirrored || !session.threadId) continue;
-        const rollout = readCodexRolloutSummary(session.threadId, codexHomeDir);
-        const lines = rollout?.terminalLines?.length ? rollout.terminalLines : session.rolloutTerminalLines;
-        if (lines && lines.length > 0) {
-          session.seededRolloutTerminal = true;
-          session.rolloutTerminalLines = lines;
-          emitTerminalOutput(
-            session,
-            `\x1b[2J\x1b[H\x1b[38;5;141m╭─ ${session.title} · ${session.cwd}\x1b[0m\r\n` +
-              lines.join('\r\n') +
-              '\r\n',
-          );
-        }
+        emitMirroredSessionSnapshot(session, force);
       }
     }, 60);
     mirroredSnapshotTimer.unref?.();
   }
+
+  const desktopWatchInterval =
+    desktopDbPath && mode !== 'relay'
+      ? setInterval(() => {
+          try {
+            materializeDesktopSessions();
+            for (const session of sessions.values()) {
+              if (!session.isDesktopMirrored || !session.threadId) continue;
+              emitMirroredSessionSnapshot(session, false);
+            }
+          } catch {}
+        }, 1500)
+      : null;
+  desktopWatchInterval?.unref?.();
 
   const allowPathDiscovery = options.allowPathDiscovery !== false && process.env.OPENDIY_REMOTE_NO_PATH_DISCOVERY !== '1';
   function computeSettings() {
@@ -1442,7 +1500,18 @@ export function createRemoteServer(options = {}) {
         };
         session.events.push(entry);
         if (notification.method === 'item/agentMessage/delta' && notification.params?.delta) {
+          session._streamedItemIds = session._streamedItemIds || new Set();
+          if (notification.params?.itemId) session._streamedItemIds.add(String(notification.params.itemId));
           emitTerminalOutput(session, String(notification.params.delta));
+        } else if (notification.method === 'item/completed' && notification.params?.item && !sessionProcesses.has(session.id)) {
+          const item = normalizeConversationItem(notification.params.item, 0, String(notification.params.turnId || 'turn'));
+          const alreadyStreamed = session._streamedItemIds?.has(item.id);
+          if (item.type === 'agentMessage' && item.text && !alreadyStreamed) {
+            const lines = String(item.text).trim().split(/\r?\n/).map(al => `\x1b[38;5;252m• ${al}\x1b[0m`);
+            emitTerminalOutput(session, lines.join('\r\n') + '\r\n\x1b[38;5;141m›\x1b[0m ');
+          } else if (item.type === 'commandExecution' && item.command) {
+            emitTerminalOutput(session, `\x1b[38;5;114m• Ran\x1b[0m ${String(item.command).slice(0, 140)}\r\n`);
+          }
         }
         if (notification.id !== undefined) {
           const qEntry = buildPendingQuestionEntry(session, notification);
@@ -1736,6 +1805,21 @@ export function createRemoteServer(options = {}) {
       if (request.model) thread.model = String(request.model);
       if (request.effort) thread.effort = String(request.effort);
       persistState();
+      if (!sessionProcesses.has(session.id)) {
+        const outLines = [];
+        for (const item of normalizedItems) {
+          if (item.type === 'agentMessage' && item.text) {
+            for (const al of String(item.text).trim().split(/\r?\n/)) {
+              outLines.push(`\x1b[38;5;252m• ${al}\x1b[0m`);
+            }
+          } else if (item.type === 'commandExecution' && item.command) {
+            outLines.push(`\x1b[38;5;114m• Ran\x1b[0m ${String(item.command).slice(0, 140)}`);
+          }
+        }
+        if (outLines.length > 0) {
+          emitTerminalOutput(session, outLines.join('\r\n') + '\r\n\x1b[38;5;141m›\x1b[0m ');
+        }
+      }
       return {
         turnId,
         turn: { id: turnId, status: turn.status },
@@ -2161,7 +2245,7 @@ export function createRemoteServer(options = {}) {
           if (req.projectId !== undefined) existingSession.projectId = req.projectId;
           if (req.projectAssigned !== undefined) existingSession.projectAssigned = Boolean(req.projectAssigned);
           await syncThreadFromServer(existingSession, false);
-          scheduleMirroredSessionSnapshots();
+          emitMirroredSessionSnapshot(existingSession, true);
           const existingInfo = publicSessionInfo(existingSession);
           broadcast('session-changed', existingInfo);
           return existingInfo;
@@ -2256,9 +2340,54 @@ export function createRemoteServer(options = {}) {
         const proc = sessionProcesses.get(session.id);
         if (proc && proc.stdin && proc.stdin.writable) {
           proc.stdin.write(data.replace(/\r/g, '\n'));
-        } else {
-          emitTerminalOutput(session, data);
+          return null;
         }
+        if (session.threadId) {
+          session.inputBuffer = String(session.inputBuffer || '');
+          let out = '';
+          const submittedPrompts = [];
+          for (const ch of data) {
+            if (ch === '\u0003') {
+              session.inputBuffer = '';
+              out += '^C\r\n\x1b[38;5;141m›\x1b[0m ';
+              if (appServerBridge.isConnected()) {
+                void appServerBridge.request('turn/interrupt', { threadId: session.threadId }).catch(() => {});
+              }
+            } else if (ch === '\u007f' || ch === '\b') {
+              if (session.inputBuffer.length > 0) {
+                session.inputBuffer = session.inputBuffer.slice(0, -1);
+                out += '\b \b';
+              }
+            } else if (ch === '\r' || ch === '\n') {
+              const promptText = session.inputBuffer.trim();
+              session.inputBuffer = '';
+              out += '\r\n';
+              if (promptText) {
+                submittedPrompts.push(promptText);
+              } else {
+                out += '\x1b[38;5;141m›\x1b[0m ';
+              }
+            } else if (ch >= ' ') {
+              session.inputBuffer += ch;
+              out += ch;
+            }
+          }
+          if (out) emitTerminalOutput(session, out);
+          for (const promptText of submittedPrompts) {
+            emitTerminalOutput(session, `\x1b[90m›\x1b[0m \x1b[1m${promptText}\x1b[0m\r\n`);
+            try {
+              await handleConversationRequest(session, { type: 'send', text: promptText });
+              emitMirroredSessionSnapshot(session, false);
+            } catch (err) {
+              emitTerminalOutput(
+                session,
+                `\x1b[38;5;203m• 전송 실패: ${err.message || err}\x1b[0m\r\n\x1b[38;5;141m›\x1b[0m `,
+              );
+            }
+          }
+          return null;
+        }
+        emitTerminalOutput(session, data);
         return null;
       }
       case 'session_resize': {
@@ -2266,6 +2395,9 @@ export function createRemoteServer(options = {}) {
         if (session && session.generation === Number(args.generation)) {
           session.cols = Number(args.cols) || session.cols;
           session.rows = Number(args.rows) || session.rows;
+          if (!sessionProcesses.has(session.id) && session.threadId) {
+            emitMirroredSessionSnapshot(session, true);
+          }
         }
         return null;
       }
@@ -3215,6 +3347,11 @@ export function createRemoteServer(options = {}) {
       });
       res.write(': connected\n\n');
       sseClients.add(res);
+      for (const cached of relayTerminalBuffers.values()) {
+        try {
+          res.write(`data: ${JSON.stringify({ event: 'terminal-output', payload: cached })}\n\n`);
+        } catch {}
+      }
       const keepAlive = setInterval(() => {
         try {
           res.write(': keepalive\n\n');
@@ -3297,6 +3434,7 @@ export function createRemoteServer(options = {}) {
     dispatchCommand,
     broadcast,
     close: async () => {
+      if ( desktopWatchInterval ) clearInterval(desktopWatchInterval);
       for (const jobId of [...cronTimers.keys()]) {
         clearCronTimer(jobId);
       }

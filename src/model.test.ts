@@ -664,10 +664,19 @@ test('remote server mirrors OpenDIY Desktop workspace.sqlite3 projects, active s
     onRegistered: () => {
       registered = true;
     },
-    rpcTransport: async (method: string) => {
+    rpcTransport: async (method: string, params: any) => {
       if (method === 'turn/start') {
         cronTurnStarted = true;
-        return { turn: { id: 'cron-turn-1', status: 'inProgress', items: [] } };
+        return {
+          turn: {
+            id: 'cron-turn-1',
+            status: 'completed',
+            items: [
+              { id: 'u-1', type: 'userMessage', role: 'user', text: params?.input?.[0]?.text || '' },
+              { id: 'a-1', type: 'agentMessage', role: 'assistant', text: '원격 터미널 프롬프트 응답 완료' },
+            ],
+          },
+        };
       }
       return {};
     },
@@ -750,7 +759,45 @@ test('remote server mirrors OpenDIY Desktop workspace.sqlite3 projects, active s
     assert.equal(sseBuffer.includes('terminal-output'), true);
     assert.equal(sseBuffer.includes('desktop 담당'), true);
 
+    // BLKR-01: Verify typing into mirrored session via session_write triggers turn/start and emits response to terminal
+    cronTurnStarted = false;
+    await relayInvoke('session_write', {
+      id: 'sess-desktop',
+      generation: 1,
+      data: '원격 터미널에서 직접 입력\r',
+    });
+    assert.equal(cronTurnStarted, true);
+    for (let i = 0; i < 25 && !sseBuffer.includes('원격 터미널 프롬프트 응답 완료'); i++) {
+      await new Promise(r => setTimeout(r, 50));
+    }
+    assert.equal(sseBuffer.includes('원격 터미널 프롬프트 응답 완료'), true);
+
+    // BLKR-02: Verify newly connected SSE client (e.g. browser refresh) immediately receives cached terminal-output buffer
+    const refreshController = new AbortController();
+    const refreshRes = await fetch(`${relayBase}/api/events?token=relay-sync-token`, {
+      signal: refreshController.signal,
+    });
+    assert.equal(refreshRes.status, 200);
+    const refreshReader = refreshRes.body!.getReader();
+    let refreshBuf = '';
+    const refreshPump = (async () => {
+      try {
+        while (true) {
+          const { done, value } = await refreshReader.read();
+          if (done) break;
+          refreshBuf += decoder.decode(value, { stream: true });
+        }
+      } catch {}
+    })();
+    for (let i = 0; i < 20 && !refreshBuf.includes('desktop 담당'); i++) {
+      await new Promise(r => setTimeout(r, 40));
+    }
+    assert.equal(refreshBuf.includes('desktop 담당'), true);
+    refreshController.abort();
+    await refreshPump;
+
     // Verify cron_request schedules and fires a real timer (FINDING-05)
+    cronTurnStarted = false;
     await relayInvoke('cron_request', {
       id: 'sess-desktop',
       generation: 1,

@@ -869,9 +869,19 @@ function renderGrid() {
   grid.style.gridTemplateRows = singleView ? 'minmax(0,1fr)' : rowSizes.slice(0, rows).map(size => `minmax(0,${size}fr)`).join(' ');
   order.forEach((id, index) => {
     const view = terminals.get(id)!;
-    view.card.hidden = !isVisible(id) || (!!maximized && id !== maximized) || (mobileSingle && id !== mobileTarget);
+    const wasHidden = view.card.hidden;
+    const nowHidden = !isVisible(id) || (!!maximized && id !== maximized) || (mobileSingle && id !== mobileTarget);
+    view.card.hidden = nowHidden;
     refreshInputState(id);
     if (grid.children[index] !== view.card) grid.insertBefore(view.card, grid.children[index] ?? null);
+    if (wasHidden && !nowHidden) {
+      requestAnimationFrame(() => {
+        if (!view.card.hidden && view.card.offsetWidth && view.card.offsetHeight) {
+          view.fit.fit();
+          queueResize(id);
+        }
+      });
+    }
   });
   $('#empty').hidden = visible.length > 0;
   bindText($('#empty h2'), selectedProject ? '이 프로젝트에 열린 세션이 없습니다' : '다음 작업을 펼쳐 보세요', selectedProject ? 'No open sessions in this project' : 'Open your next task');
