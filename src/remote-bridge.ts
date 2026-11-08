@@ -396,6 +396,9 @@ export function installRemoteBridge(): void {
         if (!path) return [];
         return remoteInvoke('choose_conversation_attachments', { paths: [path] });
       }
+      if (command === 'session_output_ack') {
+        return null;
+      }
       return remoteInvoke(command, args);
     },
   };

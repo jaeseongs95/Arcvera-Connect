@@ -34,7 +34,7 @@ function stateLabels(state: string): [string, string] { return states[state] ?? 
 const sessions = new Map<string, Session>();
 interface QueuedInput { data: string; generation: number; selectionVersion: number }
 interface QueuedResize { generation: number; selectionVersion: number; cols: number; rows: number }
-const terminals = new Map<string, { terminal: Terminal; fit: FitAddon; search: SearchAddon; card: HTMLElement; observer: ResizeObserver; links: ReturnType<typeof installTerminalExternalLinks>; input: TerminalInputQueue<QueuedInput>; resize: TerminalResizeQueue<QueuedResize>; inputWarning: boolean; resizeTimer?: ReturnType<typeof setTimeout> }>();
+const terminals = new Map<string, { terminal: Terminal; fit: FitAddon; search: SearchAddon; card: HTMLElement; observer: ResizeObserver; links: ReturnType<typeof installTerminalExternalLinks>; input: TerminalInputQueue<QueuedInput>; resize: TerminalResizeQueue<QueuedResize>; inputWarning: boolean; localLineBuffer: string; resizeTimer?: ReturnType<typeof setTimeout> }>();
 const conversations = new Map<string, ReturnType<typeof createConversation>>();
 const conversationOwners = new Set<string>();
 const contextControls = new Map<string, ReturnType<typeof createContextControls>>();
@@ -522,6 +522,34 @@ function inputError(error: unknown) {
 function sendInput(id: string, data: string) {
   const session = sessions.get(id); const view = terminals.get(id);
   if (!session || !view || !canType(id) || conversationOwners.has(id)) return;
+  if (remoteMode && session.lineBufferedInput) {
+    let localEcho = '';
+    let dispatchPayload = '';
+    for (const ch of data) {
+      if (ch === '\u0003') {
+        view.localLineBuffer = '';
+        dispatchPayload += '\u0003';
+      } else if (ch === '\u007f' || ch === '\b') {
+        if (view.localLineBuffer.length > 0) {
+          view.localLineBuffer = Array.from(view.localLineBuffer).slice(0, -1).join('');
+          localEcho += '\b \b';
+        }
+      } else if (ch === '\r' || ch === '\n') {
+        const line = view.localLineBuffer;
+        view.localLineBuffer = '';
+        localEcho += '\r\n';
+        dispatchPayload += `${line}\r`;
+      } else if (ch >= ' ') {
+        view.localLineBuffer += ch;
+        localEcho += ch;
+      }
+    }
+    if (localEcho) {
+      view.terminal.write(localEcho);
+    }
+    if (!dispatchPayload) return;
+    data = dispatchPayload;
+  }
   void view.input.enqueue({ data, generation: session.generation, selectionVersion: projectSelectionVersion }).catch(error => {
     if (error instanceof InputQueueError && error.reason === 'cancelled') return;
     if (error instanceof InputQueueError && view.inputWarning) return;
@@ -609,7 +637,7 @@ function createTerminal(session: Session) {
     if (!current || value.selectionVersion !== projectSelectionVersion || current.generation !== value.generation || !canType(session.id)) return;
     await call('session_resize', { id: session.id, generation: value.generation, cols: value.cols, rows: value.rows });
   }, error => notifyError('터미널 크기 변경 실패', 'Could not resize terminal', error));
-  terminals.set(session.id, { terminal, fit, search, card, observer, links, input, resize, inputWarning: false });
+  terminals.set(session.id, { terminal, fit, search, card, observer, links, input, resize, inputWarning: false, localLineBuffer: '' });
   refreshInputState(session.id);
   mountConversation(session);
   terminal.onData(data => sendInput(session.id, data));
@@ -711,7 +739,7 @@ function receiveSession(info: SessionInfo, persist = true) {
   if (persist) scheduleSave();
 }
 
-const outputAcknowledgements = new TerminalOutputAcknowledgements(output => { if (native) void call('session_output_ack', { id: output.id, generation: output.generation, seq: output.seq }).catch(error => notifyError('출력 확인 전송 실패', 'Could not acknowledge output', error)); });
+const outputAcknowledgements = new TerminalOutputAcknowledgements(output => { if (native && !remoteMode) void call('session_output_ack', { id: output.id, generation: output.generation, seq: output.seq }).catch(error => notifyError('출력 확인 전송 실패', 'Could not acknowledge output', error)); });
 function ack(output: Output) { outputAcknowledgements.enqueue(output); }
 async function resolveOrphan(id: string) {
   if (!native || resolving.has(id)) return;

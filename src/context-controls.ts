@@ -110,7 +110,7 @@ export function createContextControls(options: Options) {
     compact.disabled = !visible || busy || !canAttempt();
     compact.setAttribute('aria-busy', String(busy || snapshot?.compacting === true));
   }
-  function schedule(delay = 2000) {
+  function schedule(delay = 5000) {
     clearTimeout(timer);
     if (!disposed && visible) timer = setTimeout(() => void refresh(), delay);
   }
@@ -124,7 +124,7 @@ export function createContextControls(options: Options) {
       if (alive(version) && supportVersion === supportEpoch) { snapshot = { ...snapshot, connected: false, guiConnected: false, tokenUsageFresh: false, compacting: false, active: null, canCompact: false, reason: 'disconnected' }; invalidateCapabilities(); }
     } finally {
       reading = false;
-      if (!disposed) { render(); schedule(version === epoch ? 2000 : 0); }
+      if (!disposed) { render(); schedule(version === epoch ? 5000 : 0); }
     }
   }
   async function startCompaction() {

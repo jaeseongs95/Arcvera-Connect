@@ -860,3 +860,38 @@ test('remote server mirrors OpenDIY Desktop workspace.sqlite3 projects, active s
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
+
+test('TerminalInputQueue coalesces rapid typing bursts over high-RTT links into a single batch send', async () => {
+  const { TerminalInputQueue } = await import('./terminal-flow.ts');
+  const sentBatches: Array<{ data: string; generation: number; selectionVersion: number }> = [];
+  let releaseFirstSend!: () => void;
+  const firstSendBarrier = new Promise<void>(resolve => {
+    releaseFirstSend = resolve;
+  });
+
+  const queue = new TerminalInputQueue<{ data: string; generation: number; selectionVersion: number }>(
+    async value => {
+      sentBatches.push(value);
+      if (sentBatches.length === 1) {
+        await firstSendBarrier;
+      }
+    },
+    () => {},
+  );
+
+  const p1 = queue.enqueue({ data: '안', generation: 1, selectionVersion: 1 });
+  const p2 = queue.enqueue({ data: '녕', generation: 1, selectionVersion: 1 });
+  const p3 = queue.enqueue({ data: '하', generation: 1, selectionVersion: 1 });
+  const p4 = queue.enqueue({ data: '세', generation: 1, selectionVersion: 1 });
+  const p5 = queue.enqueue({ data: '요', generation: 1, selectionVersion: 1 });
+  const p6 = queue.enqueue({ data: '\r', generation: 1, selectionVersion: 1 });
+
+  releaseFirstSend();
+  await Promise.all([p1, p2, p3, p4, p5, p6]);
+
+  assert.equal(sentBatches.length, 2);
+  assert.equal(sentBatches[0].data, '안');
+  assert.equal(sentBatches[1].data, '녕하세요\r');
+  assert.equal(queue.size, 0);
+  assert.equal(queue.byteLength, 0);
+});

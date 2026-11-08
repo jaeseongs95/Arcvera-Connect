@@ -12,6 +12,7 @@ export interface SessionInfo {
   projectId?: string | null;
   projectAssigned?: boolean;
   projectRevision?: number;
+  lineBufferedInput?: boolean;
 }
 
 export interface Output {

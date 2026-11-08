@@ -9,7 +9,10 @@ type OutputAcknowledgement = { id: string; generation: number; seq: number };
 export class TerminalOutputAcknowledgements {
   private pending = new Map<string, Map<number, OutputAcknowledgement>>();
   private scheduled = false;
-  constructor(private send: (output: OutputAcknowledgement) => void) {}
+  private send: (output: OutputAcknowledgement) => void;
+  constructor(send: (output: OutputAcknowledgement) => void) {
+    this.send = send;
+  }
   enqueue(output: OutputAcknowledgement) {
     let generations = this.pending.get(output.id);
     if (!generations) { generations = new Map(); this.pending.set(output.id, generations); }
@@ -27,7 +30,11 @@ export class TerminalOutputAcknowledgements {
 }
 
 export class InputQueueError extends Error {
-  constructor(readonly reason: 'message' | 'full' | 'cancelled') { super(`Terminal input ${reason}`); }
+  readonly reason: 'message' | 'full' | 'cancelled';
+  constructor(reason: 'message' | 'full' | 'cancelled') {
+    super(`Terminal input ${reason}`);
+    this.reason = reason;
+  }
 }
 
 // Stop counting at the native per-message ceiling without allocating another
@@ -50,7 +57,12 @@ export class TerminalInputQueue<T extends { data: string }> {
   private bytes = 0;
   private pressure = false;
   private closed = false;
-  constructor(private send: (value: T) => Promise<void>, private changed: () => void) {}
+  private send: (value: T) => Promise<void>;
+  private changed: () => void;
+  constructor(send: (value: T) => Promise<void>, changed: () => void) {
+    this.send = send;
+    this.changed = changed;
+  }
   get size() { return this.count; }
   get byteLength() { return this.bytes; }
   get paused() { return this.pressure; }
@@ -83,11 +95,35 @@ export class TerminalInputQueue<T extends { data: string }> {
     this.active = true;
     try {
       while (this.pending.length) {
-        const entry = this.pending.shift()!;
-        try { await this.send(entry.value); entry.resolve(); }
-        catch (error) { entry.reject(error); }
-        finally {
-          this.count--; this.bytes -= entry.bytes;
+        const first = this.pending.shift()!;
+        const batch = [first];
+        let combinedData = first.value.data;
+        let combinedBytes = first.bytes;
+        const firstRec = first.value as Record<string, unknown>;
+        while (this.pending.length) {
+          const next = this.pending[0];
+          const nextRec = next.value as Record<string, unknown>;
+          if (
+            nextRec.generation !== firstRec.generation ||
+            nextRec.selectionVersion !== firstRec.selectionVersion ||
+            combinedBytes + next.bytes > MAX_INPUT_MESSAGE_BYTES
+          ) {
+            break;
+          }
+          this.pending.shift();
+          batch.push(next);
+          combinedData += next.value.data;
+          combinedBytes += next.bytes;
+        }
+        const mergedValue = batch.length === 1 ? first.value : ({ ...first.value, data: combinedData } as T);
+        try {
+          await this.send(mergedValue);
+          for (const entry of batch) entry.resolve();
+        } catch (error) {
+          for (const entry of batch) entry.reject(error);
+        } finally {
+          this.count -= batch.length;
+          this.bytes -= combinedBytes;
           this.pressure = this.count >= MAX_INPUT_OPERATIONS || this.bytes >= MAX_INPUT_BYTES;
           this.changed();
         }
@@ -102,7 +138,12 @@ export class TerminalResizeQueue<T> {
   private pending?: T;
   private active = false;
   private closed = false;
-  constructor(private send: (value: T) => Promise<void>, private failed: (error: unknown) => void) {}
+  private send: (value: T) => Promise<void>;
+  private failed: (error: unknown) => void;
+  constructor(send: (value: T) => Promise<void>, failed: (error: unknown) => void) {
+    this.send = send;
+    this.failed = failed;
+  }
   enqueue(value: T) { if (!this.closed) { this.pending = value; void this.pump(); } }
   cancelPending() { this.pending = undefined; }
   dispose() { this.closed = true; this.cancelPending(); }

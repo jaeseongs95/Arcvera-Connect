@@ -472,7 +472,7 @@ export function createConversation(options: ConversationOptions) {
       if (value.error) status('연결을 확인하지 못했습니다. 연결이 복구될 때까지 기다려 주세요. 초안은 보존됩니다.', 'Could not confirm the connection. Wait for it to recover. Your draft is preserved.');
       updateControls();
     } catch (error) { if (alive(version) && foreground && revision === pollVersion) { connected = false; failure(error); updateControls(); } }
-    finally { if (alive(version) && foreground && attached && revision === pollVersion) polling = setTimeout(() => void poll(version, revision), 400); }
+    finally { if (alive(version) && foreground && attached && revision === pollVersion) polling = setTimeout(() => void poll(version, revision), activeTurn ? 450 : 1200); }
   }
   function adoptStartedTurn(turn: Json | undefined, version: number, activity: number) {
     const id = string(turn?.id);

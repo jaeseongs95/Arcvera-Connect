@@ -1,5 +1,6 @@
 import http from 'node:http';
 import https from 'node:https';
+import zlib from 'node:zlib';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -1474,6 +1475,9 @@ export function createRemoteServer(options = {}) {
     if (command === 'unconfirmed_exit_available') {
       return Promise.resolve(false);
     }
+    if (command === 'session_output_ack') {
+      return Promise.resolve(null);
+    }
     if (!RELAY_COMMAND_SET.has(command)) {
       return Promise.reject(new Error(`원격 중계에서 허용되지 않는 명령입니다: ${command}`));
     }
@@ -1805,6 +1809,7 @@ export function createRemoteServer(options = {}) {
   }
 
   function publicSessionInfo(session) {
+    const isLineBuffered = Boolean(session.threadId && !sessionProcesses.has(session.id));
     return {
       id: session.id,
       generation: session.generation,
@@ -1815,6 +1820,7 @@ export function createRemoteServer(options = {}) {
       projectAssigned: Boolean(session.projectAssigned),
       state: session.state,
       active: session.active,
+      lineBufferedInput: isLineBuffered,
     };
   }
 
@@ -2741,7 +2747,9 @@ export function createRemoteServer(options = {}) {
           }
           if (out) emitTerminalOutput(session, out);
           for (const promptText of submittedPrompts) {
-            emitTerminalOutput(session, `\x1b[90m›\x1b[0m \x1b[1m${promptText}\x1b[0m\r\n`);
+            if (!data.startsWith(promptText)) {
+              emitTerminalOutput(session, `\x1b[90m›\x1b[0m \x1b[1m${promptText}\x1b[0m\r\n`);
+            }
             try {
               await handleConversationRequest(session, { type: 'send', text: promptText });
               emitMirroredSessionSnapshot(session, false);
@@ -3390,6 +3398,30 @@ export function createRemoteServer(options = {}) {
     return fs.existsSync(index) ? index : null;
   }
 
+  const staticAssetCache = new Map(); // filePath -> { mtimeMs, size, etag, rawBuf, gzipBuf }
+
+  function sendJsonResponse(req, res, statusCode, payload, extraHeaders = {}) {
+    const jsonBuf = Buffer.from(JSON.stringify(payload), 'utf8');
+    const acceptEnc = String(req.headers['accept-encoding'] || '');
+    const headers = {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': 'no-store',
+      ...extraHeaders,
+    };
+    if (jsonBuf.length >= 1024 && /\bgzip\b/i.test(acceptEnc)) {
+      const gz = zlib.gzipSync(jsonBuf);
+      headers['Content-Encoding'] = 'gzip';
+      headers['Content-Length'] = gz.length;
+      headers.Vary = 'Accept-Encoding';
+      res.writeHead(statusCode, headers);
+      res.end(gz);
+      return;
+    }
+    headers['Content-Length'] = jsonBuf.length;
+    res.writeHead(statusCode, headers);
+    res.end(jsonBuf);
+  }
+
   function readJsonBody(req, res, callback) {
     const chunks = [];
     let total = 0;
@@ -3404,7 +3436,12 @@ export function createRemoteServer(options = {}) {
         return;
       }
       try {
-        const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        let rawBuf = Buffer.concat(chunks);
+        const contentEnc = String(req.headers['content-encoding'] || '').toLowerCase();
+        if (contentEnc === 'gzip') {
+          rawBuf = zlib.gunzipSync(rawBuf, { maxOutputLength: MAX_BODY_BYTES });
+        }
+        const body = JSON.parse(rawBuf.toString('utf8'));
         callback(body);
       } catch (err) {
         res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -3473,10 +3510,12 @@ export function createRemoteServer(options = {}) {
             }
           } catch {}
         }
+        try { req.socket?.setNoDelay?.(true); } catch {}
         res.writeHead(200, {
           'Content-Type': 'text/event-stream; charset=utf-8',
           'Cache-Control': 'no-cache, no-transform',
           Connection: 'keep-alive',
+          'X-Accel-Buffering': 'no',
         });
         const pendingCalls = activeHostLease?.hostId === requestedHostId ? activeHostLease.pendingCalls : new Map();
         const keepAlive = setInterval(() => {
@@ -3697,10 +3736,12 @@ export function createRemoteServer(options = {}) {
     }
 
     if (req.method === 'GET' && pathname === '/api/events') {
+      try { req.socket?.setNoDelay?.(true); } catch {}
       res.writeHead(200, {
         'Content-Type': 'text/event-stream; charset=utf-8',
         'Cache-Control': 'no-cache, no-transform',
         Connection: 'keep-alive',
+        'X-Accel-Buffering': 'no',
       });
       res.write(': connected\n\n');
       sseClients.add(res);
@@ -3728,11 +3769,9 @@ export function createRemoteServer(options = {}) {
       readJsonBody(req, res, async body => {
         try {
           const result = await dispatchCommand(String(body.command ?? ''), body.args || {});
-          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
-          res.end(JSON.stringify({ ok: true, result }));
+          sendJsonResponse(req, res, 200, { ok: true, result });
         } catch (err) {
-          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
-          res.end(JSON.stringify({ ok: false, error: String(err.message || err) }));
+          sendJsonResponse(req, res, 400, { ok: false, error: String(err.message || err) });
         }
       });
       return;
@@ -3764,12 +3803,57 @@ export function createRemoteServer(options = {}) {
             res.end(renderAuthGatePage(), 'utf8');
             return;
           }
-          const html = injectRemoteFlag(fs.readFileSync(filePath, 'utf8'));
+          const htmlBuf = Buffer.from(injectRemoteFlag(fs.readFileSync(filePath, 'utf8')), 'utf8');
+          const acceptEnc = String(req.headers['accept-encoding'] || '');
+          if (htmlBuf.length >= 1024 && /\bgzip\b/i.test(acceptEnc)) {
+            const gz = zlib.gzipSync(htmlBuf);
+            headers['Content-Encoding'] = 'gzip';
+            headers['Content-Length'] = gz.length;
+            headers.Vary = 'Accept-Encoding';
+            res.writeHead(200, headers);
+            res.end(gz);
+            return;
+          }
+          headers['Content-Length'] = htmlBuf.length;
           res.writeHead(200, headers);
-          res.end(html, 'utf8');
+          res.end(htmlBuf);
         } else {
-          res.writeHead(200, headers);
-          fs.createReadStream(filePath).pipe(res);
+          try {
+            const st = fs.statSync(filePath);
+            let cachedAsset = staticAssetCache.get(filePath);
+            if (!cachedAsset || cachedAsset.mtimeMs !== st.mtimeMs || cachedAsset.size !== st.size) {
+              const rawBuf = fs.readFileSync(filePath);
+              const etag = `W/"${st.size.toString(16)}-${Math.floor(st.mtimeMs).toString(16)}"`;
+              const ext = path.extname(filePath).toLowerCase();
+              const compressible = ['.js', '.mjs', '.css', '.json', '.svg', '.html'].includes(ext) && rawBuf.length >= 512;
+              const gzipBuf = compressible ? zlib.gzipSync(rawBuf) : null;
+              cachedAsset = { mtimeMs: st.mtimeMs, size: st.size, etag, rawBuf, gzipBuf };
+              staticAssetCache.set(filePath, cachedAsset);
+            }
+            const isHashedAsset = pathname.startsWith('/assets/');
+            headers['Cache-Control'] = isHashedAsset ? 'public, max-age=31536000, immutable' : 'public, max-age=300';
+            headers.ETag = cachedAsset.etag;
+            if (req.headers['if-none-match'] === cachedAsset.etag) {
+              res.writeHead(304, headers);
+              res.end();
+              return;
+            }
+            const acceptEnc = String(req.headers['accept-encoding'] || '');
+            if (cachedAsset.gzipBuf && /\bgzip\b/i.test(acceptEnc)) {
+              headers['Content-Encoding'] = 'gzip';
+              headers['Content-Length'] = cachedAsset.gzipBuf.length;
+              headers.Vary = 'Accept-Encoding';
+              res.writeHead(200, headers);
+              res.end(cachedAsset.gzipBuf);
+              return;
+            }
+            headers['Content-Length'] = cachedAsset.rawBuf.length;
+            res.writeHead(200, headers);
+            res.end(cachedAsset.rawBuf);
+          } catch {
+            res.writeHead(200, headers);
+            fs.createReadStream(filePath).pipe(res);
+          }
         }
         return;
       }
@@ -3785,6 +3869,11 @@ export function createRemoteServer(options = {}) {
   const server = useTls
     ? https.createServer({ cert: tlsCert, key: tlsKey }, requestHandler)
     : http.createServer(requestHandler);
+  server.keepAliveTimeout = 65000;
+  server.headersTimeout = 66000;
+  server.on('connection', socket => {
+    try { socket.setNoDelay(true); } catch {}
+  });
 
   return {
     server,
@@ -3850,6 +3939,9 @@ export function startHostConnector(options = {}) {
     },
   });
 
+  const httpAgent = new http.Agent({ keepAlive: true, keepAliveMsecs: 30000, maxSockets: 16 });
+  const httpsAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 30000, maxSockets: 16, rejectUnauthorized });
+
   function recordCompletedReply(reqId, replyPayload) {
     if (completedReqIds.size >= 256) {
       const oldestKey = completedReqIds.keys().next().value;
@@ -3861,16 +3953,22 @@ export function startHostConnector(options = {}) {
   function postJson(endpointPath, payload) {
     return new Promise((resolve, reject) => {
       const target = new URL(endpointPath, `${relayUrl}/`);
-      const mod = target.protocol === 'https:' ? https : http;
-      const bodyBuf = Buffer.from(JSON.stringify(payload), 'utf8');
+      const isHttpsTarget = target.protocol === 'https:';
+      const mod = isHttpsTarget ? https : http;
+      const rawBuf = Buffer.from(JSON.stringify(payload), 'utf8');
+      const useGzip = rawBuf.length >= 2048;
+      const bodyBuf = useGzip ? zlib.gzipSync(rawBuf) : rawBuf;
       const req = mod.request(
         target,
         {
           method: 'POST',
-          ...(target.protocol === 'https:' ? { rejectUnauthorized } : {}),
+          agent: isHttpsTarget ? httpsAgent : httpAgent,
+          ...(isHttpsTarget ? { rejectUnauthorized } : {}),
           headers: {
             'Content-Type': 'application/json; charset=utf-8',
+            ...(useGzip ? { 'Content-Encoding': 'gzip' } : {}),
             'Content-Length': bodyBuf.length,
+            Connection: 'keep-alive',
             'X-OpenDIY-Host-Id': hostId,
             ...(hostSecret ? { 'X-OpenDIY-Host-Secret': hostSecret } : {}),
           },
@@ -3883,6 +3981,7 @@ export function startHostConnector(options = {}) {
           });
         },
       );
+      req.setNoDelay(true);
       req.on('error', reject);
       req.write(bodyBuf);
       req.end();
@@ -4005,6 +4104,8 @@ export function startHostConnector(options = {}) {
         activeReq = null;
       }
       await postJson('/api/relay/disconnect', {}).catch(() => {});
+      try { httpAgent.destroy(); } catch {}
+      try { httpsAgent.destroy(); } catch {}
       await localRuntime.close();
     },
   };
