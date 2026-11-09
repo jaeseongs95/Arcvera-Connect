@@ -13,6 +13,10 @@ export interface SessionInfo {
   projectAssigned?: boolean;
   projectRevision?: number;
   lineBufferedInput?: boolean;
+  model?: string | null;
+  effort?: string | null;
+  modelContextWindow?: number | null;
+  weeklyLeftPercent?: number | null;
 }
 
 export interface Output {

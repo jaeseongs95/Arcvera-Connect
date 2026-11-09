@@ -492,8 +492,19 @@ export function createConversation(options: ConversationOptions) {
       modelDraft = false; effortDraft = false; renderModels();
       if (input.value === draft) input.value = ''; attachments = []; for (const value of sentAttachments) stagedPaths.delete(value.path); renderAttachments();
       if (alive(version)) status('전송했습니다.', 'Sent.');
-    } catch {
-      if (!disposed && !deleted) { uncertain = true; sendFailed = true; status('전송 결과를 확인하지 못했습니다. 자동으로 다시 보내지 않습니다. 초안을 보존했습니다. 연결과 진행 중인 요청을 확인해 주세요.', 'Send result is unknown. It will not be resent automatically. Your draft is preserved. Check the connection and any pending requests.'); }
+    } catch (error) {
+      if (!disposed && !deleted) {
+        sendFailed = true;
+        const detail = error instanceof Error ? error.message : String(error ?? '');
+        status(
+          detail
+            ? `전송하지 못했습니다: ${detail}. 초안을 보존했습니다.`
+            : '전송 결과를 확인하지 못했습니다. 자동으로 다시 보내지 않습니다. 초안을 보존했습니다. 연결과 진행 중인 요청을 확인해 주세요.',
+          detail
+            ? `Could not send: ${detail}. Your draft is preserved.`
+            : 'Send result is unknown. It will not be resent automatically. Your draft is preserved. Check the connection and any pending requests.',
+        );
+      }
     } finally { sending = false; if (!disposed) { renderAttachments(); updateControls(); } }
   }
   async function interrupt() {

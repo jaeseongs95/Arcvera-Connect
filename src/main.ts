@@ -115,6 +115,56 @@ if (typeof document !== 'undefined' && document.head && !document.getElementById
   extraStyle.id = 'opendiy-remote-ui-styles';
   extraStyle.textContent = `
     .terminal-card { position: relative; }
+    .terminal-pinned-dock {
+      flex-shrink: 0;
+      margin: 0 12px;
+      padding: 6px 2px 5px;
+      border-top: 1px solid #242a36;
+      background: #141820;
+      font-family: "Cascadia Code", "Cascadia Mono", Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.45;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      cursor: text;
+      user-select: none;
+    }
+    .terminal-pinned-dock[hidden] { display: none !important; }
+    .terminal-pinned-prompt {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      min-height: 18px;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .terminal-pinned-chevron {
+      color: #af87ff;
+      font-weight: 600;
+      flex-shrink: 0;
+    }
+    .terminal-pinned-input {
+      color: #ced5e3;
+    }
+    .terminal-pinned-input.is-placeholder {
+      color: #6b768d;
+    }
+    .terminal-pinned-status {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 5px;
+      font-size: 11px;
+      min-height: 16px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .terminal-pinned-model { color: #ffaf00; }
+    .terminal-pinned-sep, .terminal-pinned-window { color: #6b768d; }
+    .terminal-pinned-title { color: #af87ff; }
+    .terminal-pinned-weekly { color: #ffaf00; }
     .terminal-host, .terminal-host .xterm, .terminal-host .xterm-viewport, .terminal-host .xterm-screen {
       touch-action: pan-y;
       -webkit-overflow-scrolling: touch;
@@ -735,6 +785,70 @@ function getFilteredSlashItems(view: TerminalView): SlashCommandItem[] {
   return source.filter(item => item.command.toLowerCase().startsWith(q) || item.description.toLowerCase().includes(q.slice(1))).slice(0, 20);
 }
 
+function renderPinnedDock(id: string) {
+  const session = sessions.get(id);
+  const view = terminals.get(id);
+  if (!session || !view) return;
+  const dock = view.card.querySelector<HTMLElement>('.terminal-pinned-dock');
+  if (!dock) return;
+  const convHost = view.card.querySelector<HTMLElement>('.conversation-host');
+  const showingConversation = Boolean(convHost && !convHost.hidden);
+  const shouldShow = Boolean(remoteMode && session.lineBufferedInput && !showingConversation);
+  dock.hidden = !shouldShow;
+  if (!shouldShow) return;
+
+  const inputEl = dock.querySelector<HTMLElement>('.terminal-pinned-input')!;
+  const currentInput = `${view.localLineBuffer}${view.compositionText}`;
+  if (currentInput) {
+    inputEl.textContent = currentInput;
+    inputEl.classList.remove('is-placeholder');
+  } else {
+    inputEl.textContent = 'Ask Codex to do anything';
+    inputEl.classList.add('is-placeholder');
+  }
+
+  const statusEl = dock.querySelector<HTMLElement>('.terminal-pinned-status')!;
+  const modelLabel = session.model || 'GPT-6.1-Sol';
+  const effortLabel = session.effort || 'high';
+  const winK = Math.round(Number(session.modelContextWindow || 380000) / 1000);
+  const weeklyLeft =
+    typeof session.weeklyLeftPercent === 'number' && Number.isFinite(session.weeklyLeftPercent)
+      ? session.weeklyLeftPercent
+      : null;
+
+  statusEl.replaceChildren();
+  const modelSpan = document.createElement('span');
+  modelSpan.className = 'terminal-pinned-model';
+  modelSpan.textContent = `${modelLabel} ${effortLabel}`;
+
+  const sep1 = document.createElement('span');
+  sep1.className = 'terminal-pinned-sep';
+  sep1.textContent = '·';
+
+  const titleSpan = document.createElement('span');
+  titleSpan.className = 'terminal-pinned-title';
+  titleSpan.textContent = session.title || 'session';
+
+  const sep2 = document.createElement('span');
+  sep2.className = 'terminal-pinned-sep';
+  sep2.textContent = '·';
+
+  const winSpan = document.createElement('span');
+  winSpan.className = 'terminal-pinned-window';
+  winSpan.textContent = `${winK}K window`;
+
+  statusEl.append(modelSpan, sep1, titleSpan, sep2, winSpan);
+  if (weeklyLeft !== null) {
+    const sep3 = document.createElement('span');
+    sep3.className = 'terminal-pinned-sep';
+    sep3.textContent = '·';
+    const weeklySpan = document.createElement('span');
+    weeklySpan.className = 'terminal-pinned-weekly';
+    weeklySpan.textContent = `weekly ${weeklyLeft}% left`;
+    statusEl.append(sep3, weeklySpan);
+  }
+}
+
 function hideSlashMenu(id: string) {
   const view = terminals.get(id);
   if (!view) return;
@@ -750,6 +864,7 @@ function applySlashCommandSelection(id: string, item: SlashCommandItem) {
   view.compositionText = '';
   if (oldCells > 0) view.terminal.write(terminalEraseCells(oldCells));
   hideSlashMenu(id);
+  renderPinnedDock(id);
 
   if (item.action === 'clear') {
     view.terminal.write('\x1b[2J\x1b[H\x1b[38;5;141m›\x1b[0m ');
@@ -771,6 +886,7 @@ function applySlashCommandSelection(id: string, item: SlashCommandItem) {
     const nextBuf = `${item.command} `;
     view.localLineBuffer = nextBuf;
     view.terminal.write(nextBuf);
+    renderPinnedDock(id);
     return;
   }
   view.terminal.write(`${item.command}\r\n`);
@@ -851,6 +967,7 @@ function sendInput(id: string, data: string) {
         hideSlashMenu(id);
         localEcho += '\r\n';
         const trimmedLine = line.trim();
+        renderPinnedDock(id);
         if (trimmedLine === '/clear') {
           view.terminal.write('\x1b[2J\x1b[H\x1b[38;5;141m›\x1b[0m ');
           return;
@@ -879,6 +996,7 @@ function sendInput(id: string, data: string) {
     if (localEcho) {
       view.terminal.write(localEcho);
     }
+    renderPinnedDock(id);
     if (view.localLineBuffer.startsWith('/')) {
       void ensureSlashCommandsLoaded(id);
       renderSlashMenu(id);
@@ -937,11 +1055,13 @@ function mountConversation(session: Session) {
       await conversation!.setForeground(!card.hidden && !document.hidden && nativeWindowVisible);
       card.querySelector<HTMLElement>('.terminal-host')!.hidden = show;
       toggle.setAttribute('aria-pressed', String(show));
+      renderPinnedDock(session.id);
       if (!show) { fit.fit(); terminal.focus(); }
     } catch (error) {
       const showingConversation = !conversationHost.hidden;
       card.querySelector<HTMLElement>('.terminal-host')!.hidden = showingConversation;
       toggle.setAttribute('aria-pressed', String(showingConversation));
+      renderPinnedDock(session.id);
       notify('보기를 전환하지 못했습니다. 현재 화면과 작성 중인 내용을 확인한 뒤 다시 시도하세요.', true, 'Could not switch views. Check the current view and your draft before trying again.');
     }
     finally { toggle.disabled = false; }
@@ -956,7 +1076,7 @@ function mountConversation(session: Session) {
 
 function createTerminal(session: Session) {
   const card = document.createElement('article'); card.className = 'terminal-card'; card.dataset.id = session.id;
-  card.innerHTML = `<header class="terminal-header"><span class="drag-handle" draggable="true" title="드래그로 순서 변경" aria-hidden="true">⠿</span><span class="terminal-title"></span><span class="session-compaction" role="status" hidden></span><span class="session-state"></span><div class="card-actions"><button class="session-id-copy icon-button" type="button" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="12" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></svg></button><span class="context-controls"></span><button class="subagents-open icon-button" type="button" aria-haspopup="dialog" aria-controls="subagents-dialog"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="5" r="3"/><circle cx="5" cy="19" r="3"/><circle cx="19" cy="19" r="3"/><path d="M12 8v4M5 16v-4h14v4"/></svg></button><button class="cron-open icon-button" type="button" aria-haspopup="dialog" aria-controls="cron-dialog"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 6v6l4 2"/></svg></button><button class="conversation-toggle icon-button" type="button" aria-label="대화 보기" title="대화 / 터미널">☷</button><button class="maximize icon-button" aria-label="세션 최대화" title="세션 최대화">⛶</button><button class="session-restart icon-button" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M20 12a8 8 0 1 0-2.3 5.7"/></svg></button><button class="stop icon-button" aria-label="이 세션 종료" title="이 세션 종료">×</button></div></header><div class="terminal-path"></div><div class="terminal-host"></div><div class="terminal-footer"><span class="terminal-identity"></span><span class="terminal-hint">Shift+드래그 선택 · Ctrl+C 복사 · Ctrl+V 붙여넣기</span></div>`;
+  card.innerHTML = `<header class="terminal-header"><span class="drag-handle" draggable="true" title="드래그로 순서 변경" aria-hidden="true">⠿</span><span class="terminal-title"></span><span class="session-compaction" role="status" hidden></span><span class="session-state"></span><div class="card-actions"><button class="session-id-copy icon-button" type="button" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="12" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></svg></button><span class="context-controls"></span><button class="subagents-open icon-button" type="button" aria-haspopup="dialog" aria-controls="subagents-dialog"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="5" r="3"/><circle cx="5" cy="19" r="3"/><circle cx="19" cy="19" r="3"/><path d="M12 8v4M5 16v-4h14v4"/></svg></button><button class="cron-open icon-button" type="button" aria-haspopup="dialog" aria-controls="cron-dialog"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 6v6l4 2"/></svg></button><button class="conversation-toggle icon-button" type="button" aria-label="대화 보기" title="대화 / 터미널">☷</button><button class="maximize icon-button" aria-label="세션 최대화" title="세션 최대화">⛶</button><button class="session-restart icon-button" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M20 12a8 8 0 1 0-2.3 5.7"/></svg></button><button class="stop icon-button" aria-label="이 세션 종료" title="이 세션 종료">×</button></div></header><div class="terminal-path"></div><div class="terminal-host"></div><div class="terminal-pinned-dock" role="region" aria-label="고정 프롬프트 및 세션 상태" hidden><div class="terminal-pinned-prompt"><span class="terminal-pinned-chevron" aria-hidden="true">›</span><span class="terminal-pinned-input is-placeholder">Ask Codex to do anything</span></div><div class="terminal-pinned-status"></div></div><div class="terminal-footer"><span class="terminal-identity"></span><span class="terminal-hint">Shift+드래그 선택 · Ctrl+C 복사 · Ctrl+V 붙여넣기</span></div>`;
   localizeMarkup(card);
   const terminal = new Terminal({ fontFamily: '"Cascadia Code", "Cascadia Mono", Consolas, monospace', fontSize: 12, lineHeight: 1.45, cursorBlink: true, scrollback: 10000, disableStdin: !native, allowProposedApi: false, theme: { background: '#141820', foreground: '#ced5e3', cursor: '#a5b4fc', selectionBackground: '#3b4567', black: '#212735', red: '#f78b99', green: '#91d6ad', yellow: '#eac184', blue: '#8eaafb', magenta: '#c4a4f3', cyan: '#87cfd9', white: '#e3e8f0' } });
   const fit = new FitAddon(); const search = new SearchAddon(); terminal.loadAddon(fit); terminal.loadAddon(search);
@@ -1007,6 +1127,14 @@ function createTerminal(session: Session) {
   terminal.onResize(() => queueResize(session.id));
 
   const termHost = card.querySelector<HTMLElement>('.terminal-host')!;
+  const pinnedDock = card.querySelector<HTMLElement>('.terminal-pinned-dock');
+  if (pinnedDock) {
+    pinnedDock.addEventListener('pointerdown', event => {
+      event.preventDefault();
+      setActive(session.id, false);
+      terminal.focus();
+    });
+  }
   const xtermTextarea = termHost.querySelector<HTMLTextAreaElement>('textarea.xterm-helper-textarea');
   if (xtermTextarea) {
     xtermTextarea.addEventListener('compositionstart', () => {
@@ -1025,12 +1153,14 @@ function createTerminal(session: Session) {
       if (prevCells > 0 || nextText) {
         terminal.write(terminalEraseCells(prevCells) + nextText);
       }
+      renderPinnedDock(session.id);
     });
     xtermTextarea.addEventListener('compositionend', (event: CompositionEvent) => {
       const current = sessions.get(session.id);
       if (!remoteMode || !current?.lineBufferedInput || !canType(session.id) || conversationOwners.has(session.id)) {
         viewObj.composing = false;
         viewObj.compositionText = '';
+        renderPinnedDock(session.id);
         return;
       }
       const prevCells = terminalDisplayCells(viewObj.compositionText);
@@ -1051,6 +1181,7 @@ function createTerminal(session: Session) {
           hideSlashMenu(session.id);
         }
       }
+      renderPinnedDock(session.id);
     });
   }
 
@@ -1107,6 +1238,7 @@ function createTerminal(session: Session) {
             viewObj.localLineBuffer = completed;
             terminal.write(terminalEraseCells(oldCells) + completed);
             hideSlashMenu(session.id);
+            renderPinnedDock(session.id);
           }
           return false;
         }
@@ -1456,6 +1588,7 @@ function renderAll() {
     const index = String(order.indexOf(id) + 1).padStart(2, '0'); bindText(identity, `${index}  ·  ${demo ? 'DEMO · 실제 세션 아님' : session.threadId ? `스레드 ${session.threadId.slice(0, 12)}` : '로컬 세션'}`, `${index}  ·  ${demo ? 'DEMO · example session' : session.threadId ? `Thread ${session.threadId.slice(0, 12)}` : 'Local session'}`);
     identity.title = session.threadId ?? '';
     card.classList.toggle('focused', id === active);
+    renderPinnedDock(id);
   }
   renderCounts(); renderSide(); renderGrid();
 }

@@ -1445,11 +1445,15 @@ test('Auto-update (T-0003) and live session state sync / Desktop parity (D-0008)
         return body.result;
       };
 
-      // A. D-0008: Session with commentary message + custom_tool_call is 'running', NOT 'idle'!
+      // A. D-0008 & D-0011: Session with commentary message + custom_tool_call is 'running', NOT 'idle', and exposes pinned dock metadata!
       const sessionsList = await invokeRelay('list_sessions');
       assert.equal(sessionsList.length, 1);
       assert.equal(sessionsList[0].id, 'sess-desktop-live');
       assert.equal(sessionsList[0].state, 'running');
+      assert.equal(sessionsList[0].model, 'GPT-6.1-Sol');
+      assert.equal(sessionsList[0].effort, 'high');
+      assert.equal(sessionsList[0].modelContextWindow, 285000);
+      assert.equal(sessionsList[0].weeklyLeftPercent, 10);
 
       // B. Desktop Parity: contextStatus returns last_token_usage.total_tokens (176700 / 285000 = 62%) and connected=true
       const ctxStatus = await invokeRelay('conversation_request', {
@@ -1505,13 +1509,41 @@ test('Auto-update (T-0003) and live session state sync / Desktop parity (D-0008)
       assert.equal(cronList.supported, true);
       assert.equal(cronList.connected, true);
 
-      const convSend = await invokeRelay('conversation_request', {
-        id: 'sess-desktop-live',
-        generation: 1,
-        request: { type: 'send', text: '미러링 대화 전송 테스트' },
+      // D-0009: Sending a regular prompt when app-server is disconnected and no PTY exists must NOT fabricate a fake assistant echo ('전달됨:')
+      const failSendRes = await fetch(`${relayBase}/api/invoke`, {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer tok-parity',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          command: 'conversation_request',
+          args: {
+            id: 'sess-desktop-live',
+            generation: 1,
+            request: { type: 'send', text: '오프라인 가짜 응답 방지 검증' },
+          },
+        }),
       });
-      assert.equal(convSend.status, 'completed');
-      assert.ok(Array.isArray(convSend.items) && convSend.items.length >= 2);
+      const failSendBody = await failSendRes.json();
+      assert.equal(failSendBody.ok, false);
+      assert.match(String(failSendBody.error || ''), /app-server가 연결되어 있지 않습니다/);
+
+      // Non-mirrored offline session (no process, no appServer) must return connected=false even if it has historical turns/tokens
+      const offlineStarted = await invokeRelay('start_session', {
+        request: { title: '비미러링 세션', cwd: projCwd, threadId: 'thread-desktop-live' },
+      });
+      // Since thread-desktop-live is already active on sess-desktop-live, start a distinct non-mirrored session
+      const offlineNonMirrored = await invokeRelay('start_session', {
+        request: { title: '오프라인 비미러링', cwd: projCwd },
+      });
+      assert.equal(Boolean(offlineStarted.id), true);
+      const offlinePoll = await invokeRelay('conversation_request', {
+        id: offlineNonMirrored.id,
+        generation: offlineNonMirrored.generation,
+        request: { type: 'poll' },
+      });
+      assert.equal(offlinePoll.connected, false);
 
       // E. T-0003: check_for_updates and apply_update across Relay + Host Connector
       const updateCheck = await invokeRelay('check_for_updates');

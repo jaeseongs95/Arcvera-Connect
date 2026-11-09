@@ -486,6 +486,21 @@ test('relay + host connector mode renders mirrored desktop terminal rollout on i
     await expect(card.locator('.xterm-rows')).toContainText('중단된 지점부터 이어서 작업해줘.');
     await expect(card.locator('.xterm-rows')).toContainText('릴레이 미러링 복원 완료했습니다.');
 
+    // D-0011: Pinned prompt ('› Ask Codex to do anything') and status line are fixed in .terminal-pinned-dock outside scrolling .xterm-rows
+    const pinnedDock = card.locator('.terminal-pinned-dock');
+    await expect(pinnedDock).toBeVisible();
+    await expect(pinnedDock.locator('.terminal-pinned-input')).toHaveText('Ask Codex to do anything');
+    await expect(pinnedDock.locator('.terminal-pinned-status')).toContainText('gpt-5.4 xhigh');
+    await expect(pinnedDock.locator('.terminal-pinned-status')).toContainText('desktop 담당');
+    await expect(pinnedDock.locator('.terminal-pinned-status')).toContainText('285K window');
+    await expect(pinnedDock.locator('.terminal-pinned-status')).toContainText('weekly 10% left');
+    await expect(card.locator('.xterm-rows')).not.toContainText('Ask Codex to do anything');
+    const hostBoxBeforeScroll = await card.locator('.terminal-host').boundingBox();
+    const dockBoxBeforeScroll = await pinnedDock.boundingBox();
+    expect(hostBoxBeforeScroll).not.toBeNull();
+    expect(dockBoxBeforeScroll).not.toBeNull();
+    expect(dockBoxBeforeScroll!.y).toBeGreaterThanOrEqual(hostBoxBeforeScroll!.y + hostBoxBeforeScroll!.height - 2);
+
     // REMOTE-BLKR-06: Stale state="running" in session_metadata is reconciled to "입력 가능" (idle) when latest turn is completed
     await expect(card.locator('.session-state')).toHaveText('입력 가능');
 
@@ -517,10 +532,12 @@ test('relay + host connector mode renders mirrored desktop terminal rollout on i
     await expect(card.locator('.xterm-rows')).toContainText('중단된 지점부터 이어서 작업해줘.');
     await expect(card.locator('.xterm-rows')).toContainText('릴레이 미러링 복원 완료했습니다.');
 
-    // BLKR-01: Typing a command into the mirrored terminal and pressing Enter executes a turn and streams the response
+    // BLKR-01 & D-0011: Typing a command into the mirrored terminal updates the pinned prompt dock live, and pressing Enter resets it to placeholder and executes the turn
     await card.locator('.xterm-helper-textarea').focus();
     await page.keyboard.type('원격 입력 테스트');
+    await expect(pinnedDock.locator('.terminal-pinned-input')).toHaveText('원격 입력 테스트');
     await page.keyboard.press('Enter');
+    await expect(pinnedDock.locator('.terminal-pinned-input')).toHaveText('Ask Codex to do anything');
     await expect(card.locator('.xterm-rows')).toContainText('E2E 릴레이 응답: 원격 입력 테스트');
 
     // D-0004: Typing '/' in remote terminal opens the slash command autocomplete menu and executes '/status'

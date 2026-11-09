@@ -1260,23 +1260,11 @@ function readCodexRolloutSummary(threadId, customCodexHome = null) {
         if (out.latestTurnStatus === 'inProgress' && out.turns.length > 0) {
           out.turns[out.turns.length - 1].status = 'inProgress';
         }
-        const modelLabel = out.model ? out.model.replace(/^gpt-6\.1-sol$/i, 'GPT-6.1-Sol') : 'GPT-6.1-Sol';
-        const effortLabel = out.effort || 'high';
-        const winK = Math.round((out.modelContextWindow || 380000) / 1000);
-        const weeklyUsedPct = out.rateLimits?.primary?.used_percent ?? latestObservedRateLimits?.rateLimits?.primary?.used_percent;
-        const weeklyLeftText = Number.isFinite(Number(weeklyUsedPct))
-          ? ` \x1b[90m·\x1b[0m \x1b[38;5;214mweekly ${Math.max(0, 100 - Math.round(Number(weeklyUsedPct)))}% left\x1b[0m`
-          : '';
         const tailLines = terminalLines.slice(-250);
         if (out.latestTurnStatus === 'inProgress') {
           tailLines.push('');
           tailLines.push('\x1b[38;5;114m• Working (esc 중단)\x1b[0m');
         }
-        tailLines.push('');
-        tailLines.push('\x1b[38;5;141m›\x1b[0m \x1b[90mAsk Codex to do anything\x1b[0m');
-        tailLines.push(
-          `\x1b[38;5;214m${modelLabel} ${effortLabel}\x1b[0m \x1b[90m·\x1b[0m \x1b[38;5;141m${out.title || 'session'}\x1b[0m \x1b[90m· ${winK}K window\x1b[0m${weeklyLeftText}`,
-        );
         out.terminalLines = tailLines;
       }
     }
@@ -2311,15 +2299,14 @@ export function createRemoteServer(options = {}) {
     };
   }
 
-  function isSessionEffectivelyConnected(session, thread = null) {
+  function isSessionEffectivelyConnected(session) {
     if (!session || session.active === false || session.state === 'stopped' || session.state === 'error') {
       return false;
     }
     if (appServerBridge.isConnected() || sessionProcesses.has(session.id)) {
       return true;
     }
-    const turns = thread && Array.isArray(thread.turns) ? thread.turns : [];
-    return Boolean(session.isDesktopMirrored || turns.length > 0 || (thread && Number(thread.usedTokens) > 0));
+    return Boolean(session.isDesktopMirrored);
   }
 
   function handleServerNotification(notification) {
@@ -2380,6 +2367,18 @@ export function createRemoteServer(options = {}) {
 
   function publicSessionInfo(session) {
     const isLineBuffered = Boolean(session.threadId && !sessionProcesses.has(session.id));
+    const thread = session.threadId ? state.threads[session.threadId] : null;
+    const rollout = session.threadId ? readCodexRolloutSummary(session.threadId, codexHomeDir) : null;
+    const rawModel = thread?.model || rollout?.model || null;
+    const modelLabel = rawModel ? String(rawModel).replace(/^gpt-6\.1-sol$/i, 'GPT-6.1-Sol') : 'GPT-6.1-Sol';
+    const effortLabel = String(thread?.effort || rollout?.effort || 'high');
+    const modelContextWindow = Number(thread?.modelContextWindow || rollout?.modelContextWindow || 380000);
+    const weeklyUsedPct =
+      rollout?.rateLimits?.primary?.used_percent ??
+      latestObservedRateLimits?.rateLimits?.primary?.used_percent;
+    const weeklyLeftPercent = Number.isFinite(Number(weeklyUsedPct))
+      ? Math.max(0, 100 - Math.round(Number(weeklyUsedPct)))
+      : null;
     return {
       id: session.id,
       generation: session.generation,
@@ -2391,6 +2390,10 @@ export function createRemoteServer(options = {}) {
       state: session.state,
       active: session.active,
       lineBufferedInput: isLineBuffered,
+      model: modelLabel,
+      effort: effortLabel,
+      modelContextWindow,
+      weeklyLeftPercent,
     };
   }
 
@@ -2765,17 +2768,6 @@ export function createRemoteServer(options = {}) {
               items: [
                 { id: `item-u-${Date.now()}`, type: 'userMessage', role: 'user', text, status: 'completed' },
                 { id: `item-a-${Date.now()}`, type: 'agentMessage', role: 'assistant', text: `터미널 세션에 전달했습니다: ${text}`, status: 'completed' },
-              ],
-            },
-          };
-        } else if (session.isDesktopMirrored || (Array.isArray(thread.turns) && thread.turns.length > 0)) {
-          rpcRes = {
-            turn: {
-              id: `mirrored-${crypto.randomUUID()}`,
-              status: 'completed',
-              items: [
-                { id: `item-u-${Date.now()}`, type: 'userMessage', role: 'user', text, status: 'completed' },
-                { id: `item-a-${Date.now()}`, type: 'agentMessage', role: 'assistant', text: `전달됨: ${text}`, status: 'completed' },
               ],
             },
           };
