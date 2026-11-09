@@ -2772,7 +2772,44 @@ export function createRemoteServer(options = {}) {
             },
           };
         } else {
-          throw new Error('Codex app-server가 연결되어 있지 않습니다.');
+          const settings = computeSettings();
+          if (settings.resolvedPath && threadId) {
+            const turnId = `exec-${crypto.randomUUID()}`;
+            const execArgs = ['exec', 'resume', String(threadId), text];
+            if (session.cwd && fs.existsSync(session.cwd)) {
+              execArgs.unshift('--cd', session.cwd);
+            }
+            const child = spawn(settings.resolvedPath, execArgs, {
+              cwd: session.cwd && fs.existsSync(session.cwd) ? session.cwd : process.cwd(),
+              stdio: ['ignore', 'pipe', 'pipe'],
+              windowsHide: true,
+            });
+            child.stdout?.on('data', chunk => {
+              const outStr = chunk.toString('utf8');
+              if (outStr.trim()) emitTerminalOutput(session, outStr);
+            });
+            child.stderr?.on('data', chunk => {
+              const errStr = chunk.toString('utf8');
+              if (errStr.trim()) emitTerminalOutput(session, errStr);
+            });
+            child.on('exit', () => {
+              if (session.threadId) {
+                emitMirroredSessionSnapshot(session, false);
+              }
+              updateSessionStateIfChanged(session, 'idle');
+            });
+            rpcRes = {
+              turn: {
+                id: turnId,
+                status: 'inProgress',
+                items: [
+                  { id: `item-u-${Date.now()}`, type: 'userMessage', role: 'user', text, status: 'completed' },
+                ],
+              },
+            };
+          } else {
+            throw new Error('Codex app-server가 연결되어 있지 않습니다.');
+          }
         }
       }
 
