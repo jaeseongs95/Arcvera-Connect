@@ -1,4 +1,4 @@
-import { isRemoteBrowser } from './remote-bridge';
+import { isRemoteBrowser, signOutRemote } from './remote-bridge';
 import { createAttachmentStorage } from './attachment-storage';
 import { invoke, isTauri } from './ipc/core';
 import { listen, type UnlistenFn } from './ipc/event';
@@ -808,9 +808,12 @@ function renderPinnedDock(id: string) {
   }
 
   const statusEl = dock.querySelector<HTMLElement>('.terminal-pinned-status')!;
-  const modelLabel = session.model || 'GPT-6.1-Sol';
-  const effortLabel = session.effort || 'high';
-  const winK = Math.round(Number(session.modelContextWindow || 380000) / 1000);
+  const modelLabel = session.model || t('기본 모델', 'default');
+  const effortLabel = session.effort || '';
+  const hasContextWindow =
+    typeof session.modelContextWindow === 'number' &&
+    Number.isFinite(session.modelContextWindow) &&
+    session.modelContextWindow > 0;
   const weeklyLeft =
     typeof session.weeklyLeftPercent === 'number' && Number.isFinite(session.weeklyLeftPercent)
       ? session.weeklyLeftPercent
@@ -819,7 +822,7 @@ function renderPinnedDock(id: string) {
   statusEl.replaceChildren();
   const modelSpan = document.createElement('span');
   modelSpan.className = 'terminal-pinned-model';
-  modelSpan.textContent = `${modelLabel} ${effortLabel}`;
+  modelSpan.textContent = effortLabel ? `${modelLabel} ${effortLabel}` : modelLabel;
 
   const sep1 = document.createElement('span');
   sep1.className = 'terminal-pinned-sep';
@@ -829,15 +832,18 @@ function renderPinnedDock(id: string) {
   titleSpan.className = 'terminal-pinned-title';
   titleSpan.textContent = session.title || 'session';
 
-  const sep2 = document.createElement('span');
-  sep2.className = 'terminal-pinned-sep';
-  sep2.textContent = '·';
+  statusEl.append(modelSpan, sep1, titleSpan);
+  if (hasContextWindow) {
+    const winK = Math.round(Number(session.modelContextWindow) / 1000);
+    const sep2 = document.createElement('span');
+    sep2.className = 'terminal-pinned-sep';
+    sep2.textContent = '·';
 
-  const winSpan = document.createElement('span');
-  winSpan.className = 'terminal-pinned-window';
-  winSpan.textContent = `${winK}K window`;
-
-  statusEl.append(modelSpan, sep1, titleSpan, sep2, winSpan);
+    const winSpan = document.createElement('span');
+    winSpan.className = 'terminal-pinned-window';
+    winSpan.textContent = `${winK}K window`;
+    statusEl.append(sep2, winSpan);
+  }
   if (weeklyLeft !== null) {
     const sep3 = document.createElement('span');
     sep3.className = 'terminal-pinned-sep';
@@ -1974,7 +1980,7 @@ function resetExitRecovery() { unconfirmedExitButton.hidden = true; $('#unconfir
 function openExitDialog() { if (!exitDialog.open) { resetExitRecovery(); exitDialog.showModal(); } }
 $('#exit').onclick = () => {
   if (remoteMode) {
-    window.location.href = '/auth/logout';
+    signOutRemote();
     return;
   }
   openExitDialog();

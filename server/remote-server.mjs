@@ -230,7 +230,8 @@ export async function performSelfUpdate(options = {}) {
 
     try {
       fs.writeFileSync(archivePath, bundleBuf);
-      execFileSync('tar', ['-xzf', archivePath, '-C', extractDir], {
+      execFileSync('tar', ['-xzf', 'bundle.tar.gz', '-C', 'extracted'], {
+        cwd: tmpStageDir,
         stdio: 'pipe',
         timeout: 30000,
         windowsHide: true,
@@ -292,7 +293,7 @@ export async function performSelfUpdate(options = {}) {
         const restartDelayMs = Math.max(100, Number(options.restartDelayMs || 600));
         const timer = setTimeout(() => {
           if (typeof options.onRestart === 'function') {
-            options.onRestart();
+            Promise.resolve(options.onRestart()).catch(() => {});
             return;
           }
           if (process.env.INVOCATION_ID || process.env.OPENDIY_REMOTE_MANAGED_RESTART === '1') {
@@ -375,6 +376,53 @@ export function verifyToken(expectedSha256, provided) {
   return actual.length === expectedSha256.length && crypto.timingSafeEqual(actual, expectedSha256);
 }
 
+export function isPathInsideDir(baseDir, candidatePath, { allowBase = false } = {}) {
+  if (!baseDir || !candidatePath) return false;
+  const resolvedBase = path.resolve(String(baseDir));
+  const resolvedCandidate = path.resolve(String(candidatePath));
+  const rel = path.relative(resolvedBase, resolvedCandidate);
+  if (rel === '') return Boolean(allowBase);
+  return !rel.startsWith('..') && !path.isAbsolute(rel);
+}
+
+export function parseBindAddress(rawBind, defaultHost = '127.0.0.1', defaultPort = 3210) {
+  const trimmed = String(rawBind ?? '').trim();
+  if (!trimmed) return { host: defaultHost, port: defaultPort };
+  if (trimmed.startsWith('[')) {
+    const closeIdx = trimmed.indexOf(']');
+    if (closeIdx !== -1) {
+      const ipv6Host = trimmed.slice(1, closeIdx) || defaultHost;
+      const remainder = trimmed.slice(closeIdx + 1);
+      if (remainder.startsWith(':')) {
+        const parsedPort = Number.parseInt(remainder.slice(1), 10);
+        if (Number.isSafeInteger(parsedPort) && parsedPort >= 0 && parsedPort <= 65535) {
+          return { host: ipv6Host, port: parsedPort };
+        }
+      }
+      return { host: ipv6Host, port: defaultPort };
+    }
+  }
+  const firstColon = trimmed.indexOf(':');
+  const lastColon = trimmed.lastIndexOf(':');
+  if (firstColon !== -1 && firstColon === lastColon) {
+    const hostPart = trimmed.slice(0, lastColon) || defaultHost;
+    const portPart = Number.parseInt(trimmed.slice(lastColon + 1), 10);
+    if (Number.isSafeInteger(portPart) && portPart >= 0 && portPart <= 65535) {
+      return { host: hostPart, port: portPart };
+    }
+  }
+  return { host: trimmed, port: defaultPort };
+}
+
+function isRequestHttps(req, useTls = false) {
+  if (useTls) return true;
+  const forwardedProto = String(req?.headers?.['x-forwarded-proto'] || '')
+    .split(',')[0]
+    .trim()
+    .toLowerCase();
+  return forwardedProto === 'https';
+}
+
 function parseCookies(cookieHeader) {
   const out = {};
   if (!cookieHeader || typeof cookieHeader !== 'string') return out;
@@ -412,6 +460,96 @@ function findExecutableInPath(names) {
 
 function getCodexHome() {
   return process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+}
+
+const codexRuntimeDefaultsCache = new Map(); // codexHome -> { configMtimeMs, modelsMtimeMs, data }
+
+function readCodexRuntimeDefaults(customCodexHome = null) {
+  const home = path.resolve(customCodexHome || getCodexHome());
+  const configPath = path.join(home, 'config.toml');
+  const modelsCachePath = path.join(home, 'models_cache.json');
+  let configMtimeMs = -1;
+  let modelsMtimeMs = -1;
+  try {
+    if (fs.existsSync(configPath)) configMtimeMs = fs.statSync(configPath).mtimeMs;
+  } catch {}
+  try {
+    if (fs.existsSync(modelsCachePath)) modelsMtimeMs = fs.statSync(modelsCachePath).mtimeMs;
+  } catch {}
+
+  const cached = codexRuntimeDefaultsCache.get(home);
+  if (cached && cached.configMtimeMs === configMtimeMs && cached.modelsMtimeMs === modelsMtimeMs) {
+    return cached.data;
+  }
+
+  let configuredModel = null;
+  let configuredEffort = null;
+  let configuredContextWindow = null;
+  if (configMtimeMs >= 0) {
+    try {
+      const rawToml = fs.readFileSync(configPath, 'utf8');
+      let inSection = false;
+      for (const rawLine of rawToml.split(/\r?\n/)) {
+        const line = rawLine.replace(/#.*$/, '').trim();
+        if (!line) continue;
+        if (line.startsWith('[')) {
+          inSection = true;
+          continue;
+        }
+        if (inSection) continue;
+        const mStr = /^([a-zA-Z0-9_]+)\s*=\s*["']([^"']+)["']$/.exec(line);
+        if (mStr) {
+          if (mStr[1] === 'model') configuredModel = mStr[2].trim();
+          else if (mStr[1] === 'model_reasoning_effort') configuredEffort = mStr[2].trim();
+          continue;
+        }
+        const mNum = /^([a-zA-Z0-9_]+)\s*=\s*([0-9_]+)$/.exec(line);
+        if (mNum && mNum[1] === 'model_context_window') {
+          const parsed = Number(mNum[2].replace(/_/g, ''));
+          if (Number.isSafeInteger(parsed) && parsed > 0) configuredContextWindow = parsed;
+        }
+      }
+    } catch {}
+  }
+
+  const modelsBySlug = new Map();
+  let defaultCachedSlug = null;
+  if (modelsMtimeMs >= 0) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(modelsCachePath, 'utf8'));
+      const list = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.models) ? parsed.models : [];
+      for (const item of list) {
+        if (!item || typeof item !== 'object') continue;
+        const slug = String(item.slug || item.id || item.model || '').trim();
+        if (!slug) continue;
+        const displayName = String(item.display_name || item.displayName || item.label || slug).trim();
+        const contextWindowRaw = Number(item.context_window ?? item.contextWindow ?? item.modelContextWindow ?? 0);
+        const contextWindow = Number.isSafeInteger(contextWindowRaw) && contextWindowRaw > 0 ? contextWindowRaw : null;
+        const defaultEffort = item.default_reasoning_level || item.defaultReasoningEffort || null;
+        modelsBySlug.set(slug.toLowerCase(), {
+          slug,
+          displayName: displayName || slug,
+          contextWindow,
+          defaultEffort: defaultEffort ? String(defaultEffort) : null,
+        });
+        if (!defaultCachedSlug) defaultCachedSlug = slug;
+      }
+    } catch {}
+  }
+
+  const data = {
+    configuredModel,
+    configuredEffort,
+    configuredContextWindow,
+    defaultCachedSlug,
+    modelsBySlug,
+  };
+  if (codexRuntimeDefaultsCache.size >= 32) {
+    const oldest = codexRuntimeDefaultsCache.keys().next().value;
+    if (oldest !== undefined) codexRuntimeDefaultsCache.delete(oldest);
+  }
+  codexRuntimeDefaultsCache.set(home, { configMtimeMs, modelsMtimeMs, data });
+  return data;
 }
 
 function resolveCodexBinary(savedPath, allowPathDiscovery = true, customCodexHome = null) {
@@ -939,7 +1077,7 @@ function readCodexRolloutSummary(threadId, customCodexHome = null) {
       effort: row.reasoning_effort ? String(row.reasoning_effort) : null,
       usedTokens: 0,
       cumulativeTokens: Number(row.tokens_used || 0),
-      modelContextWindow: 380000,
+      modelContextWindow: null,
       rateLimits: null,
       createdAt: Number(row.created_at || Math.floor(Date.now() / 1000)),
       updatedAt: Number(row.updated_at || Math.floor(Date.now() / 1000)),
@@ -1243,7 +1381,8 @@ function readCodexRolloutSummary(threadId, customCodexHome = null) {
             // Skip truncated or unparseable JSONL line.
           }
         }
-        if (out.usedTokens === 0 && out.cumulativeTokens > 0 && out.cumulativeTokens <= out.modelContextWindow * 2) {
+        const fallbackWindowBound = out.modelContextWindow || 256000;
+        if (out.usedTokens === 0 && out.cumulativeTokens > 0 && out.cumulativeTokens <= fallbackWindowBound * 2) {
           out.usedTokens = out.cumulativeTokens;
         }
         if (sawActivitySinceCompletion) {
@@ -1268,7 +1407,12 @@ function readCodexRolloutSummary(threadId, customCodexHome = null) {
         out.terminalLines = tailLines;
       }
     }
-    rolloutSummaryCache.set(String(threadId), {
+    const cacheKey = String(threadId);
+    if (!rolloutSummaryCache.has(cacheKey) && rolloutSummaryCache.size >= 256) {
+      const oldestKey = rolloutSummaryCache.keys().next().value;
+      if (oldestKey !== undefined) rolloutSummaryCache.delete(oldestKey);
+    }
+    rolloutSummaryCache.set(cacheKey, {
       rolloutPath,
       size: st ? st.size : 0,
       mtimeMs: st ? st.mtimeMs : 0,
@@ -1946,9 +2090,21 @@ export function createRemoteServer(options = {}) {
   }
 
   const authRateMap = new Map();
-  function checkAndRecordAuth(ip, valid) {
+  function checkAndRecordAuth(ip, valid, hasCredential = true) {
     if (!tokenSha256 && !hostSecretSha256 && !googleOAuthEnabled) return { allowed: true };
     const now = Date.now();
+    if (authRateMap.size >= 1024) {
+      for (const [key, entry] of authRateMap) {
+        if (entry.lockedUntil <= now && now - entry.firstFailedAt > AUTH_WINDOW_MS) {
+          authRateMap.delete(key);
+        }
+      }
+      while (authRateMap.size >= 4096) {
+        const oldestKey = authRateMap.keys().next().value;
+        if (oldestKey === undefined) break;
+        authRateMap.delete(oldestKey);
+      }
+    }
     let record = authRateMap.get(ip);
     if (record && record.lockedUntil > now) {
       return { allowed: false, locked: true };
@@ -1956,6 +2112,9 @@ export function createRemoteServer(options = {}) {
     if (valid) {
       authRateMap.delete(ip);
       return { allowed: true };
+    }
+    if (!hasCredential) {
+      return { allowed: false, locked: false };
     }
     if (!record || now - record.firstFailedAt > AUTH_WINDOW_MS) {
       record = { count: 1, firstFailedAt: now, lockedUntil: 0 };
@@ -2050,6 +2209,9 @@ export function createRemoteServer(options = {}) {
   const sseClients = new Set();
   const relayTerminalBuffers = new Map(); // sessionId -> { id, generation, seq, data }
   function broadcast(event, payload) {
+    if (event === 'session-changed' && payload && typeof payload === 'object' && payload.active === false && payload.id) {
+      relayTerminalBuffers.delete(String(payload.id));
+    }
     if (event === 'terminal-output' && payload && typeof payload === 'object' && payload.id) {
       const sid = String(payload.id);
       const chunk = String(payload.data ?? '');
@@ -2057,6 +2219,10 @@ export function createRemoteServer(options = {}) {
       let nextData = chunk;
       if (prev && prev.generation === payload.generation && !chunk.includes('\x1b[2J')) {
         nextData = (prev.data + chunk).slice(-262144);
+      }
+      if (!relayTerminalBuffers.has(sid) && relayTerminalBuffers.size >= 128) {
+        const oldestSid = relayTerminalBuffers.keys().next().value;
+        if (oldestSid !== undefined) relayTerminalBuffers.delete(oldestSid);
       }
       relayTerminalBuffers.set(sid, {
         id: sid,
@@ -2087,11 +2253,123 @@ export function createRemoteServer(options = {}) {
 
   const sessions = new Map();
   const sessionProcesses = new Map();
+  const execTurnProcesses = new Map(); // sessionId -> Map<turnId, ChildProcess>
   const pendingQuestions = new Map();
   const cronJobsByThread = new Map();
   const cronTimers = new Map();
   let cronJobSeq = 1;
   let sessionSeq = 1;
+  let cachedModelsResult = null;
+  let cachedModelsAt = 0;
+  const allowPathDiscovery = options.allowPathDiscovery !== false && process.env.OPENDIY_REMOTE_NO_PATH_DISCOVERY !== '1';
+
+  function resolveSessionModelMeta(thread = null, rollout = null) {
+    const defaults =
+      codexHomeDir || allowPathDiscovery
+        ? readCodexRuntimeDefaults(codexHomeDir)
+        : {
+            configuredModel: null,
+            configuredEffort: null,
+            configuredContextWindow: null,
+            defaultCachedSlug: null,
+            modelsBySlug: new Map(),
+          };
+    const rawModel =
+      thread?.model ||
+      rollout?.model ||
+      defaults.configuredModel ||
+      defaults.defaultCachedSlug ||
+      null;
+    let modelLabel = rawModel ? String(rawModel) : null;
+    let modelMeta = null;
+    if (rawModel) {
+      const lower = String(rawModel).toLowerCase();
+      modelMeta = defaults.modelsBySlug.get(lower) || null;
+      const rpcList = Array.isArray(cachedModelsResult?.models) ? cachedModelsResult.models : [];
+      const rpcMatch = rpcList.find(
+        m =>
+          m &&
+          typeof m === 'object' &&
+          String(m.id || m.slug || m.model || '').toLowerCase() === lower,
+      );
+      if (rpcMatch) {
+        const rpcLabel = String(rpcMatch.displayName || rpcMatch.display_name || rpcMatch.label || '').trim();
+        if (rpcLabel) modelLabel = rpcLabel;
+      } else if (modelMeta?.displayName) {
+        modelLabel = modelMeta.displayName;
+      }
+    }
+    const effortLabel = String(
+      thread?.effort ||
+        rollout?.effort ||
+        modelMeta?.defaultEffort ||
+        defaults.configuredEffort ||
+        'high',
+    );
+    const windowCandidates = [
+      thread?.modelContextWindow,
+      rollout?.modelContextWindow,
+      modelMeta?.contextWindow,
+      defaults.configuredContextWindow,
+    ];
+    let modelContextWindow = null;
+    for (const candidate of windowCandidates) {
+      const n = Number(candidate);
+      if (Number.isSafeInteger(n) && n > 0) {
+        modelContextWindow = n;
+        break;
+      }
+    }
+    return {
+      rawModel: rawModel ? String(rawModel) : null,
+      modelLabel,
+      effortLabel,
+      modelContextWindow,
+    };
+  }
+
+  async function terminateExecTurnsForSession(sessionId) {
+    const map = execTurnProcesses.get(String(sessionId));
+    if (!map || map.size === 0) return;
+    execTurnProcesses.delete(String(sessionId));
+    const procs = [...map.values()];
+    map.clear();
+    await Promise.all(procs.map(terminateChildProcess));
+  }
+
+  async function cleanupStoppedSessionResources(session) {
+    if (!session) return;
+    relayTerminalBuffers.delete(String(session.id));
+    for (const [key, q] of pendingQuestions) {
+      if (q.sessionId === session.id) {
+        pendingQuestions.delete(key);
+      }
+    }
+    await terminateExecTurnsForSession(session.id);
+    const sessionJobs = cronJobsByThread.get(String(session.id));
+    if (sessionJobs) {
+      for (const job of sessionJobs) {
+        job.removed = true;
+        clearCronTimer(job.id);
+      }
+      cronJobsByThread.delete(String(session.id));
+    }
+    if (session.threadId) {
+      const otherActiveUsesSameThread = [...sessions.values()].some(
+        s => s.id !== session.id && s.active && s.threadId === session.threadId,
+      );
+      if (!otherActiveUsesSameThread) {
+        const threadJobs = cronJobsByThread.get(String(session.threadId));
+        if (threadJobs) {
+          for (const job of threadJobs) {
+            job.removed = true;
+            clearCronTimer(job.id);
+          }
+          cronJobsByThread.delete(String(session.threadId));
+        }
+      }
+    }
+  }
 
   function resolveMirroredSessionState(session, rollout = null, thread = null, desktopMetaState = null) {
     if (!session) return 'idle';
@@ -2204,8 +2482,8 @@ export function createRemoteServer(options = {}) {
           updatedAt: rollout.updatedAt,
           model: rollout.model,
           effort: rollout.effort,
-          modelContextWindow: rollout.modelContextWindow || 380000,
-          effectiveContextWindow: rollout.modelContextWindow || 380000,
+          modelContextWindow: rollout.modelContextWindow ?? null,
+          effectiveContextWindow: rollout.modelContextWindow || 128000,
           usedTokens: rollout.usedTokens || 0,
           turns: rollout.turns,
           memorySummary: null,
@@ -2286,7 +2564,6 @@ export function createRemoteServer(options = {}) {
       : null;
   desktopWatchInterval?.unref?.();
 
-  const allowPathDiscovery = options.allowPathDiscovery !== false && process.env.OPENDIY_REMOTE_NO_PATH_DISCOVERY !== '1';
   function computeSettings() {
     const cli = resolveCodexBinary(state.codexSavedPath, allowPathDiscovery, codexHomeDir);
     const appServer = resolveAppServerBinary(state.appServerSavedPath, cli.resolvedPath, allowPathDiscovery, codexHomeDir);
@@ -2322,6 +2599,9 @@ export function createRemoteServer(options = {}) {
           ...(notification.id !== undefined ? { requestId: String(notification.id), responded: false } : {}),
         };
         session.events.push(entry);
+        if (session.events.length > 512) {
+          session.events.splice(0, session.events.length - 512);
+        }
         if (notification.method === 'turn/started') {
           updateSessionStateIfChanged(session, 'running');
         } else if (notification.method === 'turn/completed' || notification.method === 'error') {
@@ -2329,7 +2609,13 @@ export function createRemoteServer(options = {}) {
         }
         if (notification.method === 'item/agentMessage/delta' && notification.params?.delta) {
           session._streamedItemIds = session._streamedItemIds || new Set();
-          if (notification.params?.itemId) session._streamedItemIds.add(String(notification.params.itemId));
+          if (notification.params?.itemId) {
+            if (session._streamedItemIds.size >= 512) {
+              const oldestItemId = session._streamedItemIds.values().next().value;
+              if (oldestItemId !== undefined) session._streamedItemIds.delete(oldestItemId);
+            }
+            session._streamedItemIds.add(String(notification.params.itemId));
+          }
           emitTerminalOutput(session, String(notification.params.delta));
         } else if (notification.method === 'item/completed' && notification.params?.item && !sessionProcesses.has(session.id)) {
           const item = normalizeConversationItem(notification.params.item, 0, String(notification.params.turnId || 'turn'));
@@ -2369,16 +2655,13 @@ export function createRemoteServer(options = {}) {
     const isLineBuffered = Boolean(session.threadId && !sessionProcesses.has(session.id));
     const thread = session.threadId ? state.threads[session.threadId] : null;
     const rollout = session.threadId ? readCodexRolloutSummary(session.threadId, codexHomeDir) : null;
-    const rawModel = thread?.model || rollout?.model || null;
-    const modelLabel = rawModel ? String(rawModel).replace(/^gpt-6\.1-sol$/i, 'GPT-6.1-Sol') : 'GPT-6.1-Sol';
-    const effortLabel = String(thread?.effort || rollout?.effort || 'high');
-    const modelContextWindow = Number(thread?.modelContextWindow || rollout?.modelContextWindow || 380000);
-    const weeklyUsedPct =
-      rollout?.rateLimits?.primary?.used_percent ??
-      latestObservedRateLimits?.rateLimits?.primary?.used_percent;
-    const weeklyLeftPercent = Number.isFinite(Number(weeklyUsedPct))
-      ? Math.max(0, 100 - Math.round(Number(weeklyUsedPct)))
-      : null;
+    const { modelLabel, effortLabel, modelContextWindow } = resolveSessionModelMeta(thread, rollout);
+    const weeklySource = rollout?.rateLimits || readLatestRateLimitsFromRollouts(codexHomeDir);
+    const weeklyParsed = weeklySource ? extractWeeklyUsage(weeklySource) : null;
+    const weeklyLeftPercent =
+      weeklyParsed?.weekly && Number.isFinite(weeklyParsed.weekly.usedPercent)
+        ? Math.max(0, 100 - Math.round(weeklyParsed.weekly.usedPercent))
+        : null;
     return {
       id: session.id,
       generation: session.generation,
@@ -2472,7 +2755,7 @@ export function createRemoteServer(options = {}) {
         updatedAt: Math.floor(Date.now() / 1000),
         model: null,
         effort: null,
-        modelContextWindow: 128000,
+        modelContextWindow: null,
         effectiveContextWindow: 128000,
         usedTokens: 0,
         turns: [],
@@ -2515,8 +2798,6 @@ export function createRemoteServer(options = {}) {
     return currentThread;
   }
 
-  let cachedModelsResult = null;
-  let cachedModelsAt = 0;
   async function queryServerModels(cursor = null) {
     if (!cursor && cachedModelsResult && Date.now() - cachedModelsAt < 30000) {
       return cachedModelsResult;
@@ -2784,6 +3065,35 @@ export function createRemoteServer(options = {}) {
               stdio: ['ignore', 'pipe', 'pipe'],
               windowsHide: true,
             });
+            let procMap = execTurnProcesses.get(session.id);
+            if (!procMap) {
+              procMap = new Map();
+              execTurnProcesses.set(session.id, procMap);
+            }
+            procMap.set(turnId, child);
+            let initialExecStatus = 'inProgress';
+            const removeExecChild = () => {
+              const m = execTurnProcesses.get(session.id);
+              if (m) {
+                m.delete(turnId);
+                if (m.size === 0) execTurnProcesses.delete(session.id);
+              }
+            };
+            child.on('error', err => {
+              initialExecStatus = 'failed';
+              removeExecChild();
+              emitTerminalOutput(session, `\x1b[38;5;203m• 실행 오류: ${err.message || err}\x1b[0m\r\n`);
+              const targetTurn = (thread.turns || []).find(t => t.id === turnId);
+              if (targetTurn && targetTurn.status === 'inProgress') {
+                targetTurn.status = 'failed';
+                persistState();
+              }
+              handleServerNotification({
+                method: 'turn/completed',
+                params: { threadId: session.threadId, turnId, turn: { id: turnId, status: 'failed' } },
+              });
+              updateSessionStateIfChanged(session, 'idle');
+            });
             child.stdout?.on('data', chunk => {
               const outStr = chunk.toString('utf8');
               if (outStr.trim()) emitTerminalOutput(session, outStr);
@@ -2792,16 +3102,27 @@ export function createRemoteServer(options = {}) {
               const errStr = chunk.toString('utf8');
               if (errStr.trim()) emitTerminalOutput(session, errStr);
             });
-            child.on('exit', () => {
+            child.on('exit', (code, signal) => {
+              removeExecChild();
               if (session.threadId) {
                 emitMirroredSessionSnapshot(session, false);
               }
+              const nextStatus = signal ? 'interrupted' : code === 0 ? 'completed' : 'failed';
+              const targetTurn = (thread.turns || []).find(t => t.id === turnId);
+              if (targetTurn && targetTurn.status === 'inProgress') {
+                targetTurn.status = nextStatus;
+                persistState();
+              }
+              handleServerNotification({
+                method: 'turn/completed',
+                params: { threadId: session.threadId, turnId, turn: { id: turnId, status: nextStatus } },
+              });
               updateSessionStateIfChanged(session, 'idle');
             });
             rpcRes = {
               turn: {
                 id: turnId,
-                status: 'inProgress',
+                status: initialExecStatus,
                 items: [
                   { id: `item-u-${Date.now()}`, type: 'userMessage', role: 'user', text, status: 'completed' },
                 ],
@@ -2869,6 +3190,7 @@ export function createRemoteServer(options = {}) {
           proc.stdin.write('\u0003');
         }
       }
+      await terminateExecTurnsForSession(session.id);
       if (Array.isArray(thread.turns)) {
         for (const t of thread.turns) {
           if (t.status === 'inProgress' && (!request.turnId || t.id === request.turnId)) {
@@ -2925,7 +3247,7 @@ export function createRemoteServer(options = {}) {
       const effectiveConnected = Boolean(rpcConnected || hasRolloutOrMirrored);
       const caps = appServerBridge.serverInfo?.opendiyCapabilities || {};
       const usedTokens = Number(thread.usedTokens || 0);
-      const modelContextWindow = Number(thread.modelContextWindow || 380000);
+      const { modelContextWindow } = resolveSessionModelMeta(thread, rollout);
       const compactSupported = Boolean(caps.compactStartIfIdle ?? effectiveConnected);
       const isIdle = session.state === 'idle';
       session.contextRevision = (session.contextRevision || 0) + 1;
@@ -3050,8 +3372,8 @@ export function createRemoteServer(options = {}) {
         command: '/model',
         titleKo: '모델 및 추론 수준 확인·변경',
         titleEn: 'Show or switch model & reasoning effort',
-        descriptionKo: '현재 모델/추론 수준을 확인하거나 변경합니다 (예: /model gpt-5.4 high).',
-        descriptionEn: 'View or switch model and reasoning effort (e.g., /model gpt-5.4 high).',
+        descriptionKo: '현재 모델/추론 수준을 확인하거나 변경합니다 (예: /model <모델명> [추론수준]).',
+        descriptionEn: 'View or switch model and reasoning effort (e.g., /model <model> [effort]).',
         category: 'builtin',
         action: 'model',
       },
@@ -3237,7 +3559,7 @@ export function createRemoteServer(options = {}) {
         writeTerm(msg);
         return { handled: true, outputText: msg };
       }
-      const msg = `• 현재 설정된 모델: ${thread.model || '기본값'} · 추론 수준: ${thread.effort || '기본값'} (변경 예: /model gpt-5.4 high)`;
+      const msg = `• 현재 설정된 모델: ${thread.model || '기본값'} · 추론 수준: ${thread.effort || '기본값'} (변경 예: /model <모델명> [추론수준])`;
       writeTerm(msg);
       return { handled: true, outputText: msg };
     }
@@ -3447,6 +3769,23 @@ export function createRemoteServer(options = {}) {
           host: hostResult,
         };
       }
+      if (command === 'get_codex_settings') {
+        const hostSettings = await invokeRelayHost('get_codex_settings', args);
+        return hostSettings && typeof hostSettings === 'object'
+          ? { ...hostSettings, relayReadOnly: true }
+          : hostSettings;
+      }
+      if (command === 'runtime_transition_preview') {
+        const hostPreview = await invokeRelayHost('runtime_transition_preview', args);
+        return hostPreview && typeof hostPreview === 'object'
+          ? {
+              ...hostPreview,
+              canApply: false,
+              reason:
+                '원격 중계(Relay) 연결에서는 보안상 실행 파일 경로 변경 및 공유 서버 전환이 차단됩니다. 작업용 PC에서 직접 변경하세요.',
+            }
+          : hostPreview;
+      }
       return invokeRelayHost(command, args);
     }
 
@@ -3498,12 +3837,12 @@ export function createRemoteServer(options = {}) {
         }
         const caps = appServerBridge.serverInfo?.opendiyCapabilities || {};
         return {
-          executable: settings.resolvedPath,
+          executable: String(settings.resolvedPath || settings.savedPath || 'codex'),
           cliVersion,
           selectedServerExecutable: settings.appServer.resolvedPath,
           selectedServerVersion,
           serverVersion: appServerBridge.serverInfo?.userAgent || selectedServerVersion,
-          serverState: appServerBridge.isConnected() ? 'running' : 'stopped',
+          serverState: appServerBridge.isConnected() ? 'running' : 'unavailable',
           subagents: Boolean(appServerBridge.serverInfo?.supportsSubagentManagement),
           compactIfIdle: Boolean(caps.compactStartIfIdle),
           expectedTurnInterrupt: Boolean(appServerBridge.serverInfo?.supportsExpectedTurnInterrupt),
@@ -3703,17 +4042,9 @@ export function createRemoteServer(options = {}) {
         sessions.set(id, session);
         persistState();
 
-        const info = publicSessionInfo(session);
-        broadcast('session-changed', info);
-        if (!wasDesktopMirrored) {
-          emitTerminalOutput(
-            session,
-            `\x1b[38;5;141m╭─ [OpenDIY Remote] ${title} · ${cwd}\x1b[0m\r\n`,
-          );
-        }
-
         const settings = computeSettings();
         const shouldSpawnProcess = options.spawnProcess !== false && !wasDesktopMirrored;
+        let spawnErrorMsg = null;
         if (shouldSpawnProcess) {
           const useCodex = Boolean(settings.resolvedPath && options.useCodexCli === true);
           const cmdBin = useCodex
@@ -3748,6 +4079,13 @@ export function createRemoteServer(options = {}) {
               windowsHide: true,
             });
             sessionProcesses.set(id, child);
+            child.on('error', err => {
+              sessionProcesses.delete(id);
+              if (sessions.has(id)) {
+                emitTerminalOutput(session, `\x1b[38;5;203m• 프로세스 실행 오류: ${err.message || err}\x1b[0m\r\n`);
+                broadcast('session-changed', publicSessionInfo(session));
+              }
+            });
             child.stdout.on('data', chunk => {
               if (sessions.has(id)) emitTerminalOutput(session, chunk.toString('utf8'));
             });
@@ -3756,9 +4094,24 @@ export function createRemoteServer(options = {}) {
             });
             child.on('exit', () => {
               sessionProcesses.delete(id);
+              if (sessions.has(id) && session.active) {
+                broadcast('session-changed', publicSessionInfo(session));
+              }
             });
           } catch (err) {
-            emitTerminalOutput(session, `${err.message || err}\r\n`);
+            spawnErrorMsg = `${err.message || err}\r\n`;
+          }
+        }
+
+        const info = publicSessionInfo(session);
+        broadcast('session-changed', info);
+        if (!wasDesktopMirrored) {
+          emitTerminalOutput(
+            session,
+            `\x1b[38;5;141m╭─ [OpenDIY Remote] ${title} · ${cwd}\x1b[0m\r\n`,
+          );
+          if (spawnErrorMsg) {
+            emitTerminalOutput(session, spawnErrorMsg);
           }
         }
         return info;
@@ -3802,6 +4155,7 @@ export function createRemoteServer(options = {}) {
               if (session.threadId && appServerBridge.isConnected()) {
                 void appServerBridge.request('turn/interrupt', { threadId: session.threadId }).catch(() => {});
               }
+              void terminateExecTurnsForSession(session.id);
             } else if (ch === '\u007f' || ch === '\b') {
               const chars = Array.from(session.inputBuffer);
               if (chars.length > 0) {
@@ -3869,6 +4223,7 @@ export function createRemoteServer(options = {}) {
             sessionProcesses.delete(session.id);
             await terminateChildProcess(proc);
           }
+          await cleanupStoppedSessionResources(session);
           broadcast('session-changed', publicSessionInfo(session));
           sessions.delete(session.id);
         }
@@ -4459,15 +4814,33 @@ export function createRemoteServer(options = {}) {
         }
         const ext = match[1] === 'png' ? 'png' : 'jpg';
         const buf = Buffer.from(match[2], 'base64');
+        const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+        const MAX_TOTAL_ATTACHMENT_BYTES = 256 * 1024 * 1024;
+        if (buf.length === 0 || buf.length > MAX_IMAGE_BYTES) {
+          throw new Error('클립보드 이미지 크기는 10MiB 이하여야 합니다.');
+        }
+        let existingTotalBytes = 0;
+        try {
+          for (const entry of fs.readdirSync(attachmentsDir)) {
+            const st = fs.statSync(path.join(attachmentsDir, entry));
+            if (st.isFile()) existingTotalBytes += st.size;
+          }
+        } catch {}
+        if (existingTotalBytes + buf.length > MAX_TOTAL_ATTACHMENT_BYTES) {
+          throw new Error('첨부 파일 임시 저장소 한도(256MiB)를 초과했습니다. 불필요한 첨부를 정리한 뒤 다시 시도하세요.');
+        }
         const name = `clipboard-${crypto.randomUUID()}.${ext}`;
         const fullPath = path.join(attachmentsDir, name);
         fs.writeFileSync(fullPath, buf);
         return { type: 'localImage', path: fullPath, name };
       }
       case 'cleanup_conversation_attachment': {
-        const target = String(args.path ?? '');
-        if (target && target.startsWith(attachmentsDir)) {
-          try { fs.unlinkSync(target); } catch {}
+        const target = String(args.path ?? '').trim();
+        if (target && isPathInsideDir(attachmentsDir, target, { allowBase: false })) {
+          const resolvedTarget = path.resolve(target);
+          if (path.dirname(resolvedTarget) === path.resolve(attachmentsDir)) {
+            try { fs.unlinkSync(resolvedTarget); } catch {}
+          }
         }
         return null;
       }
@@ -4582,6 +4955,12 @@ export function createRemoteServer(options = {}) {
         for (const jobId of [...cronTimers.keys()]) {
           clearCronTimer(jobId);
         }
+        cronJobsByThread.clear();
+        pendingQuestions.clear();
+        relayTerminalBuffers.clear();
+        for (const sid of [...execTurnProcesses.keys()]) {
+          await terminateExecTurnsForSession(sid);
+        }
         for (const proc of sessionProcesses.values()) {
           try { proc.kill(); } catch {}
         }
@@ -4615,10 +4994,16 @@ export function createRemoteServer(options = {}) {
   }
 
   function resolveStaticFile(urlPath) {
-    const clean = decodeURIComponent(urlPath.split('?')[0] || '/').replace(/^\/+/, '');
+    let decodedPath = '/';
+    try {
+      decodedPath = decodeURIComponent(urlPath.split('?')[0] || '/');
+    } catch {
+      return null;
+    }
+    const clean = decodedPath.replace(/^\/+/, '');
     const rel = clean || 'index.html';
     const candidate = path.resolve(distDir, rel);
-    if (!candidate.startsWith(distDir)) return null;
+    if (!isPathInsideDir(distDir, candidate, { allowBase: true })) return null;
     try {
       if (fs.statSync(candidate).isFile()) return candidate;
     } catch {
@@ -4703,8 +5088,9 @@ export function createRemoteServer(options = {}) {
     // 1:1 Single-Owner Host Tunnel Endpoints (/api/relay/*)
     if (pathname.startsWith('/api/relay/')) {
       const hostAuth = req.headers['x-opendiy-host-secret'] || req.headers.authorization?.replace(/^Bearer\s+/i, '') || '';
+      const hasHostAuth = Boolean(String(hostAuth).trim());
       const validSecret = isHostCredentialValid(String(hostAuth));
-      const rate = checkAndRecordAuth(`host:${clientIp}`, validSecret);
+      const rate = checkAndRecordAuth(`host:${clientIp}`, validSecret, hasHostAuth);
       if (!rate.allowed) {
         res.writeHead(rate.locked ? 429 : 401, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
         res.end(JSON.stringify({
@@ -4865,7 +5251,7 @@ export function createRemoteServer(options = {}) {
       }
       const stateNonce = crypto.randomBytes(24).toString('hex');
       oauthStates.set(stateNonce, { exp: now + 10 * 60 * 1000, cliSessionId });
-      const isHttps = useTls || String(req.headers['x-forwarded-proto'] || '').toLowerCase() === 'https';
+      const isHttps = isRequestHttps(req, useTls);
       const origin = `${isHttps ? 'https' : 'http'}://${req.headers.host || '127.0.0.1'}`;
       const redirectUri = `${origin}/auth/google/callback`;
       const authUrl = new URL('https://accounts.google.com/o/oauth2/v2/auth');
@@ -4922,7 +5308,7 @@ export function createRemoteServer(options = {}) {
         res.end(renderAuthGatePage({ errorMsg: 'OAuth 인증 상태(state)가 만료되었거나 유효하지 않습니다. 다시 시도해 주세요.' }));
         return;
       }
-      const isHttps = useTls || String(req.headers['x-forwarded-proto'] || '').toLowerCase() === 'https';
+      const isHttps = isRequestHttps(req, useTls);
       const origin = `${isHttps ? 'https' : 'http'}://${req.headers.host || '127.0.0.1'}`;
       const redirectUri = `${origin}/auth/google/callback`;
       (async () => {
@@ -4995,7 +5381,7 @@ export function createRemoteServer(options = {}) {
     }
 
     if ((req.method === 'GET' || req.method === 'POST') && pathname === '/auth/logout') {
-      const isHttps = useTls || String(req.headers['x-forwarded-proto'] || '').toLowerCase() === 'https';
+      const isHttps = isRequestHttps(req, useTls);
       res.writeHead(302, {
         Location: '/',
         'Cache-Control': 'no-store',
@@ -5013,7 +5399,7 @@ export function createRemoteServer(options = {}) {
       const cookieToken = cookies[AUTH_COOKIE_NAME] || '';
       const provided = bearer || queryToken || cookieToken;
       const valid = isClientCredentialValid(provided);
-      const rate = checkAndRecordAuth(`client:${clientIp}`, valid);
+      const rate = checkAndRecordAuth(`client:${clientIp}`, valid, Boolean(String(provided).trim()));
       if (!rate.allowed) {
         res.writeHead(rate.locked ? 429 : 401, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
         res.end(JSON.stringify({
@@ -5082,16 +5468,25 @@ export function createRemoteServer(options = {}) {
         const urlToken = reqUrl.searchParams.get('token') || '';
         const cookies = parseCookies(req.headers.cookie);
         const cookieToken = cookies[AUTH_COOKIE_NAME] || '';
-        const isHttps = useTls || String(req.headers['x-forwarded-proto'] || '').toLowerCase() === 'https';
+        const isHttps = isRequestHttps(req, useTls);
         let hasValidAuth = isClientCredentialValid(cookieToken);
-        if (urlToken && verifyToken(tokenSha256, urlToken)) {
-          headers['Set-Cookie'] = `${AUTH_COOKIE_NAME}=${encodeURIComponent(urlToken.trim())}; HttpOnly; SameSite=Lax; Path=/${isHttps ? '; Secure' : ''}`;
-          hasValidAuth = true;
+        let authGateError = '';
+        if (urlToken) {
+          const urlValid = verifyToken(tokenSha256, urlToken);
+          const urlRate = checkAndRecordAuth(`client:${clientIp}`, urlValid, true);
+          if (urlRate.allowed) {
+            headers['Set-Cookie'] = `${AUTH_COOKIE_NAME}=${encodeURIComponent(urlToken.trim())}; HttpOnly; SameSite=Lax; Path=/${isHttps ? '; Secure' : ''}`;
+            hasValidAuth = true;
+          } else {
+            authGateError = urlRate.locked
+              ? '반복된 인증 실패로 접속이 일시 차단되었습니다. 잠시 후 다시 시도하세요.'
+              : '접속 토큰이 올바르지 않습니다.';
+          }
         }
         if (path.basename(filePath) === 'index.html') {
-          if (googleOAuthEnabled && !hasValidAuth) {
-            res.writeHead(200, headers);
-            res.end(renderAuthGatePage(), 'utf8');
+          if ((googleOAuthEnabled || tokenSha256) && !hasValidAuth) {
+            res.writeHead(authGateError ? 401 : 200, headers);
+            res.end(renderAuthGatePage({ errorMsg: authGateError }), 'utf8');
             return;
           }
           const htmlBuf = Buffer.from(injectRemoteFlag(fs.readFileSync(filePath, 'utf8')), 'utf8');
@@ -5206,11 +5601,18 @@ export function createRemoteServer(options = {}) {
     close: async () => {
       if (autoUpdateTimer) clearInterval(autoUpdateTimer);
       if (desktopWatchInterval) clearInterval(desktopWatchInterval);
+      if (mirroredSnapshotTimer) clearTimeout(mirroredSnapshotTimer);
       for (const jobId of [...cronTimers.keys()]) {
         clearCronTimer(jobId);
       }
+      cronJobsByThread.clear();
+      pendingQuestions.clear();
+      relayTerminalBuffers.clear();
       if (activeHostLease) {
         releaseHostLease(activeHostLease.hostId);
+      }
+      for (const sid of [...execTurnProcesses.keys()]) {
+        await terminateExecTurnsForSession(sid);
       }
       const procs = [...sessionProcesses.values()];
       sessionProcesses.clear();
@@ -5243,7 +5645,23 @@ export function startHostConnector(options = {}) {
       path.join(os.tmpdir(), 'opendiy-remote-workspace'),
   );
   const oauthCacheFile = path.resolve(options.oauthCacheFile || path.join(localWorkspaceDir, 'host-oauth-token.json'));
-  const hostId = options.hostId || crypto.randomUUID();
+  const hostIdFile = path.join(localWorkspaceDir, 'host-connector-id');
+  function resolvePersistentHostId() {
+    if (options.hostId) return String(options.hostId);
+    try {
+      if (fs.existsSync(hostIdFile)) {
+        const savedId = fs.readFileSync(hostIdFile, 'utf8').trim();
+        if (/^[a-zA-Z0-9_-]{8,128}$/.test(savedId)) return savedId;
+      }
+    } catch {}
+    const generated = crypto.randomUUID();
+    try {
+      fs.mkdirSync(localWorkspaceDir, { recursive: true });
+      fs.writeFileSync(hostIdFile, `${generated}\n`, { encoding: 'utf8', mode: 0o600 });
+    } catch {}
+    return generated;
+  }
+  const hostId = resolvePersistentHostId();
   const rejectUnauthorized = options.tlsRejectUnauthorized !== undefined
     ? Boolean(options.tlsRejectUnauthorized)
     : process.env.OPENDIY_REMOTE_TLS_INSECURE !== '1' && process.env.OPENDIY_REMOTE_TLS_INSECURE !== 'true';
@@ -5289,6 +5707,26 @@ export function startHostConnector(options = {}) {
   }
 
   let currentAuthToken = explicitSecret || loadCachedOAuthToken();
+  let closeConnectorPromise = null;
+
+  const defaultConnectorOnRestart = async () => {
+    try {
+      await closeConnector();
+    } catch {}
+    if (process.env.INVOCATION_ID || process.env.OPENDIY_REMOTE_MANAGED_RESTART === '1') {
+      process.exit(0);
+    } else {
+      const child = spawn(process.execPath, process.argv.slice(1), {
+        cwd: process.cwd(),
+        env: process.env,
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true,
+      });
+      child.unref();
+      process.exit(0);
+    }
+  };
 
   const localRuntime = createRemoteServer({
     ...options,
@@ -5297,6 +5735,7 @@ export function startHostConnector(options = {}) {
     tlsKey: '',
     tlsCertFile: '',
     tlsKeyFile: '',
+    onRestart: options.onRestart || defaultConnectorOnRestart,
     onBroadcast: (event, payload) => {
       if (!stopped && RELAY_EVENT_SET.has(event)) {
         postJson('/api/relay/event', { event, payload }).catch(() => {
@@ -5564,15 +6003,19 @@ export function startHostConnector(options = {}) {
     activeReq = req;
   }
 
-  connectStream();
-
-  return {
-    hostId,
-    relayUrl,
-    localRuntime,
-    close: async () => {
+  function closeConnector() {
+    if (closeConnectorPromise) return closeConnectorPromise;
+    closeConnectorPromise = (async () => {
       stopped = true;
-      if (reconnectTimer) clearTimeout(reconnectTimer);
+      oauthInProgress = false;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      if (oauthPollTimer) {
+        clearTimeout(oauthPollTimer);
+        oauthPollTimer = null;
+      }
       inFlightReqIds.clear();
       if (activeReq) {
         try { activeReq.destroy(); } catch {}
@@ -5582,7 +6025,17 @@ export function startHostConnector(options = {}) {
       try { httpAgent.destroy(); } catch {}
       try { httpsAgent.destroy(); } catch {}
       await localRuntime.close();
-    },
+    })();
+    return closeConnectorPromise;
+  }
+
+  connectStream();
+
+  return {
+    hostId,
+    relayUrl,
+    localRuntime,
+    close: closeConnector,
   };
 }
 
@@ -5590,8 +6043,12 @@ const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPat
 if (isMain) {
   let mode = process.env.OPENDIY_REMOTE_MODE || 'direct';
   let connectUrl = process.env.OPENDIY_REMOTE_RELAY_URL || '';
-  let host = process.env.OPENDIY_REMOTE_BIND || process.env.OPENDIY_REMOTE_HOST || '127.0.0.1';
-  let port = Number(process.env.OPENDIY_REMOTE_PORT || 3210);
+  const initialPort = Number(process.env.OPENDIY_REMOTE_PORT || 3210);
+  const envBind = process.env.OPENDIY_REMOTE_BIND
+    ? parseBindAddress(process.env.OPENDIY_REMOTE_BIND, process.env.OPENDIY_REMOTE_HOST || '127.0.0.1', initialPort)
+    : { host: process.env.OPENDIY_REMOTE_HOST || '127.0.0.1', port: initialPort };
+  let host = envBind.host;
+  let port = envBind.port;
   let token = process.env.OPENDIY_REMOTE_TOKEN || '';
   let hostSecret = process.env.OPENDIY_REMOTE_HOST_SECRET || '';
   let workspaceDir = process.env.OPENDIY_REMOTE_DATA_DIR || process.env.AGENT_GRID_WORKSPACE_DIR || '';
@@ -5618,14 +6075,13 @@ if (isMain) {
       connectUrl = argv[i].slice('--connect='.length);
       mode = 'connect';
     } else if (argv[i] === '--bind' && argv[i + 1]) {
-      const val = argv[++i];
-      const lastColon = val.lastIndexOf(':');
-      if (lastColon !== -1) {
-        host = val.slice(0, lastColon);
-        port = Number(val.slice(lastColon + 1));
-      } else {
-        host = val;
-      }
+      const parsedBind = parseBindAddress(argv[++i], host, port);
+      host = parsedBind.host;
+      port = parsedBind.port;
+    } else if (argv[i].startsWith('--bind=')) {
+      const parsedBind = parseBindAddress(argv[i].slice('--bind='.length), host, port);
+      host = parsedBind.host;
+      port = parsedBind.port;
     } else if (argv[i] === '--port' && argv[i + 1]) {
       port = Number(argv[++i]);
     } else if (argv[i] === '--host' && argv[i + 1]) {
@@ -5705,11 +6161,14 @@ if (isMain) {
         console.log(`OpenDIY Remote Host Connector registered with relay (${connectUrl}) [hostId=${hostId}]`);
       },
     });
-    process.on('SIGINT', () => {
+    const shutdownConnector = () => {
       connector.close().finally(() => process.exit(0));
-    });
+    };
+    process.on('SIGINT', shutdownConnector);
+    process.on('SIGTERM', shutdownConnector);
   } else {
-    const isLoopback = host === '127.0.0.1' || host === 'localhost' || host === '::1';
+    const normalizedHost = host.replace(/^\[|\]$/g, '').toLowerCase();
+    const isLoopback = normalizedHost === '127.0.0.1' || normalizedHost === 'localhost' || normalizedHost === '::1';
     const hasOAuth = Boolean(googleClientId.trim() && googleClientSecret.trim() && allowedEmail.trim());
     if (!isLoopback && !token.trim() && !hasOAuth) {
       console.error(`Error: Refusing to bind non-loopback address (${host}:${port}) without --token or Google OAuth (--google-client-id, --google-client-secret, --allowed-email).`);
@@ -5728,11 +6187,17 @@ if (isMain) {
       allowedEmail: allowedEmail || undefined,
       autoUpdate,
     });
+    const shutdownServer = () => {
+      instance.close().finally(() => process.exit(0));
+    };
+    process.on('SIGINT', shutdownServer);
+    process.on('SIGTERM', shutdownServer);
     instance.server.listen(port, host, () => {
       const addr = instance.server.address();
       const actualPort = typeof addr === 'object' && addr ? addr.port : port;
       const scheme = tlsCertFile && tlsKeyFile ? 'https' : 'http';
-      console.log(`OpenDIY Remote (${mode} mode) listening on ${scheme}://${host}:${actualPort}`);
+      const displayHost = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
+      console.log(`OpenDIY Remote (${mode} mode) listening on ${scheme}://${displayHost}:${actualPort}`);
     });
   }
 }

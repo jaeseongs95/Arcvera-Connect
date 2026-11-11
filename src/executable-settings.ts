@@ -7,6 +7,7 @@ interface CodexSettings {
   resolvedPath: string | null;
   source: 'saved' | 'environment' | 'path' | 'unavailable';
   error: string | null;
+  relayReadOnly?: boolean;
   appServer: {
     savedPath: string | null;
     resolvedPath: string | null;
@@ -89,11 +90,12 @@ export function createExecutableSettings(call: <T>(command: string, args?: Recor
   refreshLabels(); onLanguageChange(refreshLabels);
   let version = 0;
   let busy = false;
+  let relayReadOnly = false;
   let mutation: Promise<CodexSettings | null> | undefined;
   const current = (token: number) => dialog.open && version === token;
   function updateBusy() {
     const value = busy || transition.pending;
-    for (const button of [choose, reset, serverChoose, serverReset]) button.disabled = value;
+    for (const button of [choose, reset, serverChoose, serverReset]) button.disabled = value || relayReadOnly;
     dialog.setAttribute('aria-busy', String(value));
   }
   function setBusy(value: boolean, ko?: string, en = ko) {
@@ -104,6 +106,8 @@ export function createExecutableSettings(call: <T>(command: string, args?: Recor
     error.textContent = value instanceof Error ? value.message : String(value); error.hidden = false;
   }
   function show(settings: CodexSettings) {
+    relayReadOnly = settings.relayReadOnly === true;
+    updateBusy();
     compatibility.invalidate(); transition.invalidate();
     path.value = settings.savedPath ?? '';
     placeholder('자동 찾기 사용 중', 'Using automatic discovery');
@@ -121,7 +125,7 @@ export function createExecutableSettings(call: <T>(command: string, args?: Recor
     error.hidden = !errors; error.textContent = errors;
   }
   async function change(command: string, args?: Record<string, unknown>) {
-    if (busy || transition.pending) return;
+    if (busy || transition.pending || relayReadOnly) return;
     transition.invalidate();
     const token = version;
     error.hidden = true;
@@ -145,6 +149,7 @@ export function createExecutableSettings(call: <T>(command: string, args?: Recor
     async open(options: { checkServer?: boolean } = {}) {
       if (dialog.open) return;
       const token = ++version;
+      relayReadOnly = false;
       compatibility.invalidate(); transition.invalidate();
       path.value = ''; serverPath.value = '';
       for (const selector of ['#app-server-executable-resolved', '#app-server-executable-source', '#app-server-executable-kind']) text($(selector), '확인 중…', 'Checking…');
@@ -160,7 +165,19 @@ export function createExecutableSettings(call: <T>(command: string, args?: Recor
         await transition.whenIdle();
         if (!current(token)) return;
         const settings = await call<CodexSettings>('get_codex_settings');
-        if (current(token)) { show(settings); text(status, ''); loaded = true; }
+        if (current(token)) {
+          show(settings);
+          if (settings.relayReadOnly) {
+            text(
+              status,
+              '원격 중계(Relay) 연결에서는 실행 파일 경로를 변경할 수 없습니다. 작업용 PC에서 직접 변경하세요.',
+              'Executable paths are read-only over a remote relay connection. Change them directly on your host PC.',
+            );
+          } else {
+            text(status, '');
+          }
+          loaded = true;
+        }
       } catch (cause) { if (current(token)) {
         placeholder('설정을 확인하지 못했습니다', 'Could not check settings');
         for (const selector of ['#app-server-executable-resolved', '#app-server-executable-source', '#app-server-executable-kind']) text($(selector), '미확인', 'Unknown');

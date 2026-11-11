@@ -89,7 +89,7 @@ node server/remote-server.mjs \
 ```
 
 #### 3단계 — 외부 브라우저에서 접속
-브라우저에서 `http://<중계서버-IP-또는-도메인>:3210/?token=브라우저-접속용-비밀토큰`을 열면, 토큰이 즉시 `HttpOnly; SameSite=Strict` 쿠키 및 `sessionStorage`로 설정되고 주소창에서 제거되며 내 작업용 PC의 `opendiy-codex`와 프로젝트 폴더를 제어할 수 있습니다.
+브라우저에서 `http://<중계서버-IP-또는-도메인>:3210/?token=브라우저-접속용-비밀토큰`을 열면, 토큰이 즉시 `HttpOnly; SameSite=Lax` 쿠키 및 `sessionStorage`로 설정되고 주소창에서 제거되며 내 작업용 PC의 `opendiy-codex`와 프로젝트 폴더를 제어할 수 있습니다.
 
 ---
 

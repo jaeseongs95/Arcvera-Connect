@@ -616,7 +616,48 @@ test('relay + host connector mode renders mirrored desktop terminal rollout on i
     await extDialog.locator('#extensions-tab-hooks').click();
     await expect(extDialog.locator('.extensions-row', { hasText: 'PreToolUse' })).toBeVisible();
     await extDialog.locator('#extensions-close').click();
+    await expect(extDialog).toBeHidden();
+
+    // D-0020 & D-0022: Executable settings dialog in relay mode disables path buttons with notice, and runtime compatibility / transition preview succeed
+    await settingsDialog.locator('#codex-settings-open').click();
+    const codexSettingsDialog = page.locator('#codex-settings-dialog');
+    await expect(codexSettingsDialog).toBeVisible();
+    await expect(codexSettingsDialog).toHaveAttribute('aria-busy', 'false');
+    await expect(codexSettingsDialog.locator('#codex-executable-choose')).toBeDisabled();
+    await expect(codexSettingsDialog.locator('#codex-executable-reset')).toBeDisabled();
+    await expect(codexSettingsDialog.locator('#app-server-executable-choose')).toBeDisabled();
+    await expect(codexSettingsDialog.locator('#app-server-executable-reset')).toBeDisabled();
+    await expect(codexSettingsDialog.locator('#codex-settings-status')).toContainText('원격 중계(Relay) 연결에서는 실행 파일 경로를 변경할 수 없습니다');
+
+    await codexSettingsDialog.locator('.compatibility-refresh').click();
+    await expect(codexSettingsDialog.locator('.compatibility-details')).toBeVisible();
+    await expect(codexSettingsDialog.locator('.compatibility-details')).toContainText('codex-app-server/e2e-relay');
+
+    await codexSettingsDialog.locator('.transition-preview').click();
+    await expect(codexSettingsDialog.locator('.transition-details')).toBeVisible();
+    await expect(codexSettingsDialog.locator('.transition-reason')).toContainText('원격 중계(Relay) 연결에서는 보안상 실행 파일 경로 변경');
+
+    await codexSettingsDialog.locator('#codex-settings-close').click();
+    await expect(codexSettingsDialog).toBeHidden();
     await settingsDialog.locator('#settings-close').click();
+    await expect(settingsDialog).toBeHidden();
+
+    // D-0014: Clicking '#exit' ('로그아웃') clears sessionStorage token, revokes cookie session, and shows sign-in gate
+    const tokenBeforeLogout = await page.evaluate(() => sessionStorage.getItem('opendiy_remote_token'));
+    expect(tokenBeforeLogout).toBe('relay-user-token');
+    await page.locator('#exit').click();
+    await expect(page.locator('input[name="token"]')).toBeVisible();
+    const tokenAfterLogout = await page.evaluate(() => sessionStorage.getItem('opendiy_remote_token'));
+    expect(tokenAfterLogout).toBeNull();
+    const postLogoutStatus = await page.evaluate(async () => {
+      const res = await fetch('/api/invoke', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ command: 'get_ui_language', args: {} }),
+      });
+      return res.status;
+    });
+    expect(postLogoutStatus).toBe(401);
   } finally {
     await connector.close();
     await relay.close();

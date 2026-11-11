@@ -89,7 +89,7 @@ node server/remote-server.mjs \
 ```
 
 #### Step 3 — Open in Any Browser
-Visit `http://<relay-ip-or-domain>:3210/?token=my-browser-access-token`. The token is automatically stored in an `HttpOnly; SameSite=Strict` cookie and `sessionStorage` and stripped from the URL bar.
+Visit `http://<relay-ip-or-domain>:3210/?token=my-browser-access-token`. The token is automatically stored in an `HttpOnly; SameSite=Lax` cookie and `sessionStorage` and stripped from the URL bar.
 
 ---
 
