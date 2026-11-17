@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# OpenDIY Remote 1:1 Relay — One-Click VPS Installer (Ubuntu / Debian, Full TLS + Google OAuth support)
+# Arcvera Connect (OpenDIY Remote) 1:1 Relay — One-Click VPS Installer (Ubuntu / Debian, Full TLS + Google OAuth support)
 # Usage:
-#   curl -fsSL https://github.com/jaeseongs95/opendiy-remote/releases/download/v1.2.2/install-relay.sh | bash
+#   curl -fsSL https://github.com/jaeseongs95/Arcvera-Connect/releases/download/v1.2.2/install-relay.sh | bash
 # Optional Google OAuth flags (via env vars):
 #   OPENDIY_REMOTE_GOOGLE_CLIENT_ID="..." \
 #   OPENDIY_REMOTE_GOOGLE_CLIENT_SECRET="..." \
 #   OPENDIY_REMOTE_ALLOWED_EMAIL="me@gmail.com" \
-#   bash <(curl -fsSL https://github.com/jaeseongs95/opendiy-remote/releases/download/v1.2.2/install-relay.sh)
+#   bash <(curl -fsSL https://github.com/jaeseongs95/Arcvera-Connect/releases/download/v1.2.2/install-relay.sh)
 
 VERSION="${OPENDIY_REMOTE_VERSION:-v1.2.2}"
 PORT="${OPENDIY_REMOTE_PORT:-3210}"
@@ -16,7 +16,9 @@ BIND_HOST="${OPENDIY_REMOTE_BIND_HOST:-0.0.0.0}"
 INSTALL_DIR="${OPENDIY_REMOTE_DIR:-$HOME/opendiy-remote}"
 SERVICE_NAME="opendiy-remote"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-BUNDLE_URL="https://github.com/jaeseongs95/opendiy-remote/releases/download/${VERSION}/opendiy-remote-${VERSION}-relay-bundle.tar.gz"
+REPO_SLUG="${OPENDIY_REMOTE_REPO:-jaeseongs95/Arcvera-Connect}"
+PRIMARY_BUNDLE_URL="https://github.com/${REPO_SLUG}/releases/download/${VERSION}/arcvera-connect-${VERSION}-relay-bundle.tar.gz"
+FALLBACK_BUNDLE_URL="https://github.com/${REPO_SLUG}/releases/download/${VERSION}/opendiy-remote-${VERSION}-relay-bundle.tar.gz"
 
 echo "==> [1/5] Checking Node.js (>= 22)..."
 NEED_NODE=1
@@ -35,9 +37,11 @@ if [ "${NEED_NODE}" -eq 1 ]; then
   echo "    Installed Node.js $(node -v)"
 fi
 
-echo "==> [2/5] Downloading & extracting OpenDIY Remote (${VERSION}) to ${INSTALL_DIR}..."
+echo "==> [2/5] Downloading & extracting Arcvera Connect / OpenDIY Remote (${VERSION}) to ${INSTALL_DIR}..."
 mkdir -p "${INSTALL_DIR}"
-curl -fsSL "${BUNDLE_URL}" | tar -xz -C "${INSTALL_DIR}"
+if ! curl -fsSL "${PRIMARY_BUNDLE_URL}" | tar -xz -C "${INSTALL_DIR}" 2>/dev/null; then
+  curl -fsSL "${FALLBACK_BUNDLE_URL}" | tar -xz -C "${INSTALL_DIR}"
+fi
 
 TLS_DIR="${INSTALL_DIR}/tls"
 TLS_CERT="${OPENDIY_REMOTE_TLS_CERT:-${TLS_DIR}/cert.pem}"

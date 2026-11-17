@@ -97,7 +97,7 @@ export const RELAY_EVENT_ALLOWLIST = Object.freeze([
   'update-status-changed',
 ]);
 
-export const GITHUB_REPO_SLUG = 'jaeseongs95/opendiy-remote';
+export const GITHUB_REPO_SLUG = 'jaeseongs95/Arcvera-Connect';
 
 export function parseSemverTuple(rawVersion) {
   const cleaned = String(rawVersion ?? '').trim().replace(/^v/i, '').split('-')[0];
@@ -1216,7 +1216,7 @@ function readCodexRolloutSummary(threadId, customCodexHome = null) {
                 : String(p.message ?? '').trim();
               const isDeveloperWake =
                 p.role === 'developer' &&
-                (txt.includes('[agent-governance-suite') || txt.includes('peer message'));
+                (txt.includes('[agent-governance-suite') || txt.includes('[sennard') || txt.includes('[Sennard') || txt.includes('peer message'));
               if (isDeveloperWake && turn.items.some(it => it.type === 'agentMessage' || it.type === 'commandExecution' || it.type === 'mcpToolCall')) {
                 turn = startNextSubTurn(explicitIdOrNull(explicitTurnId));
               }
@@ -1227,7 +1227,8 @@ function readCodexRolloutSummary(threadId, customCodexHome = null) {
                 p.role !== 'developer' &&
                 txt &&
                 !txt.startsWith('<hook_prompt') &&
-                !txt.startsWith('[AGS 단계 확인]')
+                !txt.startsWith('[AGS 단계 확인]') &&
+                !txt.startsWith('[Sennard')
               ) {
                 if (turn.items.some(it => it.type === 'agentMessage' || it.type === 'commandExecution' || it.type === 'mcpToolCall')) {
                   turn = startNextSubTurn(explicitIdOrNull(explicitTurnId));
@@ -1497,6 +1498,29 @@ function buildPendingQuestionEntry(session, notification) {
   };
 }
 
+function normalizeUnixSeconds(rawVal) {
+  if (rawVal === null || rawVal === undefined || rawVal === '') return null;
+  let num = null;
+  if (typeof rawVal === 'number') {
+    num = rawVal;
+  } else if (typeof rawVal === 'string') {
+    const trimmed = rawVal.trim();
+    if (!trimmed) return null;
+    if (/^[0-9]+(?:\.[0-9]+)?$/.test(trimmed)) {
+      num = Number(trimmed);
+    } else {
+      const parsedMs = Date.parse(trimmed);
+      if (Number.isFinite(parsedMs) && parsedMs > 0) {
+        num = Math.floor(parsedMs / 1000);
+      }
+    }
+  }
+  if (num === null || !Number.isFinite(num) || num <= 0) return null;
+  const sec = num > 10_000_000_000 ? Math.floor(num / 1000) : Math.floor(num);
+  if (!Number.isSafeInteger(sec) || sec <= 0 || sec > 8_640_000_000_000) return null;
+  return sec;
+}
+
 function extractWeeklyUsage(rateLimitsPayload) {
   const rl = rateLimitsPayload?.rateLimits ?? rateLimitsPayload?.rate_limits ?? rateLimitsPayload;
   if (!rl || typeof rl !== 'object') return { limitName: null, weekly: null };
@@ -1520,9 +1544,7 @@ function extractWeeklyUsage(rateLimitsPayload) {
     const usedPercent = Number(entry.usedPercent ?? entry.percentUsed ?? entry.used_percent ?? 0);
     if (!Number.isFinite(usedPercent)) continue;
     const rawReset = entry.resetsAt ?? entry.resetAt ?? entry.resets_at ?? null;
-    const resetsAt = rawReset !== null && Number.isSafeInteger(Number(rawReset)) && Number(rawReset) > 0
-      ? Number(rawReset)
-      : null;
+    const resetsAt = normalizeUnixSeconds(rawReset);
     return {
       limitName,
       weekly: {
@@ -1686,7 +1708,10 @@ class AppServerBridge {
   }
 
   sendResponse(id, result) {
-    if (this.customTransport) return;
+    if (this.customTransport) {
+      this.customTransport.sendResponse?.(id, result);
+      return;
+    }
     if (!this.proc || !this.proc.stdin.writable) return;
     this.proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, result }) + '\n');
   }
@@ -2966,14 +2991,32 @@ export function createRemoteServer(options = {}) {
           : [];
       const item = itemsPool.find(i => i.id === request.itemId);
       const fullText = itemFullDetailText(item);
-      const offset = Math.max(0, Number(request.offset || 0) || 0);
-      const sliceEnd = offset + ITEM_PREVIEW_LIMIT;
+      const fullBuf = Buffer.from(fullText, 'utf8');
+      const snapshotId = crypto.createHash('sha256').update(fullBuf).digest('hex').slice(0, 16);
+      const rawOffset = Number(request.offset || 0);
+      if (!Number.isSafeInteger(rawOffset) || rawOffset < 0) {
+        throw new Error('상세 조회 오프셋(offset)이 유효하지 않습니다.');
+      }
+      if (rawOffset > 0 && request.snapshotId !== undefined && String(request.snapshotId) !== snapshotId) {
+        throw new Error('조회 도중 대화 항목 원문이 변경되었습니다. 처음부터 다시 조회해 주세요.');
+      }
+      let startByte = Math.min(fullBuf.length, rawOffset);
+      while (startByte > 0 && (fullBuf[startByte] & 0xc0) === 0x80) {
+        startByte -= 1;
+      }
+      let endByte = Math.min(fullBuf.length, startByte + ITEM_PREVIEW_LIMIT);
+      if (endByte < fullBuf.length) {
+        while (endByte > startByte && (fullBuf[endByte] & 0xc0) === 0x80) {
+          endByte -= 1;
+        }
+      }
       return {
         turnId: request.turnId,
         itemId: request.itemId,
-        text: fullText.slice(offset, sliceEnd),
-        totalBytes: fullText.length,
-        nextOffset: sliceEnd < fullText.length ? sliceEnd : null,
+        text: fullBuf.subarray(startByte, endByte).toString('utf8'),
+        totalBytes: fullBuf.length,
+        nextOffset: endByte < fullBuf.length ? endByte : null,
+        snapshotId,
       };
     }
 
@@ -2986,8 +3029,43 @@ export function createRemoteServer(options = {}) {
     }
 
     if (type === 'send') {
-      let text = String(request.text ?? request.prompt ?? '').trim();
-      if (!text) throw new Error('전송할 메시지를 입력하세요.');
+      const rawText = String(request.text ?? request.prompt ?? '');
+      if (rawText.includes('\0') || Buffer.byteLength(rawText, 'utf8') > 64 * 1024) {
+        throw new Error('메시지는 UTF-8 기준 64KiB 이하여야 하며 NUL 문자를 포함할 수 없습니다.');
+      }
+      if (request.attachments !== undefined && !Array.isArray(request.attachments)) {
+        throw new Error('첨부 파일 목록 형식이 올바르지 않습니다.');
+      }
+      const rawAttachments = Array.isArray(request.attachments) ? request.attachments : [];
+      if (rawAttachments.length > 12) {
+        throw new Error('한 번에 최대 12개까지 첨부할 수 있습니다.');
+      }
+      const validatedAttachments = [];
+      for (const att of rawAttachments) {
+        const rawPath = typeof att?.path === 'string' ? att.path.trim() : '';
+        if (!rawPath || rawPath.includes('\0') || !path.isAbsolute(rawPath)) {
+          throw new Error(`유효한 첨부 파일 절대 경로가 아닙니다: ${rawPath || '(빈 경로)'}`);
+        }
+        const resolvedPath = path.resolve(rawPath);
+        let st = null;
+        try {
+          st = fs.statSync(resolvedPath);
+        } catch {
+          st = null;
+        }
+        if (!st || !st.isFile()) {
+          throw new Error(`실제로 존재하는 일반 파일만 첨부할 수 있습니다: ${resolvedPath}`);
+        }
+        validatedAttachments.push({
+          type: att?.type === 'localImage' ? 'localImage' : 'file',
+          path: resolvedPath,
+        });
+      }
+
+      let text = rawText.trim();
+      if (!text && validatedAttachments.length === 0) {
+        throw new Error('전송할 메시지나 첨부 파일을 입력하세요.');
+      }
       if (text.startsWith('/')) {
         const slashRes = await executeServerSlashCommand(session, text, { emitToTerminal: !sessionProcesses.has(session.id) });
         if (slashRes.handled) {
@@ -3020,14 +3098,10 @@ export function createRemoteServer(options = {}) {
           text = slashRes.rewrittenPrompt;
         }
       }
-      const inputItems = [{ type: 'text', text }];
-      if (Array.isArray(request.attachments)) {
-        for (const att of request.attachments) {
-          if (att?.path) {
-            inputItems.push({ type: att.type === 'localImage' ? 'localImage' : 'file', path: String(att.path) });
-          }
-        }
-      }
+      const inputItems = [
+        ...(text ? [{ type: 'text', text }] : []),
+        ...validatedAttachments,
+      ];
 
       await appServerBridge.ensureStarted().catch(() => {});
       let rpcRes = null;
@@ -3335,17 +3409,99 @@ export function createRemoteServer(options = {}) {
     }
 
     if (type === 'respond') {
-      const key = `${session.id}:${request.requestId}`;
-      const pending = pendingQuestions.get(key);
-      if (pending) {
-        pending.responded = true;
-        pendingQuestions.delete(key);
-        appServerBridge.sendResponse(pending.rpcId, request.result);
-      }
-      return { responded: true };
+      return resolvePendingQuestionResponse(session, session.generation, request.requestId, request.result);
     }
 
     throw new Error(`지원하지 않는 대화 요청 유형입니다: ${type}`);
+  }
+
+  function resolvePendingQuestionResponse(session, expectedGeneration, rawRequestId, rawPayload) {
+    if (!session || !session.active) {
+      throw new Error('응답할 활성 세션을 찾을 수 없습니다.');
+    }
+    if (expectedGeneration !== undefined && expectedGeneration !== null && Number(expectedGeneration) !== session.generation) {
+      throw new Error('세션 세대(generation)가 일치하지 않아 응답을 거부했습니다.');
+    }
+    const requestId = String(rawRequestId ?? '').trim();
+    if (!requestId) {
+      throw new Error('응답할 요청 식별자(requestId)가 필요합니다.');
+    }
+    const key = `${session.id}:${requestId}`;
+    const pending = pendingQuestions.get(key);
+    if (!pending || pending.responded) {
+      throw new Error('미응답 상태의 대기 요청을 찾을 수 없거나 이미 처리되었습니다.');
+    }
+    if (pending.generation !== session.generation) {
+      throw new Error('요청의 세션 세대가 현재 세션 세대와 일치하지 않습니다.');
+    }
+    if (pending.canRespond !== true || pending.kind === 'unsupported') {
+      throw new Error('이 요청 유형은 원격 응답을 지원하지 않습니다.');
+    }
+
+    let rpcResult;
+    if (pending.kind === 'approval') {
+      const decision = typeof rawPayload?.decision === 'string' ? rawPayload.decision.trim() : '';
+      const allowedDecisions = Array.isArray(pending.approval?.options) && pending.approval.options.length > 0
+        ? pending.approval.options.map(opt => opt.id)
+        : ['accept', 'acceptForSession', 'decline', 'cancel'];
+      if (!decision || !allowedDecisions.includes(decision)) {
+        throw new Error(`허용되지 않은 승인 응답 선택지입니다: ${decision || '(비어 있음)'}`);
+      }
+      rpcResult = { decision };
+    } else if (pending.kind === 'question') {
+      const answers = rawPayload?.answers;
+      if (!answers || typeof answers !== 'object' || Array.isArray(answers)) {
+        throw new Error('유효한 질문 답변(answers) 객체가 필요합니다.');
+      }
+      for (const q of pending.questions || []) {
+        const entry = answers[q.id];
+        if (!entry || !Array.isArray(entry.answers) || !entry.answers.some(val => typeof val === 'string' && val.trim().length > 0)) {
+          throw new Error(`질문(${q.id})에 대한 답변이 비어 있습니다.`);
+        }
+      }
+      rpcResult = { answers };
+    } else {
+      throw new Error('지원하지 않는 대기 요청 유형입니다.');
+    }
+
+    pending.responded = true;
+    pendingQuestions.delete(key);
+    appServerBridge.sendResponse(pending.rpcId, rpcResult);
+
+    const stillWaiting = [...pendingQuestions.values()].some(q => q.sessionId === session.id && !q.responded);
+    if (!stillWaiting && session.state === 'waiting') {
+      updateSessionStateIfChanged(session, 'idle');
+    }
+    return { responded: true };
+  }
+
+  function validateCronPromptAndSchedule(rawPrompt, rawSchedule, { trimPrompt = false } = {}) {
+    if (typeof rawPrompt !== 'string' || !rawPrompt.trim() || rawPrompt.includes('\0') || Buffer.byteLength(rawPrompt, 'utf8') > 64 * 1024) {
+      throw new Error('예약 작업 내용은 비어 있을 수 없으며 NUL 없이 UTF-8 64KiB 이하여야 합니다.');
+    }
+    if (!rawSchedule || typeof rawSchedule !== 'object') {
+      throw new Error('예약 일정(schedule) 형식이 올바르지 않습니다.');
+    }
+    let normalizedSchedule;
+    if (rawSchedule.type === 'every') {
+      const seconds = Number(rawSchedule.seconds);
+      if (!Number.isSafeInteger(seconds) || seconds <= 0) {
+        throw new Error('반복 간격(seconds)은 0보다 큰 정수여야 합니다.');
+      }
+      normalizedSchedule = { type: 'every', seconds };
+    } else if (rawSchedule.type === 'at') {
+      const atUnixMs = Number(rawSchedule.atUnixMs);
+      if (!Number.isSafeInteger(atUnixMs) || atUnixMs <= 0) {
+        throw new Error('실행 시각(atUnixMs)은 0보다 큰 안전 정수여야 합니다.');
+      }
+      normalizedSchedule = { type: 'at', atUnixMs };
+    } else {
+      throw new Error('지원하지 않는 예약 일정 유형입니다.');
+    }
+    return {
+      prompt: trimPrompt ? rawPrompt.trim() : rawPrompt,
+      schedule: normalizedSchedule,
+    };
   }
 
   function buildSlashCommandsList(cwd) {
@@ -4390,8 +4546,15 @@ export function createRemoteServer(options = {}) {
           return true;
         });
         filtered.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+        const CATALOG_PAGE_SIZE = 100;
+        const rawCursor = args.request?.cursor;
+        const offset = rawCursor !== undefined && rawCursor !== null && String(rawCursor).trim() !== ''
+          ? Math.max(0, Number.parseInt(String(rawCursor), 10) || 0)
+          : 0;
+        const pageSlice = filtered.slice(offset, offset + CATALOG_PAGE_SIZE);
+        const nextCursor = offset + CATALOG_PAGE_SIZE < filtered.length ? String(offset + CATALOG_PAGE_SIZE) : null;
         return {
-          sessions: filtered.slice(0, 250).map(t => ({
+          sessions: pageSlice.map(t => ({
             id: t.id,
             title: t.title,
             cwd: t.cwd,
@@ -4399,7 +4562,7 @@ export function createRemoteServer(options = {}) {
             updatedAt: t.updatedAt,
             status: 'idle',
           })),
-          nextCursor: null,
+          nextCursor,
         };
       }
       case 'catalog_preview': {
@@ -4421,22 +4584,36 @@ export function createRemoteServer(options = {}) {
             // Fall back to local thread cache.
           }
         }
+        const PREVIEW_TURN_PAGE = 20;
+        const allTurns = thread && Array.isArray(thread.turns) ? thread.turns : [];
+        const hasCursor = args.cursor !== undefined && args.cursor !== null && String(args.cursor).trim() !== '';
+        const endIdx = hasCursor
+          ? Math.max(0, Math.min(allTurns.length, Number.parseInt(String(args.cursor), 10) || 0))
+          : allTurns.length;
+        const startIdx = Math.max(0, endIdx - PREVIEW_TURN_PAGE);
+        const nextCursor = startIdx > 0 ? String(startIdx) : null;
         const messages = [];
         let msgSeq = 1;
-        if (thread && Array.isArray(thread.turns)) {
-          for (const turn of thread.turns.slice(-20)) {
-            for (const item of turn.items || []) {
-              const txt = String(item.text ?? '').trim();
-              if (!txt) continue;
-              messages.push({
-                id: String(item.id || `${turn.id || 'turn'}-${msgSeq++}`),
-                role: item.role === 'user' || item.type === 'userMessage' ? 'user' : 'assistant',
-                text: txt.slice(0, ITEM_PREVIEW_LIMIT),
-              });
-            }
+        for (const turn of allTurns.slice(startIdx, endIdx)) {
+          const rawItems = Array.isArray(turn?.items) ? turn.items : [];
+          for (let idx = 0; idx < rawItems.length; idx += 1) {
+            const norm = normalizeConversationItem(rawItems[idx], idx, String(turn?.id || 'turn'));
+            const txt = itemFullDetailText(norm).trim();
+            if (!txt) continue;
+            messages.push({
+              id: String(norm.id || `${turn?.id || 'turn'}-${msgSeq++}`),
+              role: norm.type === 'userMessage' ? 'user' : 'assistant',
+              text: txt.slice(0, ITEM_PREVIEW_LIMIT),
+            });
           }
         }
-        return { messages, nextCursor: null };
+        return {
+          messages,
+          nextCursor,
+          ...(messages.length === 0 && nextCursor
+            ? { unavailableReason: '이 페이지에는 사용자 메시지나 답변이 없습니다. 이전 대화를 더 불러올 수 있습니다.' }
+            : {}),
+        };
       }
       case 'extensions_list': {
         const cwd = args.cwd ? String(args.cwd) : null;
@@ -4527,28 +4704,51 @@ export function createRemoteServer(options = {}) {
             throw new Error(`원격 제어 RPC(${method})를 실행하지 못했습니다.`);
           }
         }
-        const rawStatus = raw.status && typeof raw.status === 'object'
-          ? raw.status
-          : {
-              status: typeof raw.status === 'string' ? raw.status : (action === 'enable' || action === 'pair' ? 'connected' : 'disabled'),
-              serverName: String(raw.serverName || 'OpenDIY Remote'),
-              environmentId: raw.environmentId ?? null,
-            };
-        const rawPairing = raw.pairing && typeof raw.pairing === 'object'
+        const validMobileStatuses = new Set(['disabled', 'connecting', 'connected', 'reconnecting', 'disconnected', 'error']);
+        const rawStatusSrc = raw.status && typeof raw.status === 'object' ? raw.status : raw;
+        const rawStatusVal = typeof rawStatusSrc?.status === 'string'
+          ? rawStatusSrc.status.trim()
+          : typeof raw.status === 'string'
+            ? raw.status.trim()
+            : '';
+        const normalizedMobileStatus = validMobileStatuses.has(rawStatusVal)
+          ? rawStatusVal
+          : action === 'enable' || action === 'pair' || ['active', 'online', 'paired', 'enabled'].includes(rawStatusVal.toLowerCase())
+            ? 'connected'
+            : 'disabled';
+        const rawEnvId = rawStatusSrc?.environmentId ?? raw.environmentId ?? null;
+        const normalizedStatus = {
+          status: normalizedMobileStatus,
+          serverName: typeof rawStatusSrc?.serverName === 'string' && rawStatusSrc.serverName
+            ? rawStatusSrc.serverName
+            : String(raw.serverName || 'OpenDIY Remote'),
+          environmentId: typeof rawEnvId === 'string' && rawEnvId.trim() ? rawEnvId.trim() : null,
+          ...(Object.prototype.hasOwnProperty.call(rawStatusSrc || {}, 'lastError')
+            ? { lastError: rawStatusSrc.lastError == null ? null : String(rawStatusSrc.lastError) }
+            : {}),
+        };
+        const rawPairingSrc = raw.pairing && typeof raw.pairing === 'object'
           ? raw.pairing
           : action === 'pair' && raw.manualCode
-            ? {
-                manualCode: String(raw.manualCode),
-                expiresAt: Number(raw.expiresAt || Math.floor(Date.now() / 1000) + 300),
-                environmentId: String(raw.environmentId || rawStatus.environmentId || 'env-1'),
-              }
+            ? raw
             : null;
+        const manualCode = typeof rawPairingSrc?.manualCode === 'string' ? rawPairingSrc.manualCode.trim() : '';
+        const normalizedPairing = manualCode
+          ? {
+              manualCode,
+              expiresAt: normalizeUnixSeconds(rawPairingSrc.expiresAt) ?? (Math.floor(Date.now() / 1000) + 300),
+              environmentId:
+                (typeof rawPairingSrc.environmentId === 'string' && rawPairingSrc.environmentId.trim()) ||
+                normalizedStatus.environmentId ||
+                'env-1',
+            }
+          : null;
         return {
           isolated: Boolean(raw.isolated ?? true),
           shared: Boolean(raw.shared ?? false),
           mutationsAllowed: Boolean(raw.mutationsAllowed ?? true),
-          status: rawStatus,
-          pairing: rawPairing,
+          status: normalizedStatus,
+          pairing: normalizedPairing,
         };
       }
       case 'subagents_request': {
@@ -4562,8 +4762,23 @@ export function createRemoteServer(options = {}) {
         const threadObj = session.threadId ? state.threads[session.threadId] : null;
         const effectiveConnected = isSessionEffectivelyConnected(session, threadObj);
         const supported = Boolean(appServerBridge.serverInfo?.supportsSubagentManagement ?? effectiveConnected);
+        const isUuid = val => typeof val === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val);
+        const mapSubagentStatus = rawSt => {
+          const s = String(rawSt || '').trim();
+          if (['pending', 'running', 'idle', 'completed', 'errored', 'closed', 'unknown'].includes(s)) return s;
+          const lower = s.toLowerCase();
+          if (lower === 'inprogress' || lower === 'in_progress' || lower === 'active' || lower === 'working') return 'running';
+          if (lower === 'waiting') return 'idle';
+          if (lower === 'done' || lower === 'succeeded' || lower === 'finished') return 'completed';
+          if (lower === 'failed' || lower === 'error') return 'errored';
+          if (lower === 'stopped' || lower === 'terminated' || lower === 'cancelled' || lower === 'canceled') return 'closed';
+          return 'unknown';
+        };
+        const cleanOptText = (val, limit = 1024) =>
+          typeof val === 'string' && val.length > 0 && val.length <= limit && !val.includes('\0') ? val : null;
+
         if (!req.type || req.type === 'list') {
-          let agents = [];
+          let rawAgents = [];
           let nextCursor = null;
           if (rpcConnected && supported) {
             try {
@@ -4571,22 +4786,53 @@ export function createRemoteServer(options = {}) {
                 threadId: session.threadId,
                 cursor: req.cursor ?? null,
               });
-              if (Array.isArray(rpcRes?.agents)) agents = rpcRes.agents;
-              else if (Array.isArray(rpcRes?.data)) agents = rpcRes.data;
-              nextCursor = rpcRes?.nextCursor ?? null;
+              if (Array.isArray(rpcRes?.agents)) rawAgents = rpcRes.agents;
+              else if (Array.isArray(rpcRes?.data)) rawAgents = rpcRes.data;
+              nextCursor = cleanOptText(rpcRes?.nextCursor, 1024);
             } catch {
               // Keep empty list if server returns error for unmaterialized thread.
             }
           }
+          const seenAgentIds = new Set();
+          const agents = [];
+          const fallbackParentThreadId = cleanOptText(session.threadId, 1024) || 'local';
+          for (const item of rawAgents) {
+            if (!item || typeof item !== 'object') continue;
+            const agentId = cleanOptText(String(item.id ?? item.agentId ?? '').trim(), 1024);
+            if (!agentId || seenAgentIds.has(agentId)) continue;
+            seenAgentIds.add(agentId);
+            const status = mapSubagentStatus(item.status ?? item.state);
+            const rawCaps = item.capabilities && typeof item.capabilities === 'object' ? item.capabilities : {};
+            agents.push({
+              id: agentId,
+              parentThreadId: cleanOptText(item.parentThreadId ?? item.parent_thread_id, 1024) || fallbackParentThreadId,
+              runtimeId: isUuid(item.runtimeId ?? item.runtime_id) ? String(item.runtimeId ?? item.runtime_id) : null,
+              nickname: cleanOptText(item.nickname ?? item.name, 1024),
+              role: cleanOptText(item.role, 1024),
+              status,
+              model: cleanOptText(item.model, 1024),
+              effort: cleanOptText(item.effort ?? item.reasoningEffort, 1024),
+              activeTurnId: cleanOptText(item.activeTurnId ?? item.active_turn_id, 1024),
+              capabilities: {
+                send: typeof rawCaps.send === 'boolean' ? rawCaps.send : status !== 'closed',
+                interrupt: typeof rawCaps.interrupt === 'boolean' ? rawCaps.interrupt : status === 'running',
+                close: typeof rawCaps.close === 'boolean' ? rawCaps.close : status !== 'closed',
+                resume: typeof rawCaps.resume === 'boolean' ? rawCaps.resume : ['closed', 'errored', 'completed'].includes(status),
+              },
+            });
+          }
           return {
             supported,
             connected: effectiveConnected,
-            parentRuntimeId: appServerBridge.runtimeId,
+            parentRuntimeId: isUuid(appServerBridge.runtimeId) ? appServerBridge.runtimeId : null,
             agents,
             nextCursor,
             mutationState: 'clear',
-            reconciledRequestId: req.requestId ?? null,
+            reconciledRequestId: cleanOptText(req.requestId, 1024) ?? session.lastSubagentRequestId ?? null,
           };
+        }
+        if (cleanOptText(req.requestId, 1024)) {
+          session.lastSubagentRequestId = String(req.requestId);
         }
         if (rpcConnected && supported) {
           try {
@@ -4594,8 +4840,9 @@ export function createRemoteServer(options = {}) {
               threadId: session.threadId,
               ...req,
             });
+            const replyStatus = String(rpcRes?.status || 'applied');
             return {
-              status: String(rpcRes?.status || 'applied'),
+              status: ['applied', 'notApplied', 'unknown', 'unsupported'].includes(replyStatus) ? replyStatus : 'applied',
             };
           } catch {
             return { status: 'notApplied' };
@@ -4617,6 +4864,7 @@ export function createRemoteServer(options = {}) {
         const jobs = cronJobsByThread.get(threadKey);
 
         if (!req.type || req.type === 'list') {
+          const reconciled = req.requestId ? String(req.requestId) : session.lastCronRequestId || null;
           return {
             supported: true,
             connected,
@@ -4624,18 +4872,24 @@ export function createRemoteServer(options = {}) {
             jobs,
             hasMore: false,
             mutationState: 'clear',
-            ...(req.requestId ? { reconciledRequestId: String(req.requestId) } : {}),
+            ...(reconciled ? { reconciledRequestId: reconciled } : {}),
             supportsExpectedTurnInterrupt: Boolean(appServerBridge.serverInfo?.supportsExpectedTurnInterrupt ?? true),
           };
         }
+        if (req.requestId) {
+          session.lastCronRequestId = String(req.requestId);
+        }
         if (req.type === 'add') {
-          const promptText = String(req.prompt ?? req.promptPreview ?? '').trim();
-          const schedule = req.schedule || { type: 'every', seconds: 60 };
+          const { prompt: promptText, schedule } = validateCronPromptAndSchedule(
+            String(req.prompt ?? req.promptPreview ?? ''),
+            req.schedule,
+            { trimPrompt: true },
+          );
           const jobId = String(cronJobSeq++);
           const nextRunAt =
             schedule.type === 'every'
-              ? Date.now() + Math.max(1, Number(schedule.seconds || 60)) * 1000
-              : Number(schedule.atUnixMs || Date.now() + 60000);
+              ? Date.now() + schedule.seconds * 1000
+              : schedule.atUnixMs;
           const job = {
             id: jobId,
             promptPreview: promptText.slice(0, 512),
@@ -4678,9 +4932,23 @@ export function createRemoteServer(options = {}) {
       }
       case 'saved_cron_save': {
         const id = args.id ? String(args.id) : crypto.randomUUID();
-        const threadId = String(args.threadId ?? args.thread_id ?? '');
-        const prompt = String(args.prompt ?? '').trim();
-        const schedule = args.schedule;
+        const threadId = String(args.threadId ?? args.thread_id ?? '').trim();
+        if (!threadId || threadId.includes('\0')) {
+          throw new Error('저장 예약을 연결할 유효한 대화 스레드 ID(threadId)가 필요합니다.');
+        }
+        const { prompt, schedule } = validateCronPromptAndSchedule(String(args.prompt ?? ''), args.schedule, {
+          trimPrompt: false,
+        });
+        const idx = state.savedCrons.findIndex(c => c.id === id);
+        if (idx !== -1) {
+          const existing = state.savedCrons[idx];
+          if (existing.threadId !== threadId) {
+            throw new Error('다른 대화 스레드의 저장 예약 정의는 수정할 수 없습니다.');
+          }
+          if (existing.registration) {
+            throw new Error('이미 CLI에 등록되었거나 등록 결과 확인 중인 정의는 덮어쓸 수 없습니다.');
+          }
+        }
         const entry = {
           id,
           threadId,
@@ -4689,7 +4957,6 @@ export function createRemoteServer(options = {}) {
           registration: null,
           updatedAt: Math.floor(Date.now() / 1000),
         };
-        const idx = state.savedCrons.findIndex(c => c.id === id);
         if (idx !== -1) state.savedCrons[idx] = entry;
         else state.savedCrons.push(entry);
         persistState();
@@ -4697,6 +4964,17 @@ export function createRemoteServer(options = {}) {
       }
       case 'saved_cron_delete': {
         const id = String(args.id ?? '');
+        const expectedThreadId = args.threadId !== undefined ? String(args.threadId) : (args.thread_id !== undefined ? String(args.thread_id) : null);
+        const existing = state.savedCrons.find(c => c.id === id);
+        if (!existing) {
+          throw new Error('삭제할 저장 예약 정의를 찾을 수 없습니다.');
+        }
+        if (expectedThreadId !== null && existing.threadId !== expectedThreadId) {
+          throw new Error('저장 예약 정의의 대화 스레드가 일치하지 않습니다.');
+        }
+        if (existing.registration && existing.registration.state !== 'registered') {
+          throw new Error('등록 결과 미확인 상태인 저장 예약 정의는 삭제할 수 없습니다.');
+        }
         state.savedCrons = state.savedCrons.filter(c => c.id !== id);
         persistState();
         return null;
@@ -4709,17 +4987,28 @@ export function createRemoteServer(options = {}) {
         const defId = String(args.definitionId ?? args.definition_id ?? '');
         const saved = state.savedCrons.find(c => c.id === defId);
         if (!saved) throw new Error('저장된 예약 항목을 찾을 수 없습니다.');
+        if (args.threadId !== undefined && String(args.threadId) !== saved.threadId) {
+          throw new Error('저장 예약의 대화 스레드가 현재 세션 스레드와 일치하지 않습니다.');
+        }
+        if (saved.registration) {
+          throw new Error('이미 CLI에 등록되었거나 등록 확인 중인 예약 정의입니다.');
+        }
+        const { prompt: validatedPrompt, schedule: validatedSchedule } = validateCronPromptAndSchedule(
+          String(saved.prompt ?? ''),
+          saved.schedule,
+          { trimPrompt: false },
+        );
         const threadKey = String(session.threadId || session.id);
         if (!cronJobsByThread.has(threadKey)) cronJobsByThread.set(threadKey, []);
         const jobs = cronJobsByThread.get(threadKey);
         const jobId = String(cronJobSeq++);
-        const nextRunAt = saved.schedule?.type === 'every'
-          ? Date.now() + Number(saved.schedule.seconds) * 1000
-          : Number(saved.schedule?.atUnixMs || Date.now() + 60000);
+        const nextRunAt = validatedSchedule.type === 'every'
+          ? Date.now() + validatedSchedule.seconds * 1000
+          : validatedSchedule.atUnixMs;
         const job = {
           id: jobId,
-          promptPreview: String(saved.prompt).slice(0, 512),
-          schedule: saved.schedule,
+          promptPreview: validatedPrompt.slice(0, 512),
+          schedule: validatedSchedule,
           state: 'ready',
           paused: false,
           removed: false,
@@ -4727,7 +5016,7 @@ export function createRemoteServer(options = {}) {
           skipped: 0,
         };
         jobs.push(job);
-        scheduleCronJob(session, job, String(saved.prompt));
+        scheduleCronJob(session, job, validatedPrompt);
         saved.registration = {
           sessionId: session.id,
           generation: session.generation,
@@ -4750,15 +5039,9 @@ export function createRemoteServer(options = {}) {
       case 'respond_pending_question': {
         const sessionId = String(args.sessionId ?? args.session_id ?? '');
         const requestId = String(args.requestId ?? args.request_id ?? '');
-        const key = `${sessionId}:${requestId}`;
-        const pending = pendingQuestions.get(key);
-        if (pending) {
-          pending.responded = true;
-          pendingQuestions.delete(key);
-          const result = args.answers !== undefined ? { answers: args.answers } : { decision: args.decision };
-          appServerBridge.sendResponse(pending.rpcId, result);
-        }
-        return { responded: true };
+        const session = sessions.get(sessionId);
+        const payload = args.answers !== undefined ? { answers: args.answers } : { decision: args.decision };
+        return resolvePendingQuestionResponse(session, args.generation, requestId, payload);
       }
       case 'choose_conversation_attachments': {
         const paths = Array.isArray(args.paths) ? args.paths : [];

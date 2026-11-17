@@ -50,8 +50,8 @@ When the web server and `opendiy-codex` run on the same machine, run in the defa
 
 ### Build
 ```bash
-git clone https://github.com/jaeseongs95/opendiy-remote.git
-cd opendiy-remote
+git clone https://github.com/jaeseongs95/Arcvera-Connect.git
+cd Arcvera-Connect
 npm ci
 npm run build
 ```
@@ -63,7 +63,7 @@ npm run build
 #### Option 1 — One-Click VPS Install (Ubuntu / Debian)
 Run a single command on your fresh Ubuntu/Debian VPS to install Node.js 22+, download the pre-built release bundle, register the `systemd` service (`opendiy-remote.service`), and generate random access credentials automatically:
 ```bash
-curl -fsSL https://github.com/jaeseongs95/opendiy-remote/releases/download/v1.2.2/install-relay.sh | bash
+curl -fsSL https://github.com/jaeseongs95/Arcvera-Connect/releases/download/v1.2.2/install-relay.sh | bash
 ```
 
 #### Option 2 — Manual Relay Startup (No `codex` binary required)

@@ -424,12 +424,26 @@ test('relay + host connector mode renders mirrored desktop terminal rollout on i
         if (method === 'initialize') {
           return {
             userAgent: 'codex-app-server/e2e-relay',
+            supportsSubagentManagement: true,
+            supportsExpectedTurnInterrupt: true,
             opendiyCapabilities: {
               passiveSubscription: true,
               userTurnStartIfIdle: true,
               compactStartIfIdle: true,
               historySummary: true,
             },
+          };
+        }
+        if (method === 'thread/subagents/list') {
+          return {
+            data: [
+              {
+                id: 'e2e-sub-1',
+                status: 'inProgress',
+                runtimeId: 'legacy-non-uuid',
+                nickname: '검증 워커',
+              },
+            ],
           };
         }
         if (method === 'thread/read' && params?.includeTurns === true) {
@@ -641,6 +655,45 @@ test('relay + host connector mode renders mirrored desktop terminal rollout on i
     await expect(codexSettingsDialog).toBeHidden();
     await settingsDialog.locator('#settings-close').click();
     await expect(settingsDialog).toBeHidden();
+
+    // D-0026: Subagent Manager dialog opens and renders normalized subagent row without validation error
+    await card.locator('.subagents-open').click();
+    const subagentsDialog = page.locator('#subagents-dialog');
+    await expect(subagentsDialog).toBeVisible();
+    await expect(subagentsDialog.locator('.subagent-error')).toBeHidden();
+    await expect(subagentsDialog.locator('.subagent-list')).toContainText('검증 워커');
+    await subagentsDialog.locator('.subagent-close').click();
+    await expect(subagentsDialog).toBeHidden();
+
+    // D-0024: Pending approval appears in Question Center and single-shot approval clears it
+    rpcNotificationListener?.({
+      id: 'e2e-approval-req-1',
+      method: 'item/commandExecution/requestApproval',
+      params: {
+        threadId: 'thread-relay-1',
+        turnId: 'turn-relay-e2e-1',
+        command: 'git status --short',
+        availableDecisions: ['accept', 'decline'],
+      },
+    });
+    await expect(page.locator('#question-count')).toHaveText('1', { timeout: 5000 });
+    await page.locator('.question-center-button').click();
+    const questionDialog = page.locator('#question-center');
+    await expect(questionDialog).toBeVisible();
+    await expect(questionDialog.locator('.question-item')).toContainText('git status --short');
+    await questionDialog.locator('.question-item button', { hasText: '승인' }).click();
+    await expect(questionDialog.locator('.question-response-status')).toContainText('응답을 보냈습니다');
+    await questionDialog.locator('.question-close').click();
+    await expect(questionDialog).toBeHidden();
+    await expect(page.locator('#question-count')).toBeHidden({ timeout: 5000 });
+
+    // D-0028: Catalog preview renders tool/command execution items alongside user/assistant messages
+    await page.locator('#catalog-open').click();
+    await expect(catalogDialog).toBeVisible();
+    await expect(catalogDialog.locator('#catalog-messages')).toContainText('중단된 지점부터 이어서 작업해줘.');
+    await expect(catalogDialog.locator('#catalog-messages')).toContainText('git status --short');
+    await catalogDialog.locator('#catalog-close').click();
+    await expect(catalogDialog).toBeHidden();
 
     // D-0014: Clicking '#exit' ('로그아웃') clears sessionStorage token, revokes cookie session, and shows sign-in gate
     const tokenBeforeLogout = await page.evaluate(() => sessionStorage.getItem('opendiy_remote_token'));

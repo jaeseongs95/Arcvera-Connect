@@ -2137,3 +2137,541 @@ test('D-0012 through D-0022: security boundaries, runtime metadata, weekly windo
     try { fs.rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch {}
   }
 });
+
+test('D-0023 through D-0030: Arcvera-Connect slug/installer parity, pending question auth, attachment validation, subagent/mobile/weekly normalization, catalog pagination, UTF-8 detail snapshot, and cron guards', async () => {
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const { fileURLToPath } = await import('node:url');
+  const {
+    GITHUB_REPO_SLUG,
+    fetchLatestReleaseInfo,
+    createRemoteServer,
+  } = await import('../server/remote-server.mjs');
+
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+  // 1. D-0023: Canonical GitHub repository slug, installer bundle fallback, and README URL parity
+  assert.equal(GITHUB_REPO_SLUG, 'jaeseongs95/Arcvera-Connect');
+  const installerText = fs.readFileSync(path.join(repoRoot, 'scripts', 'install-relay.sh'), 'utf8');
+  assert.equal(installerText.includes('jaeseongs95/Arcvera-Connect'), true);
+  assert.equal(installerText.includes('arcvera-connect-${VERSION}-relay-bundle.tar.gz'), true);
+  assert.equal(installerText.includes('opendiy-remote-${VERSION}-relay-bundle.tar.gz'), true);
+  const readmeEn = fs.readFileSync(path.join(repoRoot, 'README.md'), 'utf8');
+  const readmeKo = fs.readFileSync(path.join(repoRoot, 'README.ko.md'), 'utf8');
+  assert.equal(readmeEn.includes('https://github.com/jaeseongs95/Arcvera-Connect'), true);
+  assert.equal(readmeKo.includes('https://github.com/jaeseongs95/Arcvera-Connect'), true);
+  assert.equal(readmeEn.includes('https://github.com/jaeseongs95/opendiy-remote'), false);
+  assert.equal(readmeKo.includes('https://github.com/jaeseongs95/opendiy-remote'), false);
+
+  const releaseCheck = await fetchLatestReleaseInfo({
+    currentVersion: '1.2.2',
+    fetchFn: async (url: string) => {
+      assert.equal(url, 'https://api.github.com/repos/jaeseongs95/Arcvera-Connect/releases/latest');
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          tag_name: 'v1.2.3',
+          assets: [
+            {
+              name: 'arcvera-connect-v1.2.3-relay-bundle.tar.gz',
+              browser_download_url: 'https://github.com/jaeseongs95/Arcvera-Connect/releases/download/v1.2.3/arcvera-connect-v1.2.3-relay-bundle.tar.gz',
+              size: 4096,
+              digest: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+            },
+          ],
+        }),
+      };
+    },
+  });
+  assert.equal(releaseCheck.updateAvailable, true);
+  assert.equal(releaseCheck.bundleName, 'arcvera-connect-v1.2.3-relay-bundle.tar.gz');
+
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'arcvera-d0023-d0030-'));
+  try {
+    const projDir = path.join(tmpRoot, 'proj');
+    fs.mkdirSync(projDir, { recursive: true });
+    const validAttachFile = path.join(tmpRoot, 'sample-note.txt');
+    fs.writeFileSync(validAttachFile, 'attachment-body', 'utf8');
+
+    let notifyFn: ((msg: any) => void) | null = null;
+    const sentResponses: Array<{ id: any; result: any }> = [];
+    let rateLimitsResetValue: unknown = 1794878138000; // epoch ms initially
+    let lastTurnStartParams: any = null;
+    const emojiKoreanBlock = '한글🚀세부내용검증-'.repeat(1800); // > 40 KB UTF-8 with surrogate pairs
+
+    const srv = createRemoteServer({
+      mode: 'direct',
+      token: 'tok-d23',
+      workspaceDir: path.join(tmpRoot, 'ws'),
+      allowPathDiscovery: false,
+      spawnProcess: false,
+      rpcTransport: Object.assign(
+        async (method: string, params: any) => {
+          if (method === 'initialize') {
+            return {
+              userAgent: 'codex-app-server/d23',
+              supportsSubagentManagement: true,
+              supportsExpectedTurnInterrupt: true,
+              opendiyCapabilities: {
+                passiveSubscription: true,
+                userTurnStartIfIdle: true,
+                compactStartIfIdle: true,
+                historySummary: true,
+              },
+            };
+          }
+          if (method === 'thread/start' || method === 'thread/resume') {
+            return { thread: { id: params.threadId || 'thread-d23-main', cwd: projDir, turns: [] } };
+          }
+          if (method === 'thread/read') {
+            if (params.threadId === 'thread-d23-detail') {
+              return {
+                thread: {
+                  id: 'thread-d23-detail',
+                  cwd: projDir,
+                  turns: [
+                    {
+                      id: 'turn-detail-1',
+                      status: 'completed',
+                      items: [
+                        {
+                          id: 'item-detail-big',
+                          type: 'agentMessage',
+                          text: emojiKoreanBlock,
+                          status: 'completed',
+                        },
+                      ],
+                    },
+                  ],
+                },
+              };
+            }
+            if (params.threadId === 'thread-preview-paged') {
+              const turns = Array.from({ length: 25 }, (_, i) => ({
+                id: `turn-p-${i + 1}`,
+                status: 'completed',
+                items:
+                  i % 2 === 0
+                    ? [
+                        {
+                          id: `u-p-${i + 1}`,
+                          type: 'userMessage',
+                          content: [{ type: 'text', text: `구조화 질문 ${i + 1}` }],
+                        },
+                      ]
+                    : [
+                        {
+                          id: `cmd-p-${i + 1}`,
+                          type: 'commandExecution',
+                          command: `git log -n ${i + 1}`,
+                          aggregatedOutput: `commit-${i + 1}`,
+                        },
+                      ],
+              }));
+              return { thread: { id: 'thread-preview-paged', cwd: projDir, turns } };
+            }
+            return { thread: { id: params.threadId, cwd: projDir, turns: [] } };
+          }
+          if (method === 'turn/start') {
+            lastTurnStartParams = params;
+            return {
+              turn: {
+                id: `turn-${Date.now()}`,
+                status: 'completed',
+                items: [{ id: 'a-ok', type: 'agentMessage', text: 'ok', status: 'completed' }],
+              },
+            };
+          }
+          if (method === 'thread/subagents/list') {
+            return {
+              data: [
+                {
+                  id: 'sub-raw-1',
+                  status: 'inProgress',
+                  runtimeId: 'not-a-valid-uuid',
+                  name: 'Worker 1',
+                },
+              ],
+            };
+          }
+          if (method === 'thread/subagents/control') {
+            return { status: 'applied' };
+          }
+          if (method === 'account/rateLimits/read') {
+            return {
+              rateLimits: {
+                limitName: 'weekly-plan',
+                weekly: { usedPercent: 42, resetsAt: rateLimitsResetValue },
+              },
+            };
+          }
+          if (method === 'remoteControl/pairing/start') {
+            return {
+              status: 'ACTIVE_UNKNOWN_ENUM',
+              manualCode: '123-456',
+              expiresAt: 1794878138000, // ms instead of sec
+              environmentId: '',
+            };
+          }
+          return {};
+        },
+        {
+          subscribe(fn: (msg: any) => void) {
+            notifyFn = fn;
+            return () => { if (notifyFn === fn) notifyFn = null; };
+          },
+          sendResponse(id: any, result: any) {
+            sentResponses.push({ id, result });
+          },
+        },
+      ),
+    });
+
+    const port = await new Promise<number>(resolve => {
+      srv.server.listen(0, '127.0.0.1', () => {
+        const addr = srv.server.address();
+        resolve(typeof addr === 'object' && addr ? addr.port : 0);
+      });
+    });
+
+    try {
+      const invoke = async (command: string, args: Record<string, unknown> = {}) => {
+        const res = await fetch(`http://127.0.0.1:${port}/api/invoke`, {
+          method: 'POST',
+          headers: { Authorization: 'Bearer tok-d23', 'Content-Type': 'application/json' },
+          body: JSON.stringify({ command, args }),
+        });
+        return res.json() as Promise<{ ok: boolean; result?: any; error?: string }>;
+      };
+
+      await invoke('prepare_runtime');
+      const sessRes = await invoke('start_session', {
+        request: { title: 'D0024-D0030 검증', cwd: projDir, threadId: 'thread-d23-main' },
+      });
+      assert.equal(sessRes.ok, true);
+      const sid = sessRes.result.id;
+      const sgen = sessRes.result.generation;
+
+      // 2. D-0024: respond_pending_question & conversation_request(respond) enforce active session, generation, canRespond, valid payload, and single-shot
+      notifyFn?.({
+        id: 'rpc-unsupported-1',
+        method: 'item/unknownCustomPrompt',
+        params: { threadId: 'thread-d23-main' },
+      });
+      notifyFn?.({
+        id: 'rpc-approval-valid',
+        method: 'item/commandExecution/requestApproval',
+        params: { threadId: 'thread-d23-main', command: 'npm test', availableDecisions: ['accept', 'decline'] },
+      });
+
+      // Unknown requestId must fail
+      const missingResp = await invoke('respond_pending_question', {
+        sessionId: sid,
+        generation: sgen,
+        requestId: 'non-existent-req',
+        decision: 'accept',
+      });
+      assert.equal(missingResp.ok, false);
+
+      // Mismatched generation must fail
+      const wrongGenResp = await invoke('respond_pending_question', {
+        sessionId: sid,
+        generation: sgen + 1,
+        requestId: 'rpc-approval-valid',
+        decision: 'accept',
+      });
+      assert.equal(wrongGenResp.ok, false);
+
+      // Unsupported request (canRespond === false) must fail
+      const unsupportedResp = await invoke('respond_pending_question', {
+        sessionId: sid,
+        generation: sgen,
+        requestId: 'rpc-unsupported-1',
+        decision: 'accept',
+      });
+      assert.equal(unsupportedResp.ok, false);
+
+      // Disallowed approval decision must fail without consuming the pending request
+      const badDecisionResp = await invoke('respond_pending_question', {
+        sessionId: sid,
+        generation: sgen,
+        requestId: 'rpc-approval-valid',
+        decision: 'acceptForSession',
+      });
+      assert.equal(badDecisionResp.ok, false);
+
+      // Valid single-shot approval succeeds and dispatches JSON-RPC response
+      const okApprovalResp = await invoke('respond_pending_question', {
+        sessionId: sid,
+        generation: sgen,
+        requestId: 'rpc-approval-valid',
+        decision: 'accept',
+      });
+      assert.equal(okApprovalResp.ok, true);
+      assert.equal(sentResponses.length, 1);
+      assert.deepEqual(sentResponses[0], { id: 'rpc-approval-valid', result: { decision: 'accept' } });
+
+      // Duplicate second response to the same requestId must fail
+      const dupApprovalResp = await invoke('conversation_request', {
+        id: sid,
+        generation: sgen,
+        request: { type: 'respond', requestId: 'rpc-approval-valid', result: { decision: 'accept' } },
+      });
+      assert.equal(dupApprovalResp.ok, false);
+
+      // 3. D-0025: conversation_request(send) validates attachments, caps count/size, and permits attachment-only messages
+      const relAttachRes = await invoke('conversation_request', {
+        id: sid,
+        generation: sgen,
+        request: { type: 'send', text: '상대경로 첨부', attachments: [{ type: 'file', path: '../secret.txt' }] },
+      });
+      assert.equal(relAttachRes.ok, false);
+
+      const dirAttachRes = await invoke('conversation_request', {
+        id: sid,
+        generation: sgen,
+        request: { type: 'send', text: '폴더 첨부', attachments: [{ type: 'file', path: projDir }] },
+      });
+      assert.equal(dirAttachRes.ok, false);
+
+      const tooManyAttachRes = await invoke('conversation_request', {
+        id: sid,
+        generation: sgen,
+        request: {
+          type: 'send',
+          text: '초과 첨부',
+          attachments: Array.from({ length: 13 }, () => ({ type: 'file', path: validAttachFile })),
+        },
+      });
+      assert.equal(tooManyAttachRes.ok, false);
+
+      const oversizedTextRes = await invoke('conversation_request', {
+        id: sid,
+        generation: sgen,
+        request: { type: 'send', text: '가'.repeat(25000) }, // 75,000 UTF-8 bytes > 64 KiB
+      });
+      assert.equal(oversizedTextRes.ok, false);
+
+      // Attachment-only send (empty text + valid attachment) succeeds
+      const attachOnlyRes = await invoke('conversation_request', {
+        id: sid,
+        generation: sgen,
+        request: { type: 'send', text: '', attachments: [{ type: 'file', path: validAttachFile }] },
+      });
+      assert.equal(attachOnlyRes.ok, true);
+      assert.equal(
+        lastTurnStartParams.input.some((item: any) => item.type === 'file' && item.path === validAttachFile),
+        true,
+      );
+
+      // 4. D-0026: subagents_request normalizes raw agent schema and reconciles mutated requestId (and cron_request reconciles too)
+      const subMutReqId = '11111111-2222-4333-8444-555555555555';
+      const subMutRes = await invoke('subagents_request', {
+        id: sid,
+        generation: sgen,
+        request: { type: 'interrupt', agentId: 'sub-raw-1', requestId: subMutReqId },
+      });
+      assert.equal(subMutRes.ok, true);
+      assert.equal(subMutRes.result.status, 'applied');
+
+      const subListRes = await invoke('subagents_request', {
+        id: sid,
+        generation: sgen,
+        request: { type: 'list' },
+      });
+      assert.equal(subListRes.ok, true);
+      assert.equal(subListRes.result.reconciledRequestId, subMutReqId);
+      assert.equal(subListRes.result.agents.length, 1);
+      const normAgent = subListRes.result.agents[0];
+      assert.equal(normAgent.id, 'sub-raw-1');
+      assert.equal(normAgent.parentThreadId, 'thread-d23-main');
+      assert.equal(normAgent.status, 'running');
+      assert.equal(normAgent.runtimeId, null);
+      assert.equal(typeof normAgent.capabilities.send, 'boolean');
+      assert.equal(typeof normAgent.capabilities.interrupt, 'boolean');
+      assert.equal(typeof normAgent.capabilities.close, 'boolean');
+      assert.equal(typeof normAgent.capabilities.resume, 'boolean');
+
+      const cronMutReqId = '22222222-3333-4444-8555-666666666666';
+      const cronAddOk = await invoke('cron_request', {
+        id: sid,
+        generation: sgen,
+        request: { type: 'add', requestId: cronMutReqId, prompt: '주기 점검', schedule: { type: 'every', seconds: 120 } },
+      });
+      assert.equal(cronAddOk.ok, true);
+      const cronListReconciled = await invoke('cron_request', {
+        id: sid,
+        generation: sgen,
+        request: { type: 'list' },
+      });
+      assert.equal(cronListReconciled.ok, true);
+      assert.equal(cronListReconciled.result.reconciledRequestId, cronMutReqId);
+
+      // 5. D-0027: weekly_usage normalizes ms & ISO resetsAt to Unix seconds; mobile_control normalizes status & pairing
+      const wkMs = await invoke('weekly_usage');
+      assert.equal(wkMs.ok, true);
+      assert.equal(wkMs.result.weekly.resetsAt, 1794878138);
+
+      rateLimitsResetValue = '2026-11-20T00:00:00Z';
+      const wkIso = await invoke('weekly_usage');
+      assert.equal(wkIso.ok, true);
+      assert.equal(wkIso.result.weekly.resetsAt, Math.floor(Date.parse('2026-11-20T00:00:00Z') / 1000));
+
+      const mobilePair = await invoke('mobile_control', {
+        id: sid,
+        generation: sgen,
+        action: 'pair',
+      });
+      assert.equal(mobilePair.ok, true);
+      assert.equal(
+        ['disabled', 'connecting', 'connected', 'reconnecting', 'disconnected', 'error'].includes(mobilePair.result.status.status),
+        true,
+      );
+      assert.equal(typeof mobilePair.result.status.serverName, 'string');
+      assert.equal(mobilePair.result.pairing.manualCode, '123-456');
+      assert.equal(mobilePair.result.pairing.expiresAt, 1794878138);
+      assert.equal(mobilePair.result.pairing.environmentId.length > 0, true);
+
+      // 6. D-0028: catalog_list & catalog_preview cursor pagination + structured/tool message preview
+      for (let i = 0; i < 115; i++) {
+        await invoke('start_session', {
+          request: { title: `카탈로그 세션 ${i}`, cwd: projDir, threadId: `thread-cat-${i}` },
+        });
+      }
+      const catPage1 = await invoke('catalog_list', { request: { query: 'thread-cat-' } });
+      assert.equal(catPage1.ok, true);
+      assert.equal(catPage1.result.sessions.length, 100);
+      assert.ok(catPage1.result.nextCursor);
+      const catPage2 = await invoke('catalog_list', {
+        request: { query: 'thread-cat-', cursor: catPage1.result.nextCursor },
+      });
+      assert.equal(catPage2.ok, true);
+      assert.equal(catPage2.result.sessions.length, 15);
+      assert.equal(catPage2.result.nextCursor, null);
+
+      const prevPage1 = await invoke('catalog_preview', { threadId: 'thread-preview-paged' });
+      assert.equal(prevPage1.ok, true);
+      assert.equal(prevPage1.result.messages.length, 20);
+      assert.ok(prevPage1.result.nextCursor);
+      assert.equal(
+        prevPage1.result.messages.some((m: any) => m.text.includes('git log -n')),
+        true,
+      );
+      assert.equal(
+        prevPage1.result.messages.some((m: any) => m.text.includes('구조화 질문')),
+        true,
+      );
+      const prevPage2 = await invoke('catalog_preview', {
+        threadId: 'thread-preview-paged',
+        cursor: prevPage1.result.nextCursor,
+      });
+      assert.equal(prevPage2.ok, true);
+      assert.equal(prevPage2.result.messages.length, 5);
+      assert.equal(prevPage2.result.nextCursor, null);
+
+      // 7. D-0029: detail UTF-8 byte slicing preserves multi-byte/surrogate boundaries and validates snapshotId
+      const detailSess = await invoke('start_session', {
+        request: { title: '상세 검증', cwd: projDir, threadId: 'thread-d23-detail' },
+      });
+      assert.equal(detailSess.ok, true);
+      const expectedTotalBytes = Buffer.byteLength(emojiKoreanBlock, 'utf8');
+      let assembled = '';
+      let detailOffset: number | null = 0;
+      let snapId = '';
+      while (detailOffset !== null) {
+        const dRes = await invoke('conversation_request', {
+          id: detailSess.result.id,
+          generation: detailSess.result.generation,
+          request: {
+            type: 'detail',
+            turnId: 'turn-detail-1',
+            itemId: 'item-detail-big',
+            offset: detailOffset,
+            ...(detailOffset > 0 ? { snapshotId: snapId } : {}),
+          },
+        });
+        assert.equal(dRes.ok, true);
+        assert.equal(dRes.result.totalBytes, expectedTotalBytes);
+        assert.equal(dRes.result.text.includes('\uFFFD'), false, 'UTF-8 boundary slice must never emit U+FFFD');
+        if (!snapId) snapId = dRes.result.snapshotId;
+        assert.equal(dRes.result.snapshotId, snapId);
+        assembled += dRes.result.text;
+        detailOffset = dRes.result.nextOffset;
+      }
+      assert.equal(assembled, emojiKoreanBlock);
+
+      const staleSnapRes = await invoke('conversation_request', {
+        id: detailSess.result.id,
+        generation: detailSess.result.generation,
+        request: {
+          type: 'detail',
+          turnId: 'turn-detail-1',
+          itemId: 'item-detail-big',
+          offset: 100,
+          snapshotId: 'stale-snapshot-id',
+        },
+      });
+      assert.equal(staleSnapRes.ok, false);
+
+      // 8. D-0030: saved_cron_save / saved_cron_delete / cron_request(add) validation & registration guard
+      const badCronAdd = await invoke('cron_request', {
+        id: sid,
+        generation: sgen,
+        request: { type: 'add', prompt: '   ', schedule: { type: 'every', seconds: 60 } },
+      });
+      assert.equal(badCronAdd.ok, false);
+
+      const badScheduleSave = await invoke('saved_cron_save', {
+        threadId: 'thread-d23-main',
+        prompt: '유효 프롬프트',
+        schedule: { type: 'every', seconds: 0 },
+      });
+      assert.equal(badScheduleSave.ok, false);
+
+      const savedDefRes = await invoke('saved_cron_save', {
+        threadId: 'thread-d23-main',
+        prompt: '  들여쓰기 보존 프롬프트  ',
+        schedule: { type: 'every', seconds: 300 },
+      });
+      assert.equal(savedDefRes.ok, true);
+      assert.equal(savedDefRes.result.prompt, '  들여쓰기 보존 프롬프트  ');
+
+      const regSavedRes = await invoke('saved_cron_register', {
+        id: sid,
+        generation: sgen,
+        definitionId: savedDefRes.result.id,
+        threadId: 'thread-d23-main',
+      });
+      assert.equal(regSavedRes.ok, true);
+
+      // Overwriting an already registered definition via saved_cron_save must be rejected
+      const overwriteRegRes = await invoke('saved_cron_save', {
+        id: savedDefRes.result.id,
+        threadId: 'thread-d23-main',
+        prompt: '덮어쓰기 시도',
+        schedule: { type: 'every', seconds: 300 },
+      });
+      assert.equal(overwriteRegRes.ok, false);
+
+      // Deleting with mismatched threadId must be rejected
+      const wrongThreadDel = await invoke('saved_cron_delete', {
+        id: savedDefRes.result.id,
+        threadId: 'other-thread-id',
+      });
+      assert.equal(wrongThreadDel.ok, false);
+
+      // Deleting with matching threadId succeeds when registration.state === 'registered'
+      const okDel = await invoke('saved_cron_delete', {
+        id: savedDefRes.result.id,
+        threadId: 'thread-d23-main',
+      });
+      assert.equal(okDel.ok, true);
+    } finally {
+      await srv.close();
+    }
+  } finally {
+    try { fs.rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch {}
+  }
+});
