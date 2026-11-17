@@ -3100,7 +3100,7 @@ test('D-0031 through D-0034: .relay.env upgrade idempotency, fail-closed atomic 
     };
     const installerPosix = toPosixPath(installerPath);
     const runSandboxedInstaller = (extraEnv: Record<string, string>) =>
-      execFileSync(bashBin, ['-c', 'export PATH="$MOCK_BIN_DIR:$PATH"; exec "$1"', '_', installerPosix], {
+      execFileSync(bashBin, ['-c', 'export PATH="$MOCK_BIN_DIR:$PATH"; exec bash "$1"', '_', installerPosix], {
         env: { ...mockEnvBase, ...extraEnv },
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -3113,13 +3113,15 @@ test('D-0031 through D-0034: .relay.env upgrade idempotency, fail-closed atomic 
       'file:///tmp/arcvera-connect-v9.9.9-relay-bundle.tar.gz',
     ]) {
       let failedBadUrl = false;
+      let badUrlStderr = '';
       try {
         runSandboxedInstaller({ OPENDIY_REMOTE_BUNDLE_URL: badInstallerUrl });
-      } catch {
+      } catch (err: any) {
         failedBadUrl = true;
+        badUrlStderr = String(err?.stderr || err?.message || '');
       }
-      if (!failedBadUrl) {
-        defects.push(`D-0033: install-relay.sh accepted untrusted BUNDLE_URL: ${badInstallerUrl}`);
+      if (!failedBadUrl || badUrlStderr.includes('Permission denied') || !badUrlStderr.includes('Untrusted OPENDIY_REMOTE_BUNDLE_URL')) {
+        defects.push(`D-0033: install-relay.sh did not fail closed cleanly on untrusted BUNDLE_URL (${badInstallerUrl}): ${badUrlStderr}`);
       }
     }
 
