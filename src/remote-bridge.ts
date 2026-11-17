@@ -2,18 +2,51 @@
 // Activates only when served by the OpenDIY Remote server (__OPENDIY_REMOTE__)
 // or when ?remote=1 is present in the URL, preserving standard desktop and test modes.
 
-const TOKEN_STORAGE_KEY = 'opendiy_remote_token';
+const LEGACY_TOKEN_STORAGE_KEY = 'opendiy_remote_token';
 let activeEventSourceCleanup: (() => void) | null = null;
 
+function purgeLegacyStoredToken(): void {
+  try {
+    sessionStorage.removeItem(LEGACY_TOKEN_STORAGE_KEY);
+  } catch {
+    // Ignore storage errors in restricted browser contexts.
+  }
+  try {
+    localStorage.removeItem(LEGACY_TOKEN_STORAGE_KEY);
+  } catch {
+    // Ignore storage errors in restricted browser contexts.
+  }
+}
+
+function scrubTokenQueryFromLocation(): void {
+  try {
+    const url = new URL(window.location.href);
+    if (url.searchParams.has('token')) {
+      url.searchParams.delete('token');
+      window.history.replaceState({}, '', url.pathname + url.search + url.hash);
+    }
+  } catch {
+    // Ignore URL parsing errors in non-browser contexts.
+  }
+}
+
 export function signOutRemote(): void {
-  setStoredToken('');
+  purgeLegacyStoredToken();
   try {
     activeEventSourceCleanup?.();
   } catch {
     // Ignore cleanup errors during navigation.
   }
   if (typeof window !== 'undefined') {
-    window.location.href = '/auth/logout';
+    void fetch('/auth/logout', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { Accept: 'application/json' },
+    })
+      .catch(() => {})
+      .finally(() => {
+        window.location.href = '/';
+      });
   }
 }
 
@@ -28,45 +61,13 @@ export function isRemoteBrowser(): boolean {
   }
 }
 
-function captureTokenFromUrl(): string {
-  try {
-    const url = new URL(window.location.href);
-    const urlToken = url.searchParams.get('token');
-    if (urlToken) {
-      sessionStorage.setItem(TOKEN_STORAGE_KEY, urlToken);
-      url.searchParams.delete('token');
-      window.history.replaceState({}, '', url.pathname + url.search + url.hash);
-      return urlToken;
-    }
-    return sessionStorage.getItem(TOKEN_STORAGE_KEY) ?? '';
-  } catch {
-    return '';
-  }
-}
-
-function getStoredToken(): string {
-  try {
-    return sessionStorage.getItem(TOKEN_STORAGE_KEY) ?? '';
-  } catch {
-    return '';
-  }
-}
-
-function setStoredToken(token: string): void {
-  try {
-    if (token) sessionStorage.setItem(TOKEN_STORAGE_KEY, token);
-    else sessionStorage.removeItem(TOKEN_STORAGE_KEY);
-  } catch {
-    // Ignore storage errors in restricted browser contexts.
-  }
-}
-
 export function installRemoteBridge(): void {
   if (!isRemoteBrowser()) return;
   const state = window as unknown as Record<string, unknown>;
   if (state.__TAURI_INTERNALS__) return;
 
-  captureTokenFromUrl();
+  purgeLegacyStoredToken();
+  scrubTokenQueryFromLocation();
   state.isTauri = true;
 
   let nextCallbackId = 1;
@@ -102,9 +103,7 @@ export function installRemoteBridge(): void {
       eventSource.close();
       eventSource = null;
     }
-    const token = getStoredToken();
-    const url = token ? `/api/events?token=${encodeURIComponent(token)}` : '/api/events';
-    const source = new EventSource(url);
+    const source = new EventSource('/api/events');
     source.onmessage = message => {
       try {
         const parsed = JSON.parse(message.data) as { event?: string; payload?: unknown };
@@ -122,22 +121,29 @@ export function installRemoteBridge(): void {
   }
 
   async function remoteInvoke(command: string, args: Record<string, unknown> = {}, retried = false): Promise<unknown> {
-    const token = getStoredToken();
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    if (token) headers.Authorization = `Bearer ${token}`;
-
     const response = await fetch('/api/invoke', {
       method: 'POST',
-      headers,
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ command, args }),
     });
 
     if (response.status === 401 && !retried && typeof window.prompt === 'function') {
       const input = window.prompt('OpenDIY Remote 접속 토큰을 입력하세요 (Enter remote access token):', '');
       if (input !== null && input.trim()) {
-        setStoredToken(input.trim());
-        connectEvents(true);
-        return remoteInvoke(command, args, true);
+        const authRes = await fetch('/auth/token', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+          },
+          body: JSON.stringify({ token: input.trim() }),
+        });
+        if (authRes.ok) {
+          connectEvents(true);
+          return remoteInvoke(command, args, true);
+        }
       }
     }
 

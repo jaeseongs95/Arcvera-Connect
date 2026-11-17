@@ -81,7 +81,7 @@ npm run build
 ### Scenario A: Dedicated VPS as a 1:1 Relay Server
 
 #### Option 1 — Automated VPS Installer (Ubuntu / Debian)
-Execute the following command on a clean Ubuntu or Debian server to verify or install Node.js 22+, download the release bundle (with legacy bundle fallback support), provision a TLS certificate, register the `systemd` service (`opendiy-remote.service` with `0600` `EnvironmentFile`), and generate access credentials:
+Execute the following command on a clean Ubuntu or Debian server to verify or install Node.js 22+ via a signed APT keyring, verify the release bundle SHA-256 digest before staged extraction, provision a TLS certificate, register the `systemd` service (`opendiy-remote.service` with `0600` `EnvironmentFile`), and generate access credentials:
 ```bash
 curl -fsSL https://github.com/jaeseongs95/Arcvera-Connect/releases/download/v1.2.3/install-relay.sh | bash
 ```
@@ -102,14 +102,15 @@ On the workstation where the CLI runtime is installed (when Google OAuth is conf
 # Google OAuth mode (recommended when OAuth is configured on the relay):
 node server/remote-server.mjs --connect https://<relay-domain>
 
-# Explicit shared host secret mode:
+# Self-signed relay TLS certificate pinning + explicit shared host secret mode:
 node server/remote-server.mjs \
   --connect https://<relay-ip-or-domain>:3210 \
-  --host-secret "my-pc-connector-secret"
+  --host-secret "my-pc-connector-secret" \
+  --tls-ca ./relay-cert.pem
 ```
 
 #### Open in a Web Browser
-Navigate to `https://<relay-ip-or-domain>:3210/?token=my-browser-access-token`. The server sets an `HttpOnly; SameSite=Lax` session cookie and strips the token from the browser address bar.
+Navigate to `https://<relay-ip-or-domain>:3210/` and submit the browser access token on the login form (`POST /auth/token`). The server sets an `HttpOnly; SameSite=Strict` session cookie without storing the token in `sessionStorage` or URL query strings (Google OAuth callbacks issue an `HttpOnly; SameSite=Lax` session cookie, and legacy `/?token=...` links immediately `302`-redirect to `/` after setting `HttpOnly; SameSite=Strict`).
 
 ### Scenario B: Single-Machine Direct Mode (`direct`)
 
@@ -141,6 +142,7 @@ npm start -- --bind 0.0.0.0:3210 --token "my-secret-access-token"
 | `--allowed-email <emails>` | `OPENDIY_REMOTE_ALLOWED_EMAIL` | `(none)` | Comma-separated owner Google email address(es) permitted to sign in |
 | `--tls-cert <path>` | `OPENDIY_REMOTE_TLS_CERT` | `(none)` | TLS certificate PEM path for native HTTPS serving |
 | `--tls-key <path>` | `OPENDIY_REMOTE_TLS_KEY` | `(none)` | TLS private key PEM path for native HTTPS serving |
+| `--tls-ca <path>` | `OPENDIY_REMOTE_TLS_CA` | `(none)` | Trusted CA / pinned relay certificate PEM path for outbound `--connect` TLS verification |
 | `--auto-update` | `OPENDIY_REMOTE_AUTO_UPDATE` | `false` | Periodically check GitHub Releases and apply SHA-256 verified atomic self-updates |
 | `--check-update` / `--update` | `-` | `-` | Check for the latest release or immediately apply an atomic self-update from the CLI |
 | `--workspace <dir>` | `OPENDIY_REMOTE_DATA_DIR` | OS temp/work dir | Absolute directory path for persisted layout, project registry, and session metadata |

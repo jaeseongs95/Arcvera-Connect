@@ -81,7 +81,7 @@ npm run build
 ### 시나리오 A: 전용 VPS를 1:1 중계 서버로 구성
 
 #### 방법 1 — 자동 설치 스크립트 실행 (Ubuntu / Debian 신규 서버 권장)
-신규 Ubuntu 또는 Debian 서버에서 아래 명령을 실행하면 Node.js 22+ 확인·설치, 릴리스 번들 다운로드(구 번들명 자동 폴백 포함), 자체 TLS 인증서 생성, `systemd` 서비스(`opendiy-remote.service`, `0600` 권한 `EnvironmentFile` 분리 보관) 등록 및 초기 인증 비밀키 발급이 자동으로 수행됩니다:
+신규 Ubuntu 또는 Debian 서버에서 아래 명령을 실행하면 서명된 APT 키링 기반 Node.js 22+ 확인·설치, 릴리스 번들 SHA-256 무결성 선검증 및 원자적 배치, 자체 TLS 인증서 생성, `systemd` 서비스(`opendiy-remote.service`, `0600` 권한 `EnvironmentFile` 분리 보관) 등록 및 초기 인증 비밀키 발급이 자동으로 수행됩니다:
 ```bash
 curl -fsSL https://github.com/jaeseongs95/Arcvera-Connect/releases/download/v1.2.3/install-relay.sh | bash
 ```
@@ -102,14 +102,15 @@ node server/remote-server.mjs \
 # Google OAuth 모드 (중계 서버에 OAuth 설정 시 권장):
 node server/remote-server.mjs --connect https://<relay-domain>
 
-# 호스트 비밀키 직접 지정 모드:
+# 자체 서명 TLS 인증서 고정(--tls-ca) 및 호스트 비밀키 지정 모드:
 node server/remote-server.mjs \
   --connect https://<relay-ip-or-domain>:3210 \
-  --host-secret "my-pc-connector-secret"
+  --host-secret "my-pc-connector-secret" \
+  --tls-ca ./relay-cert.pem
 ```
 
 #### 웹 브라우저 접속
-브라우저에서 `https://<relay-ip-or-domain>:3210/?token=my-browser-access-token` 주소로 접속하면 `HttpOnly; SameSite=Lax` 세션 쿠키가 설정되고 주소창의 토큰 쿼리가 즉시 제거됩니다.
+브라우저에서 `https://<relay-ip-or-domain>:3210/` 주소로 접속한 뒤 로그인 화면(`POST /auth/token`)에 브라우저 접속 토큰을 입력하면 `sessionStorage`나 URL 쿼리 노출 없이 `HttpOnly; SameSite=Strict` 세션 쿠키가 설정됩니다(Google OAuth 콜백은 `HttpOnly; SameSite=Lax` 쿠키를 발급하며, 기존 `/?token=...` 링크로 접속 시에도 `HttpOnly; SameSite=Strict` 쿠키 설정 후 즉시 `/`로 `302` 리다이렉트하여 주소창의 토큰을 제거합니다).
 
 ### 시나리오 B: 단일 머신 직접 실행 모드 (`direct`)
 
@@ -141,6 +142,7 @@ npm start -- --bind 0.0.0.0:3210 --token "my-secret-access-token"
 | `--allowed-email <emails>` | `OPENDIY_REMOTE_ALLOWED_EMAIL` | `(없음)` | 로그인 허용 소유자 Google 이메일 목록 (쉼표 구분) |
 | `--tls-cert <path>` | `OPENDIY_REMOTE_TLS_CERT` | `(없음)` | 자체 HTTPS 제공용 TLS 인증서(PEM) 파일 경로 |
 | `--tls-key <path>` | `OPENDIY_REMOTE_TLS_KEY` | `(없음)` | 자체 HTTPS 제공용 TLS 개인키(PEM) 파일 경로 |
+| `--tls-ca <path>` | `OPENDIY_REMOTE_TLS_CA` | `(없음)` | `--connect` 아웃바운드 TLS 검증 시 신뢰할 중계기 인증서(PEM) 고정 경로 |
 | `--auto-update` | `OPENDIY_REMOTE_AUTO_UPDATE` | `false` | GitHub Releases 최신 버전을 주기적으로 확인하고 SHA-256 검증 후 원자적 자동 업데이트 수행 |
 | `--check-update` / `--update` | `-` | `-` | CLI에서 즉시 최신 릴리스 확인 또는 원자적 자동 업데이트 실행 |
 | `--workspace <dir>` | `OPENDIY_REMOTE_DATA_DIR` | OS 임시/작업 경로 | 레이아웃·프로젝트 목록·세션 메타데이터 저장 절대 경로 |

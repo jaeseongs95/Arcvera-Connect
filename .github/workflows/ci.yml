@@ -7,6 +7,109 @@ on:
 permissions:
   contents: read
 jobs:
+  installer-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - name: Validate install-relay.sh bash syntax and Linux unit suite
+        run: |
+          bash -n scripts/install-relay.sh
+          npm test
+      - name: Runtime test install-relay.sh SHA-256 verification and 3x upgrade .relay.env idempotency
+        run: |
+          npm run build
+          WORK="$(mktemp -d)"
+          trap 'rm -rf "$WORK"' EXIT
+          BUNDLE="$WORK/arcvera-connect-v1.2.3-relay-bundle.tar.gz"
+          tar -czf "$BUNDLE" package.json dist server scripts README.md README.ko.md
+          GOOD_SHA="$(sha256sum "$BUNDLE" | awk '{print $1}')"
+
+          # Create a non-root sandboxed copy of install-relay.sh skipping only privileged systemd/apt calls
+          SANDBOX_INSTALLER="$WORK/install-sandbox.sh"
+          sed -e 's/sudo tee "${SERVICE_FILE}"/tee "$WORK_SERVICE_FILE"/g' \
+              -e 's/sudo systemctl /true /g' \
+              scripts/install-relay.sh > "$SANDBOX_INSTALLER"
+          chmod +x "$SANDBOX_INSTALLER"
+
+          export WORK_SERVICE_FILE="$WORK/opendiy-remote.service"
+          export OPENDIY_REMOTE_DIR="$WORK/installed"
+          export OPENDIY_REMOTE_BUNDLE_URL="file://$BUNDLE"
+
+          # 1) Wrong SHA-256 MUST fail closed before extracting
+          if OPENDIY_REMOTE_BUNDLE_SHA256="0000000000000000000000000000000000000000000000000000000000000000" "$SANDBOX_INSTALLER"; then
+            echo "ERROR: installer succeeded with wrong SHA-256" >&2
+            exit 1
+          fi
+          test ! -f "$OPENDIY_REMOTE_DIR/package.json"
+
+          # 2) Missing SHA-256 with custom URL MUST fail closed
+          if OPENDIY_REMOTE_BUNDLE_SHA256="" "$SANDBOX_INSTALLER"; then
+            echo "ERROR: installer succeeded with empty SHA-256" >&2
+            exit 1
+          fi
+
+          # 3) Valid SHA-256 + 3 consecutive upgrade runs preserve complex secrets bit-for-bit
+          COMPLEX_TOK='tok/with\bs"quote$and'\''space\\end'
+          COMPLEX_SEC='sec\host"val$123\\'
+          OPENDIY_REMOTE_BUNDLE_SHA256="$GOOD_SHA" \
+            OPENDIY_REMOTE_TOKEN="$COMPLEX_TOK" \
+            OPENDIY_REMOTE_HOST_SECRET="$COMPLEX_SEC" \
+            "$SANDBOX_INSTALLER" >/dev/null
+
+          # Re-run upgrade twice WITHOUT env overrides so existing .relay.env is parsed and re-written
+          for pass in 2 3; do
+            OPENDIY_REMOTE_BUNDLE_SHA256="$GOOD_SHA" "$SANDBOX_INSTALLER" >"$WORK/out-$pass.txt"
+          done
+
+          # Verify completion output never contains --tls-insecure or ?token=
+          if grep -q -- '--tls-insecure' "$WORK/out-3.txt" || grep -q '?token=' "$WORK/out-3.txt"; then
+            echo "ERROR: insecure flags or URL query token found in installer output" >&2
+            exit 1
+          fi
+          grep -q -- '--tls-ca' "$WORK/out-3.txt"
+
+          # Verify .relay.env round-trip via node parser matches exact original bytes
+          ENV_TARGET="$OPENDIY_REMOTE_DIR/.relay.env" node -e '
+            const fs = require("node:fs");
+            const bs = String.fromCharCode(92), dq = String.fromCharCode(34);
+            const lf = String.fromCharCode(10), cr = String.fromCharCode(13), tab = String.fromCharCode(9);
+            const raw = fs.readFileSync(process.env.ENV_TARGET, "utf8").split(cr).join("").split(lf);
+            const parse = key => {
+              const line = raw.find(l => l.startsWith(key + "="));
+              if (!line) return "";
+              let s = line.slice(key.length + 1);
+              if (s.length >= 2 && s.startsWith(dq) && s.endsWith(dq)) {
+                s = s.slice(1, -1);
+                let out = "";
+                for (let i = 0; i < s.length; i += 1) {
+                  if (s[i] === bs && i + 1 < s.length) {
+                    const next = s[++i];
+                    out += next === "n" ? lf : next === "r" ? cr : next === "t" ? tab : next;
+                  } else {
+                    out += s[i];
+                  }
+                }
+                return out;
+              }
+              return s;
+            };
+            if (parse("OPENDIY_REMOTE_TOKEN") !== process.env.EXPECTED_TOK) {
+              throw new Error("Token mismatch: " + parse("OPENDIY_REMOTE_TOKEN"));
+            }
+            if (parse("OPENDIY_REMOTE_HOST_SECRET") !== process.env.EXPECTED_SEC) {
+              throw new Error("Secret mismatch: " + parse("OPENDIY_REMOTE_HOST_SECRET"));
+            }
+          '
+        env:
+          EXPECTED_TOK: 'tok/with\bs"quote$and''space\\end'
+          EXPECTED_SEC: 'sec\host"val$123\\'
+
   validate:
     runs-on: windows-latest
     timeout-minutes: 30

@@ -158,11 +158,18 @@ export async function fetchLatestReleaseInfo(options = {}) {
     assets.find(a => typeof a?.name === 'string' && a.name.endsWith('.tar.gz')) ||
     null;
   const rawDigest = String(tarAsset?.digest || '').trim();
-  const sha256 = rawDigest.toLowerCase().startsWith('sha256:')
+  let sha256 = rawDigest.toLowerCase().startsWith('sha256:')
     ? rawDigest.slice('sha256:'.length).toLowerCase()
     : /^[a-f0-9]{64}$/i.test(rawDigest)
       ? rawDigest.toLowerCase()
       : null;
+  if (!sha256 && tarAsset?.name) {
+    const escapedAssetName = String(tarAsset.name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const bodyMatch = String(release.body || '').match(new RegExp(`\\b([a-f0-9]{64})\\s+\\*?${escapedAssetName}\\b`, 'i'));
+    if (bodyMatch) {
+      sha256 = bodyMatch[1].toLowerCase();
+    }
+  }
 
   const updateAvailable = Boolean(latestVersion && compareSemver(latestVersion, currentVersion) > 0);
   return {
@@ -179,6 +186,27 @@ export async function fetchLatestReleaseInfo(options = {}) {
     notes: String(release.body || '').trim(),
     checkedAt: Date.now(),
   };
+}
+
+function movePathAtomicSync(srcPath, dstPath) {
+  let lastErr = null;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    try {
+      fs.renameSync(srcPath, dstPath);
+      return;
+    } catch (err) {
+      lastErr = err;
+      if (err && err.code === 'EXDEV') {
+        fs.cpSync(srcPath, dstPath, { recursive: true, force: true });
+        fs.rmSync(srcPath, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+        return;
+      }
+      if (!err || (err.code !== 'EPERM' && err.code !== 'EACCES' && err.code !== 'EBUSY')) {
+        throw err;
+      }
+    }
+  }
+  throw lastErr;
 }
 
 let activeUpdatePromise = null;
@@ -202,6 +230,12 @@ export async function performSelfUpdate(options = {}) {
     if (!info.bundleUrl) {
       throw new Error(`릴리스(${info.tagName})에서 업데이트 번들(.tar.gz)을 찾을 수 없습니다.`);
     }
+    const expectedSha256 = String(info.sha256 || '').trim().toLowerCase();
+    if (!/^[a-f0-9]{64}$/.test(expectedSha256)) {
+      throw new Error(
+        `릴리스(${info.tagName}) 업데이트 번들의 SHA-256 무결성 해시(digest)가 누락되었거나 올바르지 않아 업데이트를 거부합니다.`,
+      );
+    }
 
     const bundleRes = await fetchFn(info.bundleUrl, {
       headers: {
@@ -219,14 +253,18 @@ export async function performSelfUpdate(options = {}) {
     }
 
     const actualSha256 = crypto.createHash('sha256').update(bundleBuf).digest('hex').toLowerCase();
-    if (info.sha256 && actualSha256 !== info.sha256.toLowerCase()) {
-      throw new Error(`업데이트 번들 SHA-256 무결성 검증 실패 (기대값: ${info.sha256}, 실제값: ${actualSha256})`);
+    if (actualSha256 !== expectedSha256) {
+      throw new Error(`업데이트 번들 SHA-256 무결성 검증 실패 (기대값: ${expectedSha256}, 실제값: ${actualSha256})`);
     }
 
-    const tmpStageDir = fs.mkdtempSync(path.join(os.tmpdir(), 'opendiy-remote-update-'));
+    fs.mkdirSync(rootDir, { recursive: true });
+    const stageStamp = `${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+    const tmpStageDir = path.join(rootDir, `.update-stage-${stageStamp}`);
     const archivePath = path.join(tmpStageDir, 'bundle.tar.gz');
     const extractDir = path.join(tmpStageDir, 'extracted');
+    const stagedBackupDir = path.join(tmpStageDir, 'backup');
     fs.mkdirSync(extractDir, { recursive: true });
+    fs.mkdirSync(stagedBackupDir, { recursive: true });
 
     try {
       fs.writeFileSync(archivePath, bundleBuf);
@@ -243,49 +281,47 @@ export async function performSelfUpdate(options = {}) {
       if (!fs.existsSync(extractedPkgPath) || !fs.existsSync(extractedServerPath) || !fs.existsSync(extractedDistIndex)) {
         throw new Error('업데이트 번들 구조 검증 실패: 필수 파일(package.json, server/remote-server.mjs, dist/index.html)이 누락되었습니다.');
       }
+      JSON.parse(fs.readFileSync(extractedPkgPath, 'utf8'));
+
+      const targets = ['dist', 'server', 'scripts', 'package.json', 'README.md', 'README.ko.md'];
+      const swapped = [];
+
+      try {
+        for (const rel of targets) {
+          const srcPath = path.join(extractDir, rel);
+          if (!fs.existsSync(srcPath)) continue;
+          const currentTarget = path.join(rootDir, rel);
+          const backupTarget = path.join(stagedBackupDir, rel);
+          const hadPrev = fs.existsSync(currentTarget);
+          if (hadPrev) {
+            movePathAtomicSync(currentTarget, backupTarget);
+          }
+          swapped.push({ rel, hadPrev, promoted: false });
+          movePathAtomicSync(srcPath, currentTarget);
+          swapped[swapped.length - 1].promoted = true;
+        }
+      } catch (applyErr) {
+        for (let idx = swapped.length - 1; idx >= 0; idx -= 1) {
+          const item = swapped[idx];
+          const currentTarget = path.join(rootDir, item.rel);
+          const backupTarget = path.join(stagedBackupDir, item.rel);
+          try {
+            if (fs.existsSync(currentTarget)) {
+              fs.rmSync(currentTarget, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+            }
+            if (item.hadPrev && fs.existsSync(backupTarget)) {
+              movePathAtomicSync(backupTarget, currentTarget);
+            }
+          } catch {}
+        }
+        throw applyErr;
+      }
 
       const backupDir = path.join(rootDir, '.backup-prev');
       try {
         fs.rmSync(backupDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+        movePathAtomicSync(stagedBackupDir, backupDir);
       } catch {}
-      fs.mkdirSync(backupDir, { recursive: true });
-
-      const targets = ['dist', 'server', 'scripts', 'package.json', 'README.md', 'README.ko.md'];
-      for (const rel of targets) {
-        const currentTarget = path.join(rootDir, rel);
-        const backupTarget = path.join(backupDir, rel);
-        if (fs.existsSync(currentTarget)) {
-          fs.cpSync(currentTarget, backupTarget, { recursive: true, force: true });
-        }
-      }
-
-      try {
-        const nextDist = path.join(extractDir, 'dist');
-        const targetDist = path.join(rootDir, 'dist');
-        if (fs.existsSync(nextDist)) {
-          fs.rmSync(targetDist, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
-          fs.cpSync(nextDist, targetDist, { recursive: true, force: true });
-        }
-        for (const rel of ['server', 'scripts', 'package.json', 'README.md', 'README.ko.md']) {
-          const srcPath = path.join(extractDir, rel);
-          const dstPath = path.join(rootDir, rel);
-          if (fs.existsSync(srcPath)) {
-            fs.cpSync(srcPath, dstPath, { recursive: true, force: true });
-          }
-        }
-      } catch (applyErr) {
-        // Rollback from backupDir on partial write failure
-        for (const rel of targets) {
-          const backupTarget = path.join(backupDir, rel);
-          const currentTarget = path.join(rootDir, rel);
-          if (fs.existsSync(backupTarget)) {
-            try {
-              fs.cpSync(backupTarget, currentTarget, { recursive: true, force: true });
-            } catch {}
-          }
-        }
-        throw applyErr;
-      }
 
       const installedVersion = readInstalledVersion(rootDir);
       const shouldScheduleRestart = options.scheduleRestart === true;
@@ -1943,7 +1979,7 @@ export function createRemoteServer(options = {}) {
     ` : ''}
     ${tokenSha256 ? `
       ${googleOAuthEnabled ? '<div class="divider">또는 접속 토큰 사용</div>' : ''}
-      <form method="GET" action="/">
+      <form method="POST" action="/auth/token">
         <input type="password" name="token" placeholder="브라우저 접속 토큰 (--token)" required autocomplete="current-password" />
         <button type="submit" class="tok-btn">토큰으로 접속</button>
       </form>
@@ -5663,24 +5699,144 @@ export function createRemoteServer(options = {}) {
       return;
     }
 
+    function isCrossOriginBrowserRequest(request) {
+      const secFetchSite = String(request.headers['sec-fetch-site'] || '').trim().toLowerCase();
+      if (secFetchSite && secFetchSite !== 'same-origin' && secFetchSite !== 'none') {
+        return true;
+      }
+      const originHeader = String(request.headers.origin || '').trim();
+      if (!originHeader) return false;
+      if (originHeader.toLowerCase() === 'null') return true;
+      let originHost = '';
+      try {
+        originHost = new URL(originHeader).host.toLowerCase();
+      } catch {
+        return true;
+      }
+      const reqHost = String(request.headers.host || '').trim().toLowerCase();
+      const fwdHost = String(request.headers['x-forwarded-host'] || '')
+        .split(',')[0]
+        .trim()
+        .toLowerCase();
+      return originHost !== reqHost && (!fwdHost || originHost !== fwdHost);
+    }
+
+    if (req.method === 'POST' && pathname === '/auth/token') {
+      if (isCrossOriginBrowserRequest(req)) {
+        sendJsonResponse(req, res, 403, {
+          ok: false,
+          error: '교차 출처(Cross-Origin) 인증 요청이 보안 정책에 의해 차단되었습니다.',
+        });
+        return;
+      }
+      const chunks = [];
+      let total = 0;
+      const AUTH_BODY_LIMIT = 64 * 1024;
+      req.on('data', chunk => {
+        total += chunk.length;
+        if (total <= AUTH_BODY_LIMIT) chunks.push(chunk);
+      });
+      req.on('end', () => {
+        const wantsJson =
+          String(req.headers['content-type'] || '').toLowerCase().includes('application/json') ||
+          String(req.headers.accept || '').toLowerCase().includes('application/json');
+        if (total > AUTH_BODY_LIMIT) {
+          if (wantsJson) {
+            sendJsonResponse(req, res, 413, { ok: false, error: '인증 요청 본문이 허용 상한을 초과했습니다.' });
+          } else {
+            res.writeHead(413, {
+              'Content-Type': 'text/html; charset=utf-8',
+              'Cache-Control': 'no-store',
+              'Referrer-Policy': 'same-origin',
+            });
+            res.end(renderAuthGatePage({ errorMsg: '인증 요청 본문이 허용 상한을 초과했습니다.' }), 'utf8');
+          }
+          return;
+        }
+        let submittedToken = '';
+        const rawText = Buffer.concat(chunks).toString('utf8');
+        try {
+          if (String(req.headers['content-type'] || '').toLowerCase().includes('application/json')) {
+            const parsed = JSON.parse(rawText || '{}');
+            submittedToken = typeof parsed.token === 'string' ? parsed.token.trim() : '';
+          } else {
+            submittedToken = String(new URLSearchParams(rawText).get('token') || '').trim();
+          }
+        } catch {
+          submittedToken = '';
+        }
+        const valid = verifyToken(tokenSha256, submittedToken);
+        const rate = checkAndRecordAuth(`client:${clientIp}`, valid, Boolean(submittedToken));
+        if (!rate.allowed) {
+          const errMsg = rate.locked
+            ? '반복된 인증 실패로 접속이 일시 차단되었습니다. 잠시 후 다시 시도하세요.'
+            : '접속 토큰이 올바르지 않습니다.';
+          const status = rate.locked ? 429 : 401;
+          if (wantsJson) {
+            sendJsonResponse(req, res, status, { ok: false, error: errMsg });
+          } else {
+            res.writeHead(status, {
+              'Content-Type': 'text/html; charset=utf-8',
+              'Cache-Control': 'no-store',
+              'Referrer-Policy': 'same-origin',
+            });
+            res.end(renderAuthGatePage({ errorMsg: errMsg }), 'utf8');
+          }
+          return;
+        }
+        const isHttps = isRequestHttps(req, useTls);
+        const cookieVal = `${AUTH_COOKIE_NAME}=${encodeURIComponent(submittedToken)}; HttpOnly; SameSite=Strict; Path=/${isHttps ? '; Secure' : ''}`;
+        if (wantsJson) {
+          sendJsonResponse(req, res, 200, { ok: true }, { 'Set-Cookie': cookieVal });
+        } else {
+          res.writeHead(303, {
+            Location: '/',
+            'Cache-Control': 'no-store',
+            'Set-Cookie': cookieVal,
+          });
+          res.end();
+        }
+      });
+      return;
+    }
+
     if ((req.method === 'GET' || req.method === 'POST') && pathname === '/auth/logout') {
+      if (req.method === 'POST' && isCrossOriginBrowserRequest(req)) {
+        sendJsonResponse(req, res, 403, {
+          ok: false,
+          error: '교차 출처(Cross-Origin) 로그아웃 요청이 보안 정책에 의해 차단되었습니다.',
+        });
+        return;
+      }
       const isHttps = isRequestHttps(req, useTls);
+      const clearCookie = `${AUTH_COOKIE_NAME}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${isHttps ? '; Secure' : ''}`;
+      if (req.method === 'POST' && String(req.headers.accept || '').toLowerCase().includes('application/json')) {
+        sendJsonResponse(req, res, 200, { ok: true }, { 'Set-Cookie': clearCookie });
+        return;
+      }
       res.writeHead(302, {
         Location: '/',
         'Cache-Control': 'no-store',
-        'Set-Cookie': `${AUTH_COOKIE_NAME}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0${isHttps ? '; Secure' : ''}`,
+        'Set-Cookie': clearCookie,
       });
       res.end();
       return;
     }
 
     if (pathname.startsWith('/api/')) {
+      if (req.method === 'POST' && isCrossOriginBrowserRequest(req)) {
+        res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify({
+          ok: false,
+          error: '교차 출처(Cross-Origin) 요청이 보안 정책에 의해 차단되었습니다.',
+        }));
+        return;
+      }
       const authHeader = req.headers.authorization || '';
       const bearer = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
-      const queryToken = reqUrl.searchParams.get('token') || '';
       const cookies = parseCookies(req.headers.cookie);
       const cookieToken = cookies[AUTH_COOKIE_NAME] || '';
-      const provided = bearer || queryToken || cookieToken;
+      const provided = bearer || cookieToken;
       const valid = isClientCredentialValid(provided);
       const rate = checkAndRecordAuth(`client:${clientIp}`, valid, Boolean(String(provided).trim()));
       if (!rate.allowed) {
@@ -5746,7 +5902,7 @@ export function createRemoteServer(options = {}) {
           'Cache-Control': 'no-store',
           'X-Content-Type-Options': 'nosniff',
           'X-Frame-Options': 'DENY',
-          'Referrer-Policy': 'no-referrer',
+          'Referrer-Policy': 'same-origin',
         };
         const urlToken = reqUrl.searchParams.get('token') || '';
         const cookies = parseCookies(req.headers.cookie);
@@ -5758,8 +5914,21 @@ export function createRemoteServer(options = {}) {
           const urlValid = verifyToken(tokenSha256, urlToken);
           const urlRate = checkAndRecordAuth(`client:${clientIp}`, urlValid, true);
           if (urlRate.allowed) {
-            headers['Set-Cookie'] = `${AUTH_COOKIE_NAME}=${encodeURIComponent(urlToken.trim())}; HttpOnly; SameSite=Lax; Path=/${isHttps ? '; Secure' : ''}`;
+            const strictCookie = `${AUTH_COOKIE_NAME}=${encodeURIComponent(urlToken.trim())}; HttpOnly; SameSite=Strict; Path=/${isHttps ? '; Secure' : ''}`;
+            headers['Set-Cookie'] = strictCookie;
             hasValidAuth = true;
+            if (path.basename(filePath) === 'index.html') {
+              const cleanUrl = new URL(reqUrl.toString());
+              cleanUrl.searchParams.delete('token');
+              const redirectTarget = `${cleanUrl.pathname || '/'}${cleanUrl.search}`;
+              res.writeHead(302, {
+                Location: redirectTarget,
+                'Cache-Control': 'no-store',
+                'Set-Cookie': strictCookie,
+              });
+              res.end();
+              return;
+            }
           } else {
             authGateError = urlRate.locked
               ? '반복된 인증 실패로 접속이 일시 차단되었습니다. 잠시 후 다시 시도하세요.'
@@ -5948,6 +6117,12 @@ export function startHostConnector(options = {}) {
   const rejectUnauthorized = options.tlsRejectUnauthorized !== undefined
     ? Boolean(options.tlsRejectUnauthorized)
     : process.env.OPENDIY_REMOTE_TLS_INSECURE !== '1' && process.env.OPENDIY_REMOTE_TLS_INSECURE !== 'true';
+  const tlsCaFilePath = String(options.tlsCaFile || process.env.OPENDIY_REMOTE_TLS_CA || '').trim();
+  const tlsCa = options.tlsCa || (tlsCaFilePath ? fs.readFileSync(path.resolve(tlsCaFilePath), 'utf8') : '');
+  const httpsTlsOpts = {
+    rejectUnauthorized,
+    ...(tlsCa ? { ca: tlsCa } : {}),
+  };
   let stopped = false;
   let activeReq = null;
   let reconnectTimer = null;
@@ -6031,7 +6206,7 @@ export function startHostConnector(options = {}) {
   });
 
   const httpAgent = new http.Agent({ keepAlive: true, keepAliveMsecs: 30000, maxSockets: 16 });
-  const httpsAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 30000, maxSockets: 16, rejectUnauthorized });
+  const httpsAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 30000, maxSockets: 16, ...httpsTlsOpts });
 
   function recordCompletedReply(reqId, replyPayload) {
     if (completedReqIds.size >= 256) {
@@ -6051,7 +6226,7 @@ export function startHostConnector(options = {}) {
         {
           method: 'GET',
           agent: isHttpsTarget ? httpsAgent : httpAgent,
-          ...(isHttpsTarget ? { rejectUnauthorized } : {}),
+          ...(isHttpsTarget ? httpsTlsOpts : {}),
           headers: { Accept: 'application/json', Connection: 'keep-alive' },
         },
         res => {
@@ -6147,7 +6322,7 @@ export function startHostConnector(options = {}) {
         {
           method: 'POST',
           agent: isHttpsTarget ? httpsAgent : httpAgent,
-          ...(isHttpsTarget ? { rejectUnauthorized } : {}),
+          ...(isHttpsTarget ? httpsTlsOpts : {}),
           headers: {
             'Content-Type': 'application/json; charset=utf-8',
             ...(useGzip ? { 'Content-Encoding': 'gzip' } : {}),
@@ -6182,7 +6357,7 @@ export function startHostConnector(options = {}) {
       streamUrl,
       {
         method: 'GET',
-        ...(streamUrl.protocol === 'https:' ? { rejectUnauthorized } : {}),
+        ...(streamUrl.protocol === 'https:' ? httpsTlsOpts : {}),
         headers: {
           Accept: 'text/event-stream',
           'X-OpenDIY-Host-Id': hostId,
@@ -6338,6 +6513,7 @@ if (isMain) {
   let tlsCertFile = process.env.OPENDIY_REMOTE_TLS_CERT || '';
   let tlsKeyFile = process.env.OPENDIY_REMOTE_TLS_KEY || '';
   let tlsInsecure = process.env.OPENDIY_REMOTE_TLS_INSECURE === '1' || process.env.OPENDIY_REMOTE_TLS_INSECURE === 'true';
+  let tlsCaFile = process.env.OPENDIY_REMOTE_TLS_CA || '';
   let googleClientId = process.env.OPENDIY_REMOTE_GOOGLE_CLIENT_ID || '';
   let googleClientSecret = process.env.OPENDIY_REMOTE_GOOGLE_CLIENT_SECRET || '';
   let allowedEmail = process.env.OPENDIY_REMOTE_ALLOWED_EMAIL || '';
@@ -6383,6 +6559,10 @@ if (isMain) {
       tlsKeyFile = argv[++i];
     } else if (argv[i].startsWith('--tls-key=')) {
       tlsKeyFile = argv[i].slice('--tls-key='.length);
+    } else if (argv[i] === '--tls-ca' && argv[i + 1]) {
+      tlsCaFile = argv[++i];
+    } else if (argv[i].startsWith('--tls-ca=')) {
+      tlsCaFile = argv[i].slice('--tls-ca='.length);
     } else if (argv[i] === '--tls-insecure') {
       tlsInsecure = true;
     } else if (argv[i] === '--google-client-id' && argv[i + 1]) {
@@ -6438,6 +6618,7 @@ if (isMain) {
       relayUrl: connectUrl,
       hostSecret: hostSecret || token,
       workspaceDir: workspaceDir || undefined,
+      tlsCaFile: tlsCaFile || undefined,
       tlsRejectUnauthorized: !tlsInsecure,
       autoUpdate,
       onRegistered: ({ hostId }) => {

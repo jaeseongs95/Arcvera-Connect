@@ -718,9 +718,12 @@ test('remote server mirrors OpenDIY Desktop workspace.sqlite3 projects, active s
     const layout = await relayInvoke('load_layout');
     assert.equal(layout.sessions.length, 2);
 
-    // Connect SSE stream to verify terminal-output forwarding over relay (FINDING-04)
+    // Connect SSE stream via Authorization header; query-string ?token= on /api/* must be rejected (401)
+    const queryTokenApiRes = await fetch(`${relayBase}/api/events?token=relay-sync-token`);
+    assert.equal(queryTokenApiRes.status, 401);
     const sseController = new AbortController();
-    const sseRes = await fetch(`${relayBase}/api/events?token=relay-sync-token`, {
+    const sseRes = await fetch(`${relayBase}/api/events`, {
+      headers: { Authorization: 'Bearer relay-sync-token' },
       signal: sseController.signal,
     });
     assert.equal(sseRes.status, 200);
@@ -818,7 +821,8 @@ test('remote server mirrors OpenDIY Desktop workspace.sqlite3 projects, active s
 
     // BLKR-02: Verify newly connected SSE client (e.g. browser refresh) immediately receives cached terminal-output buffer
     const refreshController = new AbortController();
-    const refreshRes = await fetch(`${relayBase}/api/events?token=relay-sync-token`, {
+    const refreshRes = await fetch(`${relayBase}/api/events`, {
+      headers: { Authorization: 'Bearer relay-sync-token' },
       signal: refreshController.signal,
     });
     assert.equal(refreshRes.status, 200);
@@ -1617,10 +1621,10 @@ test('D-0012 through D-0022: security boundaries, runtime metadata, weekly windo
   }
   const readmeEn = fs.readFileSync(path.join(repoRoot, 'README.md'), 'utf8');
   const readmeKo = fs.readFileSync(path.join(repoRoot, 'README.ko.md'), 'utf8');
+  assert.equal(readmeEn.includes('SameSite=Strict'), true);
   assert.equal(readmeEn.includes('SameSite=Lax'), true);
-  assert.equal(readmeEn.includes('SameSite=Strict'), false);
+  assert.equal(readmeKo.includes('SameSite=Strict'), true);
   assert.equal(readmeKo.includes('SameSite=Lax'), true);
-  assert.equal(readmeKo.includes('SameSite=Strict'), false);
 
   // 2. D-0015: Verify zero hardcoded model names or 380000 context window literals in production code
   const scanDirs = [path.join(repoRoot, 'server'), path.join(repoRoot, 'src')];
@@ -2715,4 +2719,371 @@ test('release metadata, installer version, bilingual READMEs, and document templ
     true,
   );
   assert.equal(readmeKo.includes('깡통'), false);
+});
+
+test('D-0031 through D-0034: .relay.env upgrade idempotency, fail-closed atomic self-update, supply-chain & --tls-ca pinning, and HttpOnly SameSite=Strict + Origin CSRF defense', async () => {
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const http = await import('node:http');
+  const crypto = await import('node:crypto');
+  const { execFileSync } = await import('node:child_process');
+  const {
+    performSelfUpdate,
+    createRemoteServer,
+    startHostConnector,
+  } = await import('../server/remote-server.mjs');
+
+  const repoRoot = path.resolve(import.meta.dirname, '..');
+  const installerPath = path.join(repoRoot, 'scripts', 'install-relay.sh');
+  const installerText = fs.readFileSync(installerPath, 'utf8');
+  const bridgeText = fs.readFileSync(path.join(repoRoot, 'src', 'remote-bridge.ts'), 'utf8');
+
+  const defects: string[] = [];
+
+  // 1. D-0031: Real bash 3-cycle .relay.env write -> read -> write idempotency check
+  const gitBashCandidates = [
+    'C:\\Program Files\\Git\\bin\\bash.exe',
+    'C:\\Program Files\\Git\\usr\\bin\\bash.exe',
+    '/bin/bash',
+  ];
+  const bashBin = gitBashCandidates.find(p => fs.existsSync(p)) || 'bash';
+  const readEnvBlock = installerText.match(/read_env_var\(\)\s*\{[\s\S]*?\n\}/)?.[0] || '';
+  const escapeEnvBlock = installerText.match(/escape_env_val\(\)\s*\{[\s\S]*?\n\}/)?.[0] || '';
+  if (!readEnvBlock || !escapeEnvBlock) {
+    defects.push('D-0031: missing read_env_var or escape_env_val in scripts/install-relay.sh');
+  } else {
+    const tmpEnvDir = fs.mkdtempSync(path.join(os.tmpdir(), 'opendiy-d0031-env-'));
+    try {
+      const envFilePosix = path.join(tmpEnvDir, '.relay.env').replace(/\\/g, '/');
+      const trickySecret = String.raw`tok/with\bs"quote$and'space\\end`;
+      const bashTestScript = [
+        'set -euo pipefail',
+        readEnvBlock,
+        escapeEnvBlock,
+        `ENV_FILE="${envFilePosix}"`,
+        'VAL="$INITIAL_SECRET"',
+        'for i in 1 2 3; do',
+        '  printf \'OPENDIY_REMOTE_TOKEN="%s"\\n\' "$(escape_env_val "$VAL")" > "$ENV_FILE"',
+        '  VAL="$(read_env_var "OPENDIY_REMOTE_TOKEN" "$ENV_FILE")"',
+        'done',
+        'printf "%s" "$VAL"',
+      ].join('\n');
+      const roundTripped = execFileSync(bashBin, ['-c', bashTestScript], {
+        env: { ...process.env, INITIAL_SECRET: trickySecret },
+        encoding: 'utf8',
+      });
+      if (roundTripped !== trickySecret) {
+        defects.push(`D-0031: 3x upgrade corrupted secret: expected ${JSON.stringify(trickySecret)}, got ${JSON.stringify(roundTripped)}`);
+      }
+    } finally {
+      try { fs.rmSync(tmpEnvDir, { recursive: true, force: true }); } catch {}
+    }
+  }
+
+  // 2. D-0032: performSelfUpdate MUST fail-closed when sha256 digest is missing/null
+  const tmpUpdateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'opendiy-d0032-update-'));
+  try {
+    const bundleSrc = path.join(tmpUpdateDir, 'bundle-src');
+    fs.mkdirSync(path.join(bundleSrc, 'dist'), { recursive: true });
+    fs.mkdirSync(path.join(bundleSrc, 'server'), { recursive: true });
+    fs.mkdirSync(path.join(bundleSrc, 'scripts'), { recursive: true });
+    fs.writeFileSync(path.join(bundleSrc, 'package.json'), JSON.stringify({ name: 'opendiy-remote', version: '9.9.9' }));
+    fs.writeFileSync(path.join(bundleSrc, 'dist', 'index.html'), '<!doctype html><html><body>9.9.9</body></html>');
+    fs.writeFileSync(path.join(bundleSrc, 'server', 'remote-server.mjs'), '// 9.9.9\n');
+    fs.writeFileSync(path.join(bundleSrc, 'scripts', 'install-relay.sh'), '#!/usr/bin/env bash\n');
+    const tarFile = path.join(tmpUpdateDir, 'arcvera-connect-v9.9.9-relay-bundle.tar.gz');
+    execFileSync('tar', ['-czf', tarFile, '-C', bundleSrc, 'package.json', 'dist', 'server', 'scripts']);
+    const tarBuf = fs.readFileSync(tarFile);
+
+    const installRoot = path.join(tmpUpdateDir, 'install-root');
+    fs.mkdirSync(path.join(installRoot, 'dist'), { recursive: true });
+    fs.mkdirSync(path.join(installRoot, 'server'), { recursive: true });
+    fs.writeFileSync(path.join(installRoot, 'package.json'), JSON.stringify({ name: 'opendiy-remote', version: '1.2.3' }));
+    fs.writeFileSync(path.join(installRoot, 'dist', 'index.html'), '<!doctype html><html><body>1.2.3</body></html>');
+    fs.writeFileSync(path.join(installRoot, 'server', 'remote-server.mjs'), '// 1.2.3\n');
+
+    let rejectedMissingDigest = false;
+    try {
+      await performSelfUpdate({
+        rootDir: installRoot,
+        releaseApiUrl: 'https://mock.local/releases/latest',
+        scheduleRestart: false,
+        fetchFn: async (url: string) => {
+          if (url.endsWith('/releases/latest')) {
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({
+                tag_name: 'v9.9.9',
+                assets: [
+                  {
+                    name: 'arcvera-connect-v9.9.9-relay-bundle.tar.gz',
+                    browser_download_url: 'https://mock.local/arcvera-connect-v9.9.9-relay-bundle.tar.gz',
+                    // digest intentionally omitted!
+                  },
+                ],
+              }),
+            } as any;
+          }
+          return {
+            ok: true,
+            status: 200,
+            arrayBuffer: async () => tarBuf.buffer.slice(tarBuf.byteOffset, tarBuf.byteOffset + tarBuf.byteLength),
+          } as any;
+        },
+      });
+    } catch {
+      rejectedMissingDigest = true;
+    }
+    const afterPkg = JSON.parse(fs.readFileSync(path.join(installRoot, 'package.json'), 'utf8'));
+    if (!rejectedMissingDigest || afterPkg.version !== '1.2.3') {
+      defects.push(`D-0032: performSelfUpdate failed open without sha256 digest (rejected=${rejectedMissingDigest}, version=${afterPkg.version})`);
+    }
+
+    // Valid digest performs same-filesystem staged atomic swap, preserves .backup-prev, and cleans up .update-stage-*
+    const validSha256 = crypto.createHash('sha256').update(tarBuf).digest('hex');
+    const validUpdateRes = await performSelfUpdate({
+      rootDir: installRoot,
+      releaseApiUrl: 'https://mock.local/releases/latest',
+      scheduleRestart: false,
+      fetchFn: async (url: string) => {
+        if (url.endsWith('/releases/latest')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              tag_name: 'v9.9.9',
+              assets: [
+                {
+                  name: 'arcvera-connect-v9.9.9-relay-bundle.tar.gz',
+                  browser_download_url: 'https://mock.local/arcvera-connect-v9.9.9-relay-bundle.tar.gz',
+                  digest: `sha256:${validSha256}`,
+                },
+              ],
+            }),
+          } as any;
+        }
+        return {
+          ok: true,
+          status: 200,
+          arrayBuffer: async () => tarBuf.buffer.slice(tarBuf.byteOffset, tarBuf.byteOffset + tarBuf.byteLength),
+        } as any;
+      },
+    });
+    if (!validUpdateRes.updated || validUpdateRes.version !== '9.9.9') {
+      defects.push('D-0032: performSelfUpdate did not update to 9.9.9 with valid digest');
+    }
+    const leftoverStages = fs.readdirSync(installRoot).filter(n => n.startsWith('.update-stage-'));
+    if (leftoverStages.length > 0) {
+      defects.push(`D-0032: leftover stage dirs in installRoot: ${leftoverStages.join(',')}`);
+    }
+    const prevBackupPkg = JSON.parse(fs.readFileSync(path.join(installRoot, '.backup-prev', 'package.json'), 'utf8'));
+    if (prevBackupPkg.version !== '1.2.3') {
+      defects.push(`D-0032: .backup-prev did not preserve previous version 1.2.3 (got ${prevBackupPkg.version})`);
+    }
+  } finally {
+    try { fs.rmSync(tmpUpdateDir, { recursive: true, force: true }); } catch {}
+  }
+
+  // 3. D-0033: Supply-chain integrity in install-relay.sh + --tls-ca pinning in startHostConnector
+  if (/curl[^\n]*\|\s*sudo\b[^\n]*\bbash\b/.test(installerText)) {
+    defects.push('D-0033: install-relay.sh still pipes curl setup script into sudo bash without GPG keyring');
+  }
+  if (/curl[^\n]*\|\s*tar\b/.test(installerText) || !installerText.includes('sha256sum')) {
+    defects.push('D-0033: install-relay.sh extracts release tarball without sha256sum verification');
+  }
+  if (installerText.includes('--tls-insecure') || installerText.includes('/?token=${BROWSER_TOKEN}')) {
+    defects.push('D-0033: install-relay.sh still recommends --tls-insecure or prints ?token= in URL');
+  }
+
+  const tmpTlsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'opendiy-d0033-tls-'));
+  try {
+    const certPath = path.join(tmpTlsDir, 'cert.pem');
+    const keyPath = path.join(tmpTlsDir, 'key.pem');
+    const opensslCandidates = [
+      'C:\\Program Files\\Git\\usr\\bin\\openssl.exe',
+      '/usr/bin/openssl',
+      'openssl',
+    ];
+    const opensslBin = opensslCandidates.find(p => p === 'openssl' || fs.existsSync(p)) || 'openssl';
+    let hasOpenSsl = true;
+    try {
+      execFileSync(opensslBin, [
+        'req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1',
+        '-nodes', '-keyout', keyPath, '-out', certPath,
+        '-days', '1', '-subj', '/CN=127.0.0.1',
+        '-addext', 'subjectAltName=IP:127.0.0.1,DNS:localhost',
+      ], { stdio: 'pipe' });
+    } catch {
+      hasOpenSsl = false;
+    }
+    if (!hasOpenSsl) {
+      defects.push('D-0033: openssl binary unavailable to verify self-signed --tls-ca pinning');
+    } else {
+      const tlsRelay = createRemoteServer({
+        mode: 'relay',
+        token: 'tls-browser-tok',
+        hostSecret: 'tls-host-sec',
+        tlsCertFile: certPath,
+        tlsKeyFile: keyPath,
+        workspaceDir: path.join(tmpTlsDir, 'relay-ws'),
+        spawnProcess: false,
+      });
+      const tlsPort = await new Promise<number>(resolve => {
+        tlsRelay.server.listen(0, '127.0.0.1', () => {
+          const addr = tlsRelay.server.address();
+          resolve(typeof addr === 'object' && addr ? addr.port : 0);
+        });
+      });
+      // Without tlsCaFile, self-signed TLS relay MUST NOT register when rejectUnauthorized is true
+      let registeredWithoutCa = false;
+      const unpinnedConnector = startHostConnector({
+        relayUrl: `https://127.0.0.1:${tlsPort}`,
+        hostSecret: 'tls-host-sec',
+        workspaceDir: path.join(tmpTlsDir, 'host-ws-unpinned'),
+        autoReconnect: false,
+        spawnProcess: false,
+        onRegistered: () => {
+          registeredWithoutCa = true;
+        },
+      });
+      await new Promise(r => setTimeout(r, 250));
+      await unpinnedConnector.close();
+      if (registeredWithoutCa) {
+        defects.push('D-0033: startHostConnector accepted untrusted self-signed TLS relay without tlsCaFile');
+      }
+
+      let registeredWithCa = false;
+      const caConnector = startHostConnector({
+        relayUrl: `https://127.0.0.1:${tlsPort}`,
+        hostSecret: 'tls-host-sec',
+        tlsCaFile: certPath,
+        workspaceDir: path.join(tmpTlsDir, 'host-ws'),
+        autoReconnect: false,
+        spawnProcess: false,
+        onRegistered: () => {
+          registeredWithCa = true;
+        },
+      });
+      try {
+        for (let i = 0; i < 20 && !registeredWithCa; i++) {
+          await new Promise(r => setTimeout(r, 80));
+        }
+        if (!registeredWithCa) {
+          defects.push('D-0033: startHostConnector failed to connect to self-signed TLS relay using tlsCaFile');
+        }
+      } finally {
+        await caConnector.close();
+        await tlsRelay.close();
+      }
+    }
+  } finally {
+    try { fs.rmSync(tmpTlsDir, { recursive: true, force: true }); } catch {}
+  }
+
+  // 4. D-0034: Zero sessionStorage token persistence, POST /auth/token, SameSite=Strict, 302 URL token strip, Origin CSRF check
+  if (bridgeText.includes('sessionStorage.setItem') || bridgeText.includes('/api/events?token=')) {
+    defects.push('D-0034: src/remote-bridge.ts still stores token in sessionStorage or appends ?token= to /api/events');
+  }
+
+  const tmpAuthDir = fs.mkdtempSync(path.join(os.tmpdir(), 'opendiy-d0034-auth-'));
+  try {
+    const distDir = path.join(tmpAuthDir, 'dist');
+    fs.mkdirSync(distDir, { recursive: true });
+    fs.writeFileSync(path.join(distDir, 'index.html'), '<!doctype html><html><body>auth-ok</body></html>', 'utf8');
+    const authSrv = createRemoteServer({
+      mode: 'direct',
+      token: 'master-tok-34',
+      distDir,
+      workspaceDir: path.join(tmpAuthDir, 'ws'),
+      allowPathDiscovery: false,
+      spawnProcess: false,
+    });
+    const authPort = await new Promise<number>(resolve => {
+      authSrv.server.listen(0, '127.0.0.1', () => {
+        const addr = authSrv.server.address();
+        resolve(typeof addr === 'object' && addr ? addr.port : 0);
+      });
+    });
+    try {
+      const gateRes = await fetch(`http://127.0.0.1:${authPort}/`);
+      const gateRefPolicy = gateRes.headers.get('referrer-policy') || '';
+      const gateHtml = await gateRes.text();
+      if (!gateHtml.includes('method="POST"') || !gateHtml.includes('action="/auth/token"')) {
+        defects.push('D-0034: renderAuthGatePage still uses GET form instead of POST /auth/token');
+      }
+      if (gateRefPolicy !== 'same-origin') {
+        defects.push(`D-0034: auth gate Referrer-Policy must be same-origin so Chromium POST form sends same-origin Origin instead of null (got ${gateRefPolicy})`);
+      }
+
+      const nullOriginAuthRes = await fetch(`http://127.0.0.1:${authPort}/auth/token`, {
+        method: 'POST',
+        redirect: 'manual',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Origin: 'null',
+        },
+        body: new URLSearchParams({ token: 'master-tok-34' }).toString(),
+      });
+      if (nullOriginAuthRes.status !== 403) {
+        defects.push(`D-0034: Origin: null POST /auth/token was not rejected with 403 (status=${nullOriginAuthRes.status})`);
+      }
+
+      const postAuthRes = await fetch(`http://127.0.0.1:${authPort}/auth/token`, {
+        method: 'POST',
+        redirect: 'manual',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Origin: `http://127.0.0.1:${authPort}`,
+        },
+        body: new URLSearchParams({ token: 'master-tok-34' }).toString(),
+      });
+      const postCookie = postAuthRes.headers.get('set-cookie') || '';
+      if ((postAuthRes.status !== 302 && postAuthRes.status !== 303) || !/SameSite=Strict/i.test(postCookie) || !/HttpOnly/i.test(postCookie)) {
+        defects.push(`D-0034: POST /auth/token did not return 302/303 with HttpOnly; SameSite=Strict (status=${postAuthRes.status}, cookie=${postCookie})`);
+      }
+
+      const urlTokenRes = await fetch(`http://127.0.0.1:${authPort}/?token=master-tok-34`, { redirect: 'manual' });
+      const urlCookie = urlTokenRes.headers.get('set-cookie') || '';
+      const urlLoc = urlTokenRes.headers.get('location') || '';
+      if ((urlTokenRes.status !== 302 && urlTokenRes.status !== 303) || urlLoc !== '/' || !/SameSite=Strict/i.test(urlCookie)) {
+        defects.push(`D-0034: GET /?token=... did not redirect 302 to / with SameSite=Strict (status=${urlTokenRes.status}, loc=${urlLoc}, cookie=${urlCookie})`);
+      }
+
+      const crossOriginRes = await new Promise<number>((resolve, reject) => {
+        const payload = JSON.stringify({ command: 'get_ui_language', args: {} });
+        const req = http.request(
+          {
+            hostname: '127.0.0.1',
+            port: authPort,
+            path: '/api/invoke',
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Content-Length': Buffer.byteLength(payload),
+              Origin: 'https://evil.example',
+              Cookie: 'opendiy_remote_auth=master-tok-34',
+            },
+          },
+          res => {
+            res.resume();
+            res.on('end', () => resolve(res.statusCode ?? 0));
+          },
+        );
+        req.on('error', reject);
+        req.write(payload);
+        req.end();
+      });
+      if (crossOriginRes !== 403) {
+        defects.push(`D-0034: cross-origin POST /api/invoke was not rejected with 403 (status=${crossOriginRes})`);
+      }
+    } finally {
+      await authSrv.close();
+    }
+  } finally {
+    try { fs.rmSync(tmpAuthDir, { recursive: true, force: true }); } catch {}
+  }
+
+  assert.deepEqual(defects, []);
 });

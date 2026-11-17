@@ -17,8 +17,9 @@ INSTALL_DIR="${OPENDIY_REMOTE_DIR:-$HOME/opendiy-remote}"
 SERVICE_NAME="opendiy-remote"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 REPO_SLUG="${OPENDIY_REMOTE_REPO:-jaeseongs95/Arcvera-Connect}"
-PRIMARY_BUNDLE_URL="https://github.com/${REPO_SLUG}/releases/download/${VERSION}/arcvera-connect-${VERSION}-relay-bundle.tar.gz"
-FALLBACK_BUNDLE_URL="https://github.com/${REPO_SLUG}/releases/download/${VERSION}/opendiy-remote-${VERSION}-relay-bundle.tar.gz"
+RELEASE_API_URL="${OPENDIY_REMOTE_RELEASE_API_URL:-https://api.github.com/repos/${REPO_SLUG}/releases/tags/${VERSION}}"
+PRIMARY_BUNDLE_NAME="arcvera-connect-${VERSION}-relay-bundle.tar.gz"
+FALLBACK_BUNDLE_NAME="opendiy-remote-${VERSION}-relay-bundle.tar.gz"
 
 echo "==> [1/5] Checking Node.js (>= 22)..."
 NEED_NODE=1
@@ -31,17 +32,100 @@ if command -v node >/dev/null 2>&1; then
 fi
 
 if [ "${NEED_NODE}" -eq 1 ]; then
-  echo "    Installing Node.js 22 LTS..."
-  curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+  echo "    Installing Node.js 22 LTS via signed APT keyring..."
+  sudo apt-get update -y
+  sudo apt-get install -y ca-certificates curl gnupg
+  sudo install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+    | sudo gpg --dearmor --yes -o /etc/apt/keyrings/nodesource.gpg
+  sudo chmod a+r /etc/apt/keyrings/nodesource.gpg
+  echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" \
+    | sudo tee /etc/apt/sources.list.d/nodesource.list >/dev/null
+  sudo apt-get update -y
   sudo apt-get install -y nodejs
   echo "    Installed Node.js $(node -v)"
 fi
 
-echo "==> [2/5] Downloading & extracting Arcvera Connect / OpenDIY Remote (${VERSION}) to ${INSTALL_DIR}..."
+echo "==> [2/5] Downloading & SHA-256 verifying Arcvera Connect (${VERSION}) to ${INSTALL_DIR}..."
 mkdir -p "${INSTALL_DIR}"
-if ! curl -fsSL "${PRIMARY_BUNDLE_URL}" | tar -xz -C "${INSTALL_DIR}" 2>/dev/null; then
-  curl -fsSL "${FALLBACK_BUNDLE_URL}" | tar -xz -C "${INSTALL_DIR}"
+STAGE_DIR="$(mktemp -d "${INSTALL_DIR}/.install-stage.XXXXXX")"
+cleanup_stage() {
+  rm -rf "${STAGE_DIR}"
+}
+trap cleanup_stage EXIT
+
+BUNDLE_URL="${OPENDIY_REMOTE_BUNDLE_URL:-}"
+EXPECTED_SHA256="${OPENDIY_REMOTE_BUNDLE_SHA256:-}"
+
+if [ -n "${BUNDLE_URL}" ]; then
+  if [[ ! "${EXPECTED_SHA256}" =~ ^[a-fA-F0-9]{64}$ ]]; then
+    echo "Error: OPENDIY_REMOTE_BUNDLE_SHA256 (64-char hex) is required when OPENDIY_REMOTE_BUNDLE_URL is set." >&2
+    exit 1
+  fi
+  EXPECTED_SHA256="$(printf '%s' "${EXPECTED_SHA256}" | tr '[:upper:]' '[:lower:]')"
+else
+  RELEASE_JSON="${STAGE_DIR}/release.json"
+  curl -fsSL --retry 3 -H "Accept: application/vnd.github+json" -o "${RELEASE_JSON}" "${RELEASE_API_URL}"
+  RESOLVED_ASSET="$(REL_JSON="${RELEASE_JSON}" REL_VER="${VERSION}" PRI_NAME="${PRIMARY_BUNDLE_NAME}" FB_NAME="${FALLBACK_BUNDLE_NAME}" node -e '
+    const fs = require("node:fs");
+    const rel = JSON.parse(fs.readFileSync(process.env.REL_JSON, "utf8"));
+    const ver = process.env.REL_VER || "";
+    const assets = Array.isArray(rel.assets) ? rel.assets : [];
+    const candidates = [process.env.PRI_NAME, process.env.FB_NAME].filter(Boolean);
+    let asset = null;
+    for (const name of candidates) {
+      asset = assets.find(a => a && a.name === name);
+      if (asset) break;
+    }
+    if (!asset) {
+      asset = assets.find(a => a && typeof a.name === "string" && a.name.endsWith("-relay-bundle.tar.gz"));
+    }
+    if (!asset || !asset.browser_download_url) {
+      console.error("Error: No relay bundle asset found in release " + ver + ".");
+      process.exit(1);
+    }
+    const rawDigest = String(asset.digest || "").trim();
+    const hex = rawDigest.toLowerCase().startsWith("sha256:")
+      ? rawDigest.slice(7).toLowerCase()
+      : rawDigest.toLowerCase();
+    if (!/^[a-f0-9]{64}$/.test(hex)) {
+      console.error("Error: Release asset " + asset.name + " is missing a valid SHA-256 digest.");
+      process.exit(1);
+    }
+    process.stdout.write(asset.browser_download_url + String.fromCharCode(9) + hex);
+  ')"
+  BUNDLE_URL="${RESOLVED_ASSET%%$'\t'*}"
+  EXPECTED_SHA256="${RESOLVED_ASSET#*$'\t'}"
 fi
+
+BUNDLE_ARCHIVE="${STAGE_DIR}/bundle.tar.gz"
+EXTRACT_DIR="${STAGE_DIR}/extracted"
+mkdir -p "${EXTRACT_DIR}"
+curl -fsSL --retry 3 -o "${BUNDLE_ARCHIVE}" "${BUNDLE_URL}"
+
+ACTUAL_SHA256="$(sha256sum "${BUNDLE_ARCHIVE}" | awk '{print tolower($1)}')"
+if [ -z "${EXPECTED_SHA256}" ] || [ "${ACTUAL_SHA256}" != "${EXPECTED_SHA256}" ]; then
+  echo "Error: Bundle SHA-256 verification failed (expected ${EXPECTED_SHA256:-<empty>}, got ${ACTUAL_SHA256})." >&2
+  exit 1
+fi
+echo "    Verified bundle SHA-256: ${ACTUAL_SHA256}"
+
+tar -xzf "${BUNDLE_ARCHIVE}" -C "${EXTRACT_DIR}"
+if [ ! -f "${EXTRACT_DIR}/package.json" ] || [ ! -f "${EXTRACT_DIR}/server/remote-server.mjs" ] || [ ! -f "${EXTRACT_DIR}/dist/index.html" ]; then
+  echo "Error: Extracted bundle is missing required files (package.json, server/remote-server.mjs, dist/index.html)." >&2
+  exit 1
+fi
+
+BACKUP_STAGE="${STAGE_DIR}/prev"
+mkdir -p "${BACKUP_STAGE}"
+for target in dist server scripts package.json README.md README.ko.md; do
+  if [ -e "${EXTRACT_DIR}/${target}" ]; then
+    if [ -e "${INSTALL_DIR}/${target}" ]; then
+      mv "${INSTALL_DIR}/${target}" "${BACKUP_STAGE}/${target}"
+    fi
+    mv "${EXTRACT_DIR}/${target}" "${INSTALL_DIR}/${target}"
+  fi
+done
 
 TLS_DIR="${INSTALL_DIR}/tls"
 TLS_CERT="${OPENDIY_REMOTE_TLS_CERT:-${TLS_DIR}/cert.pem}"
@@ -71,7 +155,50 @@ EXISTING_ALLOWED_EMAIL=""
 read_env_var() {
   local key="$1"
   local file="$2"
-  sed -n "s/^${key}=\"\(.*\)\"\$/\1/p; t; s/^${key}=\(.*\)\$/\1/p" "${file}" 2>/dev/null | head -n 1 || true
+  ENV_KEY="$key" ENV_TARGET="$file" node -e '
+    const fs = require("node:fs");
+    const bs = String.fromCharCode(92);
+    const dq = String.fromCharCode(34);
+    const lf = String.fromCharCode(10);
+    const cr = String.fromCharCode(13);
+    const tab = String.fromCharCode(9);
+    const key = process.env.ENV_KEY || "";
+    const file = process.env.ENV_TARGET || "";
+    if (!fs.existsSync(file)) process.exit(0);
+    const lines = fs.readFileSync(file, "utf8").split(cr).join("").split(lf);
+    for (const line of lines) {
+      if (!line.startsWith(key + "=")) continue;
+      let raw = line.slice(key.length + 1);
+      if (raw.length >= 2 && raw.startsWith(dq) && raw.endsWith(dq)) {
+        raw = raw.slice(1, -1);
+        let out = "";
+        for (let i = 0; i < raw.length; i += 1) {
+          if (raw[i] === bs && i + 1 < raw.length) {
+            const next = raw[i + 1];
+            i += 1;
+            out += next === "n" ? lf : next === "r" ? cr : next === "t" ? tab : next;
+          } else {
+            out += raw[i];
+          }
+        }
+        raw = out;
+      }
+      process.stdout.write(raw);
+      break;
+    }
+  ' 2>/dev/null || true
+}
+
+escape_env_val() {
+  printf '%s' "$1" | node -e '
+    const fs = require("node:fs");
+    const bs = String.fromCharCode(92);
+    const dq = String.fromCharCode(34);
+    const lf = String.fromCharCode(10);
+    const cr = String.fromCharCode(13);
+    const val = fs.readFileSync(0, "utf8").split(cr).join("").split(lf).join("");
+    process.stdout.write(val.split(bs).join(bs + bs).split(dq).join(bs + dq));
+  '
 }
 
 if [ -r "${ENV_FILE}" ]; then
@@ -97,10 +224,6 @@ GOOGLE_CLIENT_SECRET="${OPENDIY_REMOTE_GOOGLE_CLIENT_SECRET:-${EXISTING_GOOGLE_S
 ALLOWED_EMAIL="${OPENDIY_REMOTE_ALLOWED_EMAIL:-${EXISTING_ALLOWED_EMAIL}}"
 RUN_USER="$(id -un)"
 NODE_BIN="$(command -v node)"
-
-escape_env_val() {
-  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
-}
 
 (
   umask 077
@@ -145,14 +268,16 @@ sudo systemctl enable --now "${SERVICE_NAME}"
 sudo systemctl restart "${SERVICE_NAME}"
 
 PUBLIC_IP="$(curl -fsSL --max-time 3 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]' || hostname -I | awk '{print $1}')"
+TLS_FINGERPRINT="$(openssl x509 -in "${TLS_CERT}" -noout -fingerprint -sha256 2>/dev/null | sed 's/^.*=//' || true)"
 
 echo ""
 echo "======================================================================"
-echo " OpenDIY Remote 1:1 Relay (${VERSION}) is running with HTTPS (TLS)!"
+echo " Arcvera Connect 1:1 Relay (${VERSION}) is running with HTTPS (TLS)!"
 echo "======================================================================"
 if [ -n "${PUBLIC_IP}" ]; then
-  echo "[0] Relay Endpoint:"
-  echo "    https://${PUBLIC_IP}:${PORT}/?token=${BROWSER_TOKEN}"
+  echo "[0] Relay Web Login URL:"
+  echo "    https://${PUBLIC_IP}:${PORT}/"
+  echo "    (Enter the Browser Access Token below on the sign-in form)"
   echo ""
 fi
 echo "[1] Browser Access Token (--token):"
@@ -161,9 +286,17 @@ if [ -n "${GOOGLE_CLIENT_ID}" ] && [ -n "${ALLOWED_EMAIL}" ]; then
   echo "    (Google OAuth Enabled for: ${ALLOWED_EMAIL})"
 fi
 echo ""
-echo "[2] Workstation PC Host Secret (--host-secret):"
+if [ -n "${TLS_FINGERPRINT}" ]; then
+  echo "[2] Relay TLS Certificate SHA-256 Fingerprint:"
+  echo "    ${TLS_FINGERPRINT}"
+  if [ -n "${PUBLIC_IP}" ]; then
+    echo "    Copy cert to workstation: scp ${RUN_USER}@${PUBLIC_IP}:${TLS_CERT} ./relay-cert.pem"
+  fi
+  echo ""
+fi
+echo "[3] Workstation PC Host Secret (--host-secret):"
 echo "    ${PC_SECRET}"
 if [ -n "${PUBLIC_IP}" ]; then
-  echo "    Connect command: node server/remote-server.mjs --connect https://${PUBLIC_IP}:${PORT} --host-secret \"${PC_SECRET}\" --tls-insecure"
+  echo "    Connect command: node server/remote-server.mjs --connect https://${PUBLIC_IP}:${PORT} --host-secret \"${PC_SECRET}\" --tls-ca ./relay-cert.pem"
 fi
 echo "======================================================================"

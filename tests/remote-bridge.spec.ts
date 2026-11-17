@@ -492,9 +492,14 @@ test('relay + host connector mode renders mirrored desktop terminal rollout on i
       })
       .toBe(true);
 
-    // BLKR-02: Initial visit in relay mode renders mirrored rollout transcript inside xterm
-    await page.goto(`${relayOrigin}/?token=relay-user-token`);
+    // BLKR-02 & D-0034: Sign in via POST /auth/token gate form (never putting token in URL or sessionStorage) and render mirrored rollout inside xterm
+    await page.goto(relayOrigin);
+    const loginForm = page.locator('form[method="POST"][action="/auth/token"]');
+    await expect(loginForm).toBeVisible();
+    await loginForm.locator('input[name="token"]').fill('relay-user-token');
+    await loginForm.locator('button.tok-btn').click();
     await expect(page.locator('#app')).toHaveAttribute('aria-busy', 'false');
+    expect(page.url()).not.toContain('token=');
     const card = page.locator('.terminal-card').first();
     await expect(card).toBeVisible();
     await expect(card.locator('.xterm-rows')).toContainText('중단된 지점부터 이어서 작업해줘.');
@@ -695,9 +700,18 @@ test('relay + host connector mode renders mirrored desktop terminal rollout on i
     await catalogDialog.locator('#catalog-close').click();
     await expect(catalogDialog).toBeHidden();
 
-    // D-0014: Clicking '#exit' ('로그아웃') clears sessionStorage token, revokes cookie session, and shows sign-in gate
-    const tokenBeforeLogout = await page.evaluate(() => sessionStorage.getItem('opendiy_remote_token'));
-    expect(tokenBeforeLogout).toBe('relay-user-token');
+    // D-0014 & D-0034: Active session never exposes master token in sessionStorage/localStorage, and clicking '#exit' ('로그아웃') purges any legacy storage, revokes HttpOnly cookie, and shows sign-in gate
+    const storageExposureWhileAuthed = await page.evaluate(() => ({
+      session: sessionStorage.getItem('opendiy_remote_token'),
+      local: localStorage.getItem('opendiy_remote_token'),
+      cookieVisibleToJs: document.cookie,
+    }));
+    expect(storageExposureWhileAuthed.session).toBeNull();
+    expect(storageExposureWhileAuthed.local).toBeNull();
+    expect(storageExposureWhileAuthed.cookieVisibleToJs).not.toContain('opendiy_remote_auth');
+
+    // Simulate a legacy stale token in sessionStorage to verify signOutRemote purges it as well
+    await page.evaluate(() => sessionStorage.setItem('opendiy_remote_token', 'legacy-stale-token'));
     await page.locator('#exit').click();
     await expect(page.locator('input[name="token"]')).toBeVisible();
     const tokenAfterLogout = await page.evaluate(() => sessionStorage.getItem('opendiy_remote_token'));
