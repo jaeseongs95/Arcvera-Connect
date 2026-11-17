@@ -1192,6 +1192,9 @@ test('Auto-update (T-0003) and live session state sync / Desktop parity (D-0008)
     fs.writeFileSync(path.join(installRoot, 'dist', 'index.html'), '<!doctype html><html><body>v1.1.0</body></html>');
     fs.writeFileSync(path.join(installRoot, 'server', 'remote-server.mjs'), '// v1.1.0 server\n');
 
+    const mockBundleUrl =
+      'https://github.com/jaeseongs95/Arcvera-Connect/releases/download/v9.9.9/opendiy-remote-v9.9.9-relay-bundle.tar.gz';
+    const mockReleaseApiUrl = 'https://api.github.com/repos/jaeseongs95/Arcvera-Connect/releases/latest';
     const mockFetch = async (url: string) => {
       if (url.endsWith('/releases/latest')) {
         return {
@@ -1199,13 +1202,13 @@ test('Auto-update (T-0003) and live session state sync / Desktop parity (D-0008)
           status: 200,
           json: async () => ({
             tag_name: 'v9.9.9',
-            html_url: 'https://github.com/jaeseongs95/opendiy-remote/releases/tag/v9.9.9',
+            html_url: 'https://github.com/jaeseongs95/Arcvera-Connect/releases/tag/v9.9.9',
             body: 'Auto-update test release',
             published_at: '2026-11-08T13:00:00Z',
             assets: [
               {
                 name: 'opendiy-remote-v9.9.9-relay-bundle.tar.gz',
-                browser_download_url: 'https://mock.local/opendiy-remote-v9.9.9-relay-bundle.tar.gz',
+                browser_download_url: mockBundleUrl,
                 size: tarBytes.length,
                 digest: `sha256:${tarSha256}`,
               },
@@ -1213,7 +1216,7 @@ test('Auto-update (T-0003) and live session state sync / Desktop parity (D-0008)
           }),
         } as any;
       }
-      if (url === 'https://mock.local/opendiy-remote-v9.9.9-relay-bundle.tar.gz') {
+      if (url === mockBundleUrl) {
         return {
           ok: true,
           status: 200,
@@ -1225,7 +1228,7 @@ test('Auto-update (T-0003) and live session state sync / Desktop parity (D-0008)
 
     const checkInfo = await fetchLatestReleaseInfo({
       rootDir: installRoot,
-      releaseApiUrl: 'https://mock.local/releases/latest',
+      releaseApiUrl: mockReleaseApiUrl,
       fetchFn: mockFetch,
     });
     assert.equal(checkInfo.currentVersion, '1.1.0');
@@ -1238,7 +1241,7 @@ test('Auto-update (T-0003) and live session state sync / Desktop parity (D-0008)
       () =>
         performSelfUpdate({
           rootDir: installRoot,
-          releaseApiUrl: 'https://mock.local/releases/latest',
+          releaseApiUrl: mockReleaseApiUrl,
           fetchFn: async (url: string) => {
             if (url.endsWith('/releases/latest')) {
               return {
@@ -1249,7 +1252,7 @@ test('Auto-update (T-0003) and live session state sync / Desktop parity (D-0008)
                   assets: [
                     {
                       name: 'opendiy-remote-v9.9.9-relay-bundle.tar.gz',
-                      browser_download_url: 'https://mock.local/opendiy-remote-v9.9.9-relay-bundle.tar.gz',
+                      browser_download_url: mockBundleUrl,
                       digest: 'sha256:0000000000000000000000000000000000000000000000000000000000000000',
                     },
                   ],
@@ -1408,7 +1411,7 @@ test('Auto-update (T-0003) and live session state sync / Desktop parity (D-0008)
       hostSecret: 'sec-parity',
       workspaceDir: path.join(tmpRoot, 'relay-ws'),
       updateRootDir: relayInstallRoot,
-      releaseApiUrl: 'https://mock.local/releases/latest',
+      releaseApiUrl: mockReleaseApiUrl,
       updateFetchFn: mockFetch,
       scheduleRestartOnUpdate: false,
       allowPathDiscovery: false,
@@ -1430,7 +1433,7 @@ test('Auto-update (T-0003) and live session state sync / Desktop parity (D-0008)
       desktopDbPath,
       codexHomeDir: codexHome,
       updateRootDir: installRoot,
-      releaseApiUrl: 'https://mock.local/releases/latest',
+      releaseApiUrl: mockReleaseApiUrl,
       updateFetchFn: mockFetch,
       scheduleRestartOnUpdate: false,
       spawnProcess: false,
@@ -1784,15 +1787,42 @@ test('D-0012 through D-0022: security boundaries, runtime metadata, weekly windo
         assert.equal(emptyRes.status, 401);
       }
 
-      // D-0014: /auth/logout behind multi-hop X-Forwarded-Proto: https, http sets Secure cookie
-      const logoutCookie = await new Promise<string>((resolve, reject) => {
+      // D-0014 & D-0034: GET /auth/logout must be rejected with 405 (blocking <img src> cross-port logout CSRF),
+      // while POST /auth/logout with same-origin Origin behind multi-hop X-Forwarded-Proto: https, http sets Secure; SameSite=Strict; Max-Age=0
+      const getLogoutRes = await new Promise<{ status: number; cookie: string }>((resolve, reject) => {
         const req = http.request(
           {
             hostname: '127.0.0.1',
             port: directPort,
             path: '/auth/logout',
             method: 'GET',
-            headers: { 'X-Forwarded-Proto': 'https, http' },
+            headers: { Cookie: 'opendiy_remote_auth=tok-sec' },
+          },
+          res => {
+            const setCookie = Array.isArray(res.headers['set-cookie'])
+              ? res.headers['set-cookie'].join('; ')
+              : String(res.headers['set-cookie'] || '');
+            res.resume();
+            res.on('end', () => resolve({ status: res.statusCode ?? 0, cookie: setCookie }));
+          },
+        );
+        req.on('error', reject);
+        req.end();
+      });
+      assert.equal(getLogoutRes.status, 405);
+      assert.equal(getLogoutRes.cookie, '');
+
+      const logoutCookie = await new Promise<string>((resolve, reject) => {
+        const req = http.request(
+          {
+            hostname: '127.0.0.1',
+            port: directPort,
+            path: '/auth/logout',
+            method: 'POST',
+            headers: {
+              'X-Forwarded-Proto': 'https, http',
+              Origin: `https://127.0.0.1:${directPort}`,
+            },
           },
           res => {
             const setCookie = Array.isArray(res.headers['set-cookie'])
@@ -1806,6 +1836,7 @@ test('D-0012 through D-0022: security boundaries, runtime metadata, weekly windo
         req.end();
       });
       assert.match(logoutCookie, /Secure/);
+      assert.match(logoutCookie, /SameSite=Strict/);
 
       const invokeDirect = async (command: string, args: Record<string, unknown> = {}) => {
         const res = await fetch(`http://127.0.0.1:${directPort}/api/invoke`, {
@@ -2105,8 +2136,9 @@ test('D-0012 through D-0022: security boundaries, runtime metadata, weekly windo
           {
             hostname: '127.0.0.1',
             port: rPort,
-            path: '/api/events?token=tok-r2',
+            path: '/api/events',
             method: 'GET',
+            headers: { Authorization: 'Bearer tok-r2' },
           },
           res => {
             res.setEncoding('utf8');
@@ -2803,11 +2835,15 @@ test('D-0031 through D-0034: .relay.env upgrade idempotency, fail-closed atomic 
     fs.writeFileSync(path.join(installRoot, 'dist', 'index.html'), '<!doctype html><html><body>1.2.3</body></html>');
     fs.writeFileSync(path.join(installRoot, 'server', 'remote-server.mjs'), '// 1.2.3\n');
 
+    const ghReleaseApiUrl = 'https://api.github.com/repos/jaeseongs95/Arcvera-Connect/releases/latest';
+    const ghBundleUrl =
+      'https://github.com/jaeseongs95/Arcvera-Connect/releases/download/v9.9.9/arcvera-connect-v9.9.9-relay-bundle.tar.gz';
+
     let rejectedMissingDigest = false;
     try {
       await performSelfUpdate({
         rootDir: installRoot,
-        releaseApiUrl: 'https://mock.local/releases/latest',
+        releaseApiUrl: ghReleaseApiUrl,
         scheduleRestart: false,
         fetchFn: async (url: string) => {
           if (url.endsWith('/releases/latest')) {
@@ -2819,7 +2855,7 @@ test('D-0031 through D-0034: .relay.env upgrade idempotency, fail-closed atomic 
                 assets: [
                   {
                     name: 'arcvera-connect-v9.9.9-relay-bundle.tar.gz',
-                    browser_download_url: 'https://mock.local/arcvera-connect-v9.9.9-relay-bundle.tar.gz',
+                    browser_download_url: ghBundleUrl,
                     // digest intentionally omitted!
                   },
                 ],
@@ -2841,11 +2877,138 @@ test('D-0031 through D-0034: .relay.env upgrade idempotency, fail-closed atomic 
       defects.push(`D-0032: performSelfUpdate failed open without sha256 digest (rejected=${rejectedMissingDigest}, version=${afterPkg.version})`);
     }
 
-    // Valid digest performs same-filesystem staged atomic swap, preserves .backup-prev, and cleans up .update-stage-*
+    // D-0032 (Finding 3b): performSelfUpdate MUST reject non-HTTPS or non-GitHub bundleUrl/releaseApiUrl
     const validSha256 = crypto.createHash('sha256').update(tarBuf).digest('hex');
+    for (const untrustedBundleUrl of [
+      'http://github.com/jaeseongs95/Arcvera-Connect/releases/download/v9.9.9/arcvera-connect-v9.9.9-relay-bundle.tar.gz',
+      'https://evil.example/arcvera-connect-v9.9.9-relay-bundle.tar.gz',
+      'https://github.com.evil.example/arcvera-connect-v9.9.9-relay-bundle.tar.gz',
+    ]) {
+      let rejectedUntrustedUrl = false;
+      try {
+        await performSelfUpdate({
+          rootDir: installRoot,
+          releaseApiUrl: ghReleaseApiUrl,
+          scheduleRestart: false,
+          fetchFn: async (url: string) => {
+            if (url.endsWith('/releases/latest')) {
+              return {
+                ok: true,
+                status: 200,
+                json: async () => ({
+                  tag_name: 'v9.9.9',
+                  assets: [
+                    {
+                      name: 'arcvera-connect-v9.9.9-relay-bundle.tar.gz',
+                      browser_download_url: untrustedBundleUrl,
+                      digest: `sha256:${validSha256}`,
+                    },
+                  ],
+                }),
+              } as any;
+            }
+            return {
+              ok: true,
+              status: 200,
+              arrayBuffer: async () => tarBuf.buffer.slice(tarBuf.byteOffset, tarBuf.byteOffset + tarBuf.byteLength),
+            } as any;
+          },
+        });
+      } catch {
+        rejectedUntrustedUrl = true;
+      }
+      if (!rejectedUntrustedUrl) {
+        defects.push(`D-0032: performSelfUpdate accepted untrusted bundleUrl: ${untrustedBundleUrl}`);
+      }
+    }
+
+    // Reset installRoot to 1.2.3 (in case untrusted URL failed open during RED run) and test real OS mid-swap failure rollback!
+    fs.rmSync(installRoot, { recursive: true, force: true });
+    fs.mkdirSync(path.join(installRoot, 'dist'), { recursive: true });
+    fs.mkdirSync(path.join(installRoot, 'server'), { recursive: true });
+    fs.mkdirSync(path.join(installRoot, 'scripts'), { recursive: true });
+    fs.writeFileSync(path.join(installRoot, 'package.json'), JSON.stringify({ name: 'opendiy-remote', version: '1.2.3' }));
+    fs.writeFileSync(path.join(installRoot, 'dist', 'index.html'), '<!doctype html><html><body>1.2.3</body></html>');
+    fs.writeFileSync(path.join(installRoot, 'server', 'remote-server.mjs'), '// 1.2.3\n');
+    fs.writeFileSync(path.join(installRoot, 'scripts', 'install-relay.sh'), '# 1.2.3\n');
+
+    const { spawn: spawnChild } = await import('node:child_process');
+    let lockProc: ReturnType<typeof spawnChild> | null = null;
+    const scriptsTargetDir = path.join(installRoot, 'scripts');
+    if (process.platform === 'win32') {
+      lockProc = spawnChild(process.execPath, ['-e', 'setInterval(() => {}, 30000)'], {
+        cwd: scriptsTargetDir,
+        stdio: 'ignore',
+        windowsHide: true,
+      });
+      await new Promise(r => setTimeout(r, 150));
+    } else {
+      fs.chmodSync(scriptsTargetDir, 0o500);
+    }
+    let selfUpdateMidSwapRejected = false;
+    try {
+      await performSelfUpdate({
+        rootDir: installRoot,
+        releaseApiUrl: ghReleaseApiUrl,
+        scheduleRestart: false,
+        fetchFn: async (url: string) => {
+          if (url.endsWith('/releases/latest')) {
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({
+                tag_name: 'v9.9.9',
+                assets: [
+                  {
+                    name: 'arcvera-connect-v9.9.9-relay-bundle.tar.gz',
+                    browser_download_url: ghBundleUrl,
+                    digest: `sha256:${validSha256}`,
+                  },
+                ],
+              }),
+            } as any;
+          }
+          return {
+            ok: true,
+            status: 200,
+            arrayBuffer: async () => tarBuf.buffer.slice(tarBuf.byteOffset, tarBuf.byteOffset + tarBuf.byteLength),
+          } as any;
+        },
+      });
+    } catch {
+      selfUpdateMidSwapRejected = true;
+    } finally {
+      if (lockProc) {
+        try { lockProc.kill('SIGKILL'); } catch {}
+        await new Promise(r => setTimeout(r, 80));
+      } else {
+        try { fs.chmodSync(scriptsTargetDir, 0o755); } catch {}
+      }
+    }
+    const selfRollbackDist = fs.existsSync(path.join(installRoot, 'dist', 'index.html'))
+      ? fs.readFileSync(path.join(installRoot, 'dist', 'index.html'), 'utf8')
+      : '<MISSING>';
+    const selfRollbackServer = fs.existsSync(path.join(installRoot, 'server', 'remote-server.mjs'))
+      ? fs.readFileSync(path.join(installRoot, 'server', 'remote-server.mjs'), 'utf8')
+      : '<MISSING>';
+    const selfRollbackPkg = fs.existsSync(path.join(installRoot, 'package.json'))
+      ? JSON.parse(fs.readFileSync(path.join(installRoot, 'package.json'), 'utf8')).version
+      : '<MISSING>';
+    if (
+      !selfUpdateMidSwapRejected ||
+      !selfRollbackDist.includes('1.2.3') ||
+      !selfRollbackServer.includes('1.2.3') ||
+      selfRollbackPkg !== '1.2.3'
+    ) {
+      defects.push(
+        `D-0032: performSelfUpdate mid-swap failure did not cleanly roll back (rejected=${selfUpdateMidSwapRejected}, dist=${selfRollbackDist}, server=${selfRollbackServer.trim()}, pkg=${selfRollbackPkg})`,
+      );
+    }
+
+    // Valid digest performs same-filesystem staged atomic swap, preserves .backup-prev, and cleans up .update-stage-*
     const validUpdateRes = await performSelfUpdate({
       rootDir: installRoot,
-      releaseApiUrl: 'https://mock.local/releases/latest',
+      releaseApiUrl: ghReleaseApiUrl,
       scheduleRestart: false,
       fetchFn: async (url: string) => {
         if (url.endsWith('/releases/latest')) {
@@ -2857,7 +3020,7 @@ test('D-0031 through D-0034: .relay.env upgrade idempotency, fail-closed atomic 
               assets: [
                 {
                   name: 'arcvera-connect-v9.9.9-relay-bundle.tar.gz',
-                  browser_download_url: 'https://mock.local/arcvera-connect-v9.9.9-relay-bundle.tar.gz',
+                  browser_download_url: ghBundleUrl,
                   digest: `sha256:${validSha256}`,
                 },
               ],
@@ -2874,13 +3037,177 @@ test('D-0031 through D-0034: .relay.env upgrade idempotency, fail-closed atomic 
     if (!validUpdateRes.updated || validUpdateRes.version !== '9.9.9') {
       defects.push('D-0032: performSelfUpdate did not update to 9.9.9 with valid digest');
     }
-    const leftoverStages = fs.readdirSync(installRoot).filter(n => n.startsWith('.update-stage-'));
+    const leftoverStages = fs.readdirSync(installRoot).filter(n => n.startsWith('.update-stage-') || n.startsWith('.backup-stage-'));
     if (leftoverStages.length > 0) {
       defects.push(`D-0032: leftover stage dirs in installRoot: ${leftoverStages.join(',')}`);
     }
     const prevBackupPkg = JSON.parse(fs.readFileSync(path.join(installRoot, '.backup-prev', 'package.json'), 'utf8'));
     if (prevBackupPkg.version !== '1.2.3') {
       defects.push(`D-0032: .backup-prev did not preserve previous version 1.2.3 (got ${prevBackupPkg.version})`);
+    }
+
+    // D-0032 & D-0033 (Finding 1, 3a, 3b): Real bash execution of install-relay.sh testing:
+    //  (a) Non-HTTPS / non-GitHub BUNDLE_URL rejection before download
+    //  (b) Mid-swap mv failure rollback (after dist & server moved, scripts promotion fails -> dist & server restored to 1.2.3 and backup not destroyed!)
+    //  (c) Printed --host-secret single-quote escaping prevents $, backtick, and quote shell command substitution
+    const sandboxDir = path.join(tmpUpdateDir, 'installer-sandbox');
+    const mockBinDir = path.join(sandboxDir, 'bin');
+    const targetInstallDir = path.join(sandboxDir, 'installed');
+    fs.mkdirSync(mockBinDir, { recursive: true });
+    fs.mkdirSync(path.join(targetInstallDir, 'dist'), { recursive: true });
+    fs.mkdirSync(path.join(targetInstallDir, 'server'), { recursive: true });
+    fs.mkdirSync(path.join(targetInstallDir, 'scripts'), { recursive: true });
+    fs.writeFileSync(path.join(targetInstallDir, 'package.json'), JSON.stringify({ name: 'opendiy-remote', version: '1.2.3' }));
+    fs.writeFileSync(path.join(targetInstallDir, 'dist', 'index.html'), '<!doctype html><html><body>1.2.3</body></html>');
+    fs.writeFileSync(path.join(targetInstallDir, 'server', 'remote-server.mjs'), '// 1.2.3\n');
+    fs.writeFileSync(path.join(targetInstallDir, 'scripts', 'install-relay.sh'), '# 1.2.3\n');
+
+    const toPosixPath = (p: string) => {
+      const normalized = p.replace(/\\/g, '/');
+      if (process.platform === 'win32' && /^[A-Za-z]:\//.test(normalized)) {
+        return `/${normalized[0].toLowerCase()}${normalized.slice(2)}`;
+      }
+      return normalized;
+    };
+    const writeMockCmd = (name: string, body: string) => {
+      const full = path.join(mockBinDir, name);
+      fs.writeFileSync(full, `#!/usr/bin/env bash\n${body}\n`, { encoding: 'utf8', mode: 0o755 });
+    };
+    writeMockCmd('sudo', 'if [ "$1" = "tee" ]; then cat > "$MOCK_SERVICE_FILE"; elif [ "$1" = "systemctl" ]; then exit 0; else "$@"; fi');
+    writeMockCmd('systemctl', 'exit 0');
+    writeMockCmd('hostname', 'echo "203.0.113.10"');
+    writeMockCmd(
+      'curl',
+      'OUT=""; URL=""; while [ $# -gt 0 ]; do if [ "$1" = "-o" ]; then OUT="$2"; shift 2; else URL="$1"; shift; fi; done; if [[ "$URL" == *"checkip.amazonaws.com"* ]]; then echo "203.0.113.10"; exit 0; fi; if [ -n "$OUT" ]; then cp "$MOCK_TAR_FILE" "$OUT"; exit 0; fi; exit 1',
+    );
+    writeMockCmd(
+      'openssl',
+      'if [ "$1" = "rand" ]; then echo "0123456789abcdef0123456789abcdef0123456789abcdef"; exit 0; fi; if [ "$1" = "req" ]; then KEY=""; OUT=""; while [ $# -gt 0 ]; do if [ "$1" = "-keyout" ]; then KEY="$2"; shift 2; elif [ "$1" = "-out" ]; then OUT="$2"; shift 2; else shift; fi; done; [ -n "$KEY" ] && echo "MOCK-KEY" > "$KEY"; [ -n "$OUT" ] && echo "MOCK-CERT" > "$OUT"; exit 0; fi; if [ "$1" = "x509" ]; then echo "SHA256 Fingerprint=AA:BB:CC"; exit 0; fi; exit 0',
+    );
+    writeMockCmd(
+      'mv',
+      'REAL_MV="/bin/mv"; [ ! -x "$REAL_MV" ] && REAL_MV="/usr/bin/mv"; if [ "${FAIL_MV_ON_SCRIPTS:-0}" = "1" ] && [[ "$1" == */extracted/scripts ]]; then echo "Simulated mid-swap disk error on scripts" >&2; exit 1; fi; exec "$REAL_MV" "$@"',
+    );
+
+    const mockBinPosix = toPosixPath(mockBinDir);
+    const mockEnvBase = {
+      ...process.env,
+      MOCK_BIN_DIR: mockBinPosix,
+      MOCK_TAR_FILE: toPosixPath(tarFile),
+      MOCK_SERVICE_FILE: toPosixPath(path.join(sandboxDir, 'opendiy-remote.service')),
+      OPENDIY_REMOTE_DIR: toPosixPath(targetInstallDir),
+      OPENDIY_REMOTE_BUNDLE_SHA256: validSha256,
+    };
+    const installerPosix = toPosixPath(installerPath);
+    const runSandboxedInstaller = (extraEnv: Record<string, string>) =>
+      execFileSync(bashBin, ['-c', 'export PATH="$MOCK_BIN_DIR:$PATH"; exec "$1"', '_', installerPosix], {
+        env: { ...mockEnvBase, ...extraEnv },
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+
+    // (a) Untrusted BUNDLE_URL schemes/hosts MUST fail closed in install-relay.sh
+    for (const badInstallerUrl of [
+      'http://github.com/jaeseongs95/Arcvera-Connect/releases/download/v9.9.9/arcvera-connect-v9.9.9-relay-bundle.tar.gz',
+      'https://evil.example/arcvera-connect-v9.9.9-relay-bundle.tar.gz',
+      'file:///tmp/arcvera-connect-v9.9.9-relay-bundle.tar.gz',
+    ]) {
+      let failedBadUrl = false;
+      try {
+        runSandboxedInstaller({ OPENDIY_REMOTE_BUNDLE_URL: badInstallerUrl });
+      } catch {
+        failedBadUrl = true;
+      }
+      if (!failedBadUrl) {
+        defects.push(`D-0033: install-relay.sh accepted untrusted BUNDLE_URL: ${badInstallerUrl}`);
+      }
+    }
+
+    // Reset targetInstallDir to clean 1.2.3 before mid-swap failure test (in case (a) failed open and overwrote it!)
+    fs.rmSync(targetInstallDir, { recursive: true, force: true });
+    fs.mkdirSync(path.join(targetInstallDir, 'dist'), { recursive: true });
+    fs.mkdirSync(path.join(targetInstallDir, 'server'), { recursive: true });
+    fs.mkdirSync(path.join(targetInstallDir, 'scripts'), { recursive: true });
+    fs.writeFileSync(path.join(targetInstallDir, 'package.json'), JSON.stringify({ name: 'opendiy-remote', version: '1.2.3' }));
+    fs.writeFileSync(path.join(targetInstallDir, 'dist', 'index.html'), '<!doctype html><html><body>1.2.3</body></html>');
+    fs.writeFileSync(path.join(targetInstallDir, 'server', 'remote-server.mjs'), '// 1.2.3\n');
+    fs.writeFileSync(path.join(targetInstallDir, 'scripts', 'install-relay.sh'), '# 1.2.3\n');
+
+    // (b) Mid-swap mv failure (after dist & server moved, scripts promotion fails) MUST roll back dist & server to 1.2.3!
+    let midSwapFailed = false;
+    try {
+      runSandboxedInstaller({
+        OPENDIY_REMOTE_BUNDLE_URL: ghBundleUrl,
+        FAIL_MV_ON_SCRIPTS: '1',
+      });
+    } catch {
+      midSwapFailed = true;
+    }
+    const distExistsAfterRollback = fs.existsSync(path.join(targetInstallDir, 'dist', 'index.html'));
+    const serverExistsAfterRollback = fs.existsSync(path.join(targetInstallDir, 'server', 'remote-server.mjs'));
+    const scriptsExistsAfterRollback = fs.existsSync(path.join(targetInstallDir, 'scripts', 'install-relay.sh'));
+    const distHtmlAfterRollback = distExistsAfterRollback
+      ? fs.readFileSync(path.join(targetInstallDir, 'dist', 'index.html'), 'utf8')
+      : '<MISSING>';
+    const serverJsAfterRollback = serverExistsAfterRollback
+      ? fs.readFileSync(path.join(targetInstallDir, 'server', 'remote-server.mjs'), 'utf8')
+      : '<MISSING>';
+    const pkgVerAfterRollback = fs.existsSync(path.join(targetInstallDir, 'package.json'))
+      ? JSON.parse(fs.readFileSync(path.join(targetInstallDir, 'package.json'), 'utf8')).version
+      : '<MISSING>';
+    if (
+      !midSwapFailed ||
+      !distHtmlAfterRollback.includes('1.2.3') ||
+      !serverJsAfterRollback.includes('1.2.3') ||
+      !scriptsExistsAfterRollback ||
+      pkgVerAfterRollback !== '1.2.3'
+    ) {
+      defects.push(
+        `D-0032/D-0033: install-relay.sh mid-swap failure corrupted install dir without rollback (failed=${midSwapFailed}, dist=${distHtmlAfterRollback}, server=${serverJsAfterRollback.trim()}, scriptsExists=${scriptsExistsAfterRollback}, pkg=${pkgVerAfterRollback})`,
+      );
+    }
+
+    // Reset targetInstallDir cleanly before (c) in case (b) half-corrupted it in RED run
+    fs.rmSync(targetInstallDir, { recursive: true, force: true });
+    fs.mkdirSync(targetInstallDir, { recursive: true });
+
+    // (c) Valid install with shell-metacharacter PC_SECRET prints safe single-quoted --host-secret without command substitution
+    const shellInjectionSecret = 'sec$(echo PWNED)`echo SUB`"dbl\'sgl\\end';
+    let installerStdout = '';
+    try {
+      installerStdout = runSandboxedInstaller({
+        OPENDIY_REMOTE_BUNDLE_URL: ghBundleUrl,
+        OPENDIY_REMOTE_HOST_SECRET: shellInjectionSecret,
+      });
+    } catch (e: any) {
+      defects.push(`D-0033: valid install-relay.sh run failed unexpectedly: ${String(e.stderr || e.message)}`);
+    }
+    const connectLine = installerStdout
+      .split(/\r?\n/)
+      .map(l => l.trim())
+      .find(l => l.startsWith('Connect command: node server/remote-server.mjs '));
+    if (!connectLine) {
+      defects.push('D-0033: install-relay.sh did not print Connect command line');
+    } else {
+      const cliArgsExpr = connectLine.slice('Connect command: node server/remote-server.mjs '.length);
+      let evaluatedSecret = '';
+      try {
+        evaluatedSecret = execFileSync(
+          bashBin,
+          [
+            '-c',
+            `extract_sec() { while [ $# -gt 0 ]; do if [ "$1" = "--host-secret" ]; then printf '%s' "$2"; break; fi; shift; done; }; extract_sec ${cliArgsExpr}`,
+          ],
+          { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
+        );
+      } catch (evalErr: any) {
+        evaluatedSecret = `<EVAL_ERROR:${String(evalErr.message)}>`;
+      }
+      if (evaluatedSecret !== shellInjectionSecret) {
+        defects.push(
+          `D-0033: Connect command --host-secret suffered shell expansion/corruption: expected ${JSON.stringify(shellInjectionSecret)}, got ${JSON.stringify(evaluatedSecret)}`,
+        );
+      }
     }
   } finally {
     try { fs.rmSync(tmpUpdateDir, { recursive: true, force: true }); } catch {}
@@ -2982,7 +3309,7 @@ test('D-0031 through D-0034: .relay.env upgrade idempotency, fail-closed atomic 
     try { fs.rmSync(tmpTlsDir, { recursive: true, force: true }); } catch {}
   }
 
-  // 4. D-0034: Zero sessionStorage token persistence, POST /auth/token, SameSite=Strict, 302 URL token strip, Origin CSRF check
+  // 4. D-0034: Zero sessionStorage token persistence, POST /auth/token, POST-only /auth/logout, zero URL ?token= acceptance, strict Origin (headerless & cross-port) CSRF defense
   if (bridgeText.includes('sessionStorage.setItem') || bridgeText.includes('/api/events?token=')) {
     defects.push('D-0034: src/remote-bridge.ts still stores token in sessionStorage or appends ?token= to /api/events');
   }
@@ -2992,6 +3319,7 @@ test('D-0031 through D-0034: .relay.env upgrade idempotency, fail-closed atomic 
     const distDir = path.join(tmpAuthDir, 'dist');
     fs.mkdirSync(distDir, { recursive: true });
     fs.writeFileSync(path.join(distDir, 'index.html'), '<!doctype html><html><body>auth-ok</body></html>', 'utf8');
+    fs.writeFileSync(path.join(distDir, 'favicon.ico'), 'ico-bytes', 'utf8');
     const authSrv = createRemoteServer({
       mode: 'direct',
       token: 'master-tok-34',
@@ -3030,6 +3358,31 @@ test('D-0031 through D-0034: .relay.env upgrade idempotency, fail-closed atomic 
         defects.push(`D-0034: Origin: null POST /auth/token was not rejected with 403 (status=${nullOriginAuthRes.status})`);
       }
 
+      // Headerless POST /auth/token (neither Sec-Fetch-Site nor Origin) MUST be rejected with 403
+      const headerlessAuthRes = await fetch(`http://127.0.0.1:${authPort}/auth/token`, {
+        method: 'POST',
+        redirect: 'manual',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ token: 'master-tok-34' }).toString(),
+      });
+      if (headerlessAuthRes.status !== 403) {
+        defects.push(`D-0034: headerless POST /auth/token (missing Origin & Sec-Fetch-Site) was not rejected with 403 (status=${headerlessAuthRes.status})`);
+      }
+
+      // Cross-port same-host POST /auth/token (http://127.0.0.1:${authPort + 1}) MUST be rejected with 403
+      const crossPortAuthRes = await fetch(`http://127.0.0.1:${authPort}/auth/token`, {
+        method: 'POST',
+        redirect: 'manual',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Origin: `http://127.0.0.1:${authPort + 1}`,
+        },
+        body: new URLSearchParams({ token: 'master-tok-34' }).toString(),
+      });
+      if (crossPortAuthRes.status !== 403) {
+        defects.push(`D-0034: cross-port POST /auth/token was not rejected with 403 (status=${crossPortAuthRes.status})`);
+      }
+
       const postAuthRes = await fetch(`http://127.0.0.1:${authPort}/auth/token`, {
         method: 'POST',
         redirect: 'manual',
@@ -3044,39 +3397,119 @@ test('D-0031 through D-0034: .relay.env upgrade idempotency, fail-closed atomic 
         defects.push(`D-0034: POST /auth/token did not return 302/303 with HttpOnly; SameSite=Strict (status=${postAuthRes.status}, cookie=${postCookie})`);
       }
 
+      // URL ?token=... MUST NEVER authenticate or issue Set-Cookie on / or /favicon.ico, and MUST strip ?token= via 302
       const urlTokenRes = await fetch(`http://127.0.0.1:${authPort}/?token=master-tok-34`, { redirect: 'manual' });
       const urlCookie = urlTokenRes.headers.get('set-cookie') || '';
       const urlLoc = urlTokenRes.headers.get('location') || '';
-      if ((urlTokenRes.status !== 302 && urlTokenRes.status !== 303) || urlLoc !== '/' || !/SameSite=Strict/i.test(urlCookie)) {
-        defects.push(`D-0034: GET /?token=... did not redirect 302 to / with SameSite=Strict (status=${urlTokenRes.status}, loc=${urlLoc}, cookie=${urlCookie})`);
+      if (urlCookie !== '' || (urlTokenRes.status !== 302 && urlTokenRes.status !== 303) || urlLoc !== '/') {
+        defects.push(`D-0034: GET /?token=... must NOT issue Set-Cookie and must 302 strip token (status=${urlTokenRes.status}, loc=${urlLoc}, cookie=${urlCookie})`);
       }
-
-      const crossOriginRes = await new Promise<number>((resolve, reject) => {
-        const payload = JSON.stringify({ command: 'get_ui_language', args: {} });
+      const faviconTokenRes = await fetch(`http://127.0.0.1:${authPort}/favicon.ico?token=master-tok-34`, { redirect: 'manual' });
+      const faviconCookie = faviconTokenRes.headers.get('set-cookie') || '';
+      const faviconLoc = faviconTokenRes.headers.get('location') || '';
+      if (faviconCookie !== '' || (faviconTokenRes.status !== 302 && faviconTokenRes.status !== 303) || faviconLoc !== '/favicon.ico') {
+        defects.push(
+          `D-0034: GET /favicon.ico?token=... leaked token without 302 strip or issued cookie (status=${faviconTokenRes.status}, loc=${faviconLoc}, cookie=${faviconCookie})`,
+        );
+      }
+      // Protocol-relative //evil.example?token=... MUST NEVER open-redirect to //evil.example
+      const openRedirLoc = await new Promise<string>((resolve, reject) => {
         const req = http.request(
           {
             hostname: '127.0.0.1',
             port: authPort,
-            path: '/api/invoke',
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Content-Length': Buffer.byteLength(payload),
-              Origin: 'https://evil.example',
-              Cookie: 'opendiy_remote_auth=master-tok-34',
-            },
+            path: '//evil.example/?token=master-tok-34',
+            method: 'GET',
           },
           res => {
             res.resume();
-            res.on('end', () => resolve(res.statusCode ?? 0));
+            res.on('end', () => resolve(String(res.headers.location || '')));
           },
         );
         req.on('error', reject);
-        req.write(payload);
         req.end();
       });
+      if (openRedirLoc.startsWith('//')) {
+        defects.push(`D-0034: protocol-relative open redirect via ?token= strip: Location=${openRedirLoc}`);
+      }
+
+      // GET /auth/logout MUST be rejected with 405 (preventing cross-port <img src="/auth/logout"> CSRF)
+      const getLogoutCsrfRes = await fetch(`http://127.0.0.1:${authPort}/auth/logout`, {
+        method: 'GET',
+        redirect: 'manual',
+        headers: { Cookie: 'opendiy_remote_auth=master-tok-34' },
+      });
+      const getLogoutCookie = getLogoutCsrfRes.headers.get('set-cookie') || '';
+      if (getLogoutCsrfRes.status !== 405 || getLogoutCookie !== '') {
+        defects.push(`D-0034: GET /auth/logout allowed forced logout CSRF (status=${getLogoutCsrfRes.status}, cookie=${getLogoutCookie})`);
+      }
+
+      // Headerless & Cross-port POST /auth/logout MUST be rejected with 403
+      const headerlessLogoutRes = await fetch(`http://127.0.0.1:${authPort}/auth/logout`, {
+        method: 'POST',
+        redirect: 'manual',
+        headers: { Cookie: 'opendiy_remote_auth=master-tok-34' },
+      });
+      if (headerlessLogoutRes.status !== 403) {
+        defects.push(`D-0034: headerless POST /auth/logout was not rejected with 403 (status=${headerlessLogoutRes.status})`);
+      }
+      const crossPortLogoutRes = await fetch(`http://127.0.0.1:${authPort}/auth/logout`, {
+        method: 'POST',
+        redirect: 'manual',
+        headers: {
+          Cookie: 'opendiy_remote_auth=master-tok-34',
+          Origin: `http://127.0.0.1:${authPort + 1}`,
+        },
+      });
+      if (crossPortLogoutRes.status !== 403) {
+        defects.push(`D-0034: cross-port POST /auth/logout was not rejected with 403 (status=${crossPortLogoutRes.status})`);
+      }
+
+      // Headerless cookie POST /api/invoke (missing both Origin and Sec-Fetch-Site) MUST be rejected with 403
+      const sendRawInvoke = (extraHeaders: Record<string, string>) =>
+        new Promise<number>((resolve, reject) => {
+          const payload = JSON.stringify({ command: 'get_ui_language', args: {} });
+          const req = http.request(
+            {
+              hostname: '127.0.0.1',
+              port: authPort,
+              path: '/api/invoke',
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Content-Length': String(Buffer.byteLength(payload)),
+                Cookie: 'opendiy_remote_auth=master-tok-34',
+                ...extraHeaders,
+              },
+            },
+            res => {
+              res.resume();
+              res.on('end', () => resolve(res.statusCode ?? 0));
+            },
+          );
+          req.on('error', reject);
+          req.write(payload);
+          req.end();
+        });
+
+      const headerlessInvokeStatus = await sendRawInvoke({});
+      if (headerlessInvokeStatus !== 403) {
+        defects.push(`D-0034: headerless cookie POST /api/invoke was not rejected with 403 (status=${headerlessInvokeStatus})`);
+      }
+
+      const crossPortInvokeStatus = await sendRawInvoke({ Origin: `http://127.0.0.1:${authPort + 1}` });
+      if (crossPortInvokeStatus !== 403) {
+        defects.push(`D-0034: cross-port cookie POST /api/invoke was not rejected with 403 (status=${crossPortInvokeStatus})`);
+      }
+
+      const crossOriginRes = await sendRawInvoke({ Origin: 'https://evil.example' });
       if (crossOriginRes !== 403) {
         defects.push(`D-0034: cross-origin POST /api/invoke was not rejected with 403 (status=${crossOriginRes})`);
+      }
+
+      const sameOriginInvokeStatus = await sendRawInvoke({ Origin: `http://127.0.0.1:${authPort}` });
+      if (sameOriginInvokeStatus !== 200) {
+        defects.push(`D-0034: legitimate same-origin cookie POST /api/invoke failed (status=${sameOriginInvokeStatus})`);
       }
     } finally {
       await authSrv.close();

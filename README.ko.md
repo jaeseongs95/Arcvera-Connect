@@ -110,7 +110,7 @@ node server/remote-server.mjs \
 ```
 
 #### 웹 브라우저 접속
-브라우저에서 `https://<relay-ip-or-domain>:3210/` 주소로 접속한 뒤 로그인 화면(`POST /auth/token`)에 브라우저 접속 토큰을 입력하면 `sessionStorage`나 URL 쿼리 노출 없이 `HttpOnly; SameSite=Strict` 세션 쿠키가 설정됩니다(Google OAuth 콜백은 `HttpOnly; SameSite=Lax` 쿠키를 발급하며, 기존 `/?token=...` 링크로 접속 시에도 `HttpOnly; SameSite=Strict` 쿠키 설정 후 즉시 `/`로 `302` 리다이렉트하여 주소창의 토큰을 제거합니다).
+브라우저에서 `https://<relay-ip-or-domain>:3210/` 주소로 접속한 뒤 로그인 화면(`POST /auth/token`)에 브라우저 접속 토큰을 입력하면 `sessionStorage` 저장이나 URL `?token=...` 쿼리 인증 수용 없이 `HttpOnly; SameSite=Strict` 세션 쿠키가 설정됩니다(`GET` 경로에 포함된 `?token=` 쿼리는 인증 처리 없이 즉시 `302` 리다이렉트로 제거되며, Google OAuth 콜백은 `HttpOnly; SameSite=Lax` 쿠키를 발급하고 `/auth/logout`은 엄격한 `Origin` 검증을 거치는 `POST` 전용으로만 동작합니다).
 
 ### 시나리오 B: 단일 머신 직접 실행 모드 (`direct`)
 

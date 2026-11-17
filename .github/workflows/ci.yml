@@ -21,7 +21,7 @@ jobs:
         run: |
           bash -n scripts/install-relay.sh
           npm test
-      - name: Runtime test install-relay.sh SHA-256 verification and 3x upgrade .relay.env idempotency
+      - name: Runtime test install-relay.sh URL allowlist, SHA-256 verification, mid-swap rollback, PC_SECRET quoting, and 3x .relay.env idempotency
         run: |
           npm run build
           WORK="$(mktemp -d)"
@@ -29,42 +29,115 @@ jobs:
           BUNDLE="$WORK/arcvera-connect-v1.2.3-relay-bundle.tar.gz"
           tar -czf "$BUNDLE" package.json dist server scripts README.md README.ko.md
           GOOD_SHA="$(sha256sum "$BUNDLE" | awk '{print $1}')"
+          GH_BUNDLE_URL="https://github.com/jaeseongs95/Arcvera-Connect/releases/download/v1.2.3/arcvera-connect-v1.2.3-relay-bundle.tar.gz"
 
-          # Create a non-root sandboxed copy of install-relay.sh skipping only privileged systemd/apt calls
-          SANDBOX_INSTALLER="$WORK/install-sandbox.sh"
-          sed -e 's/sudo tee "${SERVICE_FILE}"/tee "$WORK_SERVICE_FILE"/g' \
-              -e 's/sudo systemctl /true /g' \
-              scripts/install-relay.sh > "$SANDBOX_INSTALLER"
-          chmod +x "$SANDBOX_INSTALLER"
+          MOCK_BIN="$WORK/mock-bin"
+          mkdir -p "$MOCK_BIN"
+          cat > "$MOCK_BIN/sudo" <<'EOF'
+          #!/usr/bin/env bash
+          if [ "$1" = "tee" ]; then
+            cat > "$WORK_SERVICE_FILE"
+          elif [ "$1" = "systemctl" ]; then
+            exit 0
+          else
+            "$@"
+          fi
+          EOF
+          cat > "$MOCK_BIN/systemctl" <<'EOF'
+          #!/usr/bin/env bash
+          exit 0
+          EOF
+          cat > "$MOCK_BIN/curl" <<'EOF'
+          #!/usr/bin/env bash
+          OUT=""
+          URL=""
+          while [ $# -gt 0 ]; do
+            if [ "$1" = "-o" ]; then
+              OUT="$2"
+              shift 2
+            else
+              URL="$1"
+              shift
+            fi
+          done
+          if [[ "$URL" == *"checkip.amazonaws.com"* ]]; then
+            echo "203.0.113.10"
+            exit 0
+          fi
+          if [ -n "$OUT" ] && [ "$URL" = "$GH_BUNDLE_URL" ]; then
+            cp "$BUNDLE" "$OUT"
+            exit 0
+          fi
+          echo "Unexpected curl URL: $URL" >&2
+          exit 22
+          EOF
+          cat > "$MOCK_BIN/mv" <<'EOF'
+          #!/usr/bin/env bash
+          if [ "${FAIL_MV_ON_SCRIPTS:-0}" = "1" ] && [[ "$1" == */extracted/scripts ]]; then
+            echo "Simulated mid-swap failure on scripts" >&2
+            exit 1
+          fi
+          exec /bin/mv "$@"
+          EOF
+          chmod +x "$MOCK_BIN/sudo" "$MOCK_BIN/systemctl" "$MOCK_BIN/curl" "$MOCK_BIN/mv"
 
+          export PATH="$MOCK_BIN:$PATH"
+          export BUNDLE GH_BUNDLE_URL
           export WORK_SERVICE_FILE="$WORK/opendiy-remote.service"
           export OPENDIY_REMOTE_DIR="$WORK/installed"
-          export OPENDIY_REMOTE_BUNDLE_URL="file://$BUNDLE"
 
-          # 1) Wrong SHA-256 MUST fail closed before extracting
-          if OPENDIY_REMOTE_BUNDLE_SHA256="0000000000000000000000000000000000000000000000000000000000000000" "$SANDBOX_INSTALLER"; then
+          # 1) Untrusted URL schemes/hosts MUST fail closed before curl
+          for BAD_URL in "http://github.com/jaeseongs95/Arcvera-Connect/releases/download/v1.2.3/arcvera-connect-v1.2.3-relay-bundle.tar.gz" \
+                         "https://evil.example/arcvera-connect-v1.2.3-relay-bundle.tar.gz" \
+                         "file://$BUNDLE"; do
+            if OPENDIY_REMOTE_BUNDLE_URL="$BAD_URL" OPENDIY_REMOTE_BUNDLE_SHA256="$GOOD_SHA" bash scripts/install-relay.sh; then
+              echo "ERROR: installer accepted untrusted URL: $BAD_URL" >&2
+              exit 1
+            fi
+          done
+
+          export OPENDIY_REMOTE_BUNDLE_URL="$GH_BUNDLE_URL"
+
+          # 2) Wrong SHA-256 MUST fail closed before extracting
+          if OPENDIY_REMOTE_BUNDLE_SHA256="0000000000000000000000000000000000000000000000000000000000000000" bash scripts/install-relay.sh; then
             echo "ERROR: installer succeeded with wrong SHA-256" >&2
             exit 1
           fi
           test ! -f "$OPENDIY_REMOTE_DIR/package.json"
 
-          # 2) Missing SHA-256 with custom URL MUST fail closed
-          if OPENDIY_REMOTE_BUNDLE_SHA256="" "$SANDBOX_INSTALLER"; then
+          # 3) Missing SHA-256 with custom URL MUST fail closed
+          if OPENDIY_REMOTE_BUNDLE_SHA256="" bash scripts/install-relay.sh; then
             echo "ERROR: installer succeeded with empty SHA-256" >&2
             exit 1
           fi
 
-          # 3) Valid SHA-256 + 3 consecutive upgrade runs preserve complex secrets bit-for-bit
+          # 4) Seed baseline installation and prove mid-swap mv failure rolls back dist & server completely
+          mkdir -p "$OPENDIY_REMOTE_DIR/dist" "$OPENDIY_REMOTE_DIR/server" "$OPENDIY_REMOTE_DIR/scripts"
+          printf '{"name":"opendiy-remote","version":"1.0.0"}\n' > "$OPENDIY_REMOTE_DIR/package.json"
+          printf 'BASELINE_DIST_HTML' > "$OPENDIY_REMOTE_DIR/dist/index.html"
+          printf '// BASELINE_SERVER\n' > "$OPENDIY_REMOTE_DIR/server/remote-server.mjs"
+          printf '# BASELINE_SCRIPT\n' > "$OPENDIY_REMOTE_DIR/scripts/install-relay.sh"
+
+          if FAIL_MV_ON_SCRIPTS=1 OPENDIY_REMOTE_BUNDLE_SHA256="$GOOD_SHA" bash scripts/install-relay.sh; then
+            echo "ERROR: installer succeeded despite mid-swap mv failure" >&2
+            exit 1
+          fi
+          grep -q "BASELINE_DIST_HTML" "$OPENDIY_REMOTE_DIR/dist/index.html"
+          grep -q "BASELINE_SERVER" "$OPENDIY_REMOTE_DIR/server/remote-server.mjs"
+          grep -q "BASELINE_SCRIPT" "$OPENDIY_REMOTE_DIR/scripts/install-relay.sh"
+          grep -q '"1.0.0"' "$OPENDIY_REMOTE_DIR/package.json"
+
+          # 5) Valid SHA-256 + 3 consecutive upgrade runs preserve complex secrets & single-quote --host-secret safely
           COMPLEX_TOK='tok/with\bs"quote$and'\''space\\end'
-          COMPLEX_SEC='sec\host"val$123\\'
+          COMPLEX_SEC='sec$(echo PWNED)`echo SUB`"dbl'\''sgl\\end'
           OPENDIY_REMOTE_BUNDLE_SHA256="$GOOD_SHA" \
             OPENDIY_REMOTE_TOKEN="$COMPLEX_TOK" \
             OPENDIY_REMOTE_HOST_SECRET="$COMPLEX_SEC" \
-            "$SANDBOX_INSTALLER" >/dev/null
+            bash scripts/install-relay.sh >/dev/null
 
           # Re-run upgrade twice WITHOUT env overrides so existing .relay.env is parsed and re-written
           for pass in 2 3; do
-            OPENDIY_REMOTE_BUNDLE_SHA256="$GOOD_SHA" "$SANDBOX_INSTALLER" >"$WORK/out-$pass.txt"
+            OPENDIY_REMOTE_BUNDLE_SHA256="$GOOD_SHA" bash scripts/install-relay.sh >"$WORK/out-$pass.txt"
           done
 
           # Verify completion output never contains --tls-insecure or ?token=
@@ -73,6 +146,14 @@ jobs:
             exit 1
           fi
           grep -q -- '--tls-ca' "$WORK/out-3.txt"
+
+          # Verify printed Connect command evaluates --host-secret bit-for-bit without shell command substitution
+          CONNECT_ARGS="$(sed -n 's/^ *Connect command: node server\/remote-server\.mjs //p' "$WORK/out-3.txt")"
+          EVAL_SEC="$(bash -c "extract_sec() { while [ \$# -gt 0 ]; do if [ \"\$1\" = \"--host-secret\" ]; then printf '%s' \"\$2\"; break; fi; shift; done; }; extract_sec ${CONNECT_ARGS}")"
+          if [ "$EVAL_SEC" != "$COMPLEX_SEC" ]; then
+            echo "ERROR: printed Connect command corrupted secret: got [$EVAL_SEC], expected [$COMPLEX_SEC]" >&2
+            exit 1
+          fi
 
           # Verify .relay.env round-trip via node parser matches exact original bytes
           ENV_TARGET="$OPENDIY_REMOTE_DIR/.relay.env" node -e '
@@ -108,7 +189,7 @@ jobs:
           '
         env:
           EXPECTED_TOK: 'tok/with\bs"quote$and''space\\end'
-          EXPECTED_SEC: 'sec\host"val$123\\'
+          EXPECTED_SEC: 'sec$(echo PWNED)`echo SUB`"dbl''sgl\\end'
 
   validate:
     runs-on: windows-latest

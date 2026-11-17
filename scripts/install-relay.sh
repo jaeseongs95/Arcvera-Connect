@@ -54,16 +54,62 @@ cleanup_stage() {
 }
 trap cleanup_stage EXIT
 
+validate_github_https_url() {
+  local target_url="$1"
+  local label="$2"
+  TARGET_URL="${target_url}" URL_LABEL="${label}" node -e '
+    const raw = String(process.env.TARGET_URL || "").trim();
+    const label = String(process.env.URL_LABEL || "URL");
+    let parsed;
+    try {
+      parsed = new URL(raw);
+    } catch {
+      console.error("Error: Invalid " + label + ": " + raw);
+      process.exit(1);
+    }
+    const allowedHosts = new Set([
+      "github.com",
+      "api.github.com",
+      "objects.githubusercontent.com",
+      "release-assets.githubusercontent.com",
+      "codeload.github.com",
+    ]);
+    const host = parsed.hostname.toLowerCase();
+    if (
+      parsed.protocol !== "https:" ||
+      parsed.username !== "" ||
+      parsed.password !== "" ||
+      (parsed.port !== "" && parsed.port !== "443") ||
+      !allowedHosts.has(host)
+    ) {
+      console.error("Error: Untrusted " + label + " (must be https:// on an official GitHub release host): " + raw);
+      process.exit(1);
+    }
+  '
+}
+
+shell_quote_single() {
+  printf '%s' "$1" | node -e '
+    const fs = require("node:fs");
+    const sq = String.fromCharCode(39);
+    const bs = String.fromCharCode(92);
+    const val = fs.readFileSync(0, "utf8");
+    process.stdout.write(sq + val.split(sq).join(sq + bs + sq + sq) + sq);
+  '
+}
+
 BUNDLE_URL="${OPENDIY_REMOTE_BUNDLE_URL:-}"
 EXPECTED_SHA256="${OPENDIY_REMOTE_BUNDLE_SHA256:-}"
 
 if [ -n "${BUNDLE_URL}" ]; then
+  validate_github_https_url "${BUNDLE_URL}" "OPENDIY_REMOTE_BUNDLE_URL"
   if [[ ! "${EXPECTED_SHA256}" =~ ^[a-fA-F0-9]{64}$ ]]; then
     echo "Error: OPENDIY_REMOTE_BUNDLE_SHA256 (64-char hex) is required when OPENDIY_REMOTE_BUNDLE_URL is set." >&2
     exit 1
   fi
   EXPECTED_SHA256="$(printf '%s' "${EXPECTED_SHA256}" | tr '[:upper:]' '[:lower:]')"
 else
+  validate_github_https_url "${RELEASE_API_URL}" "OPENDIY_REMOTE_RELEASE_API_URL"
   RELEASE_JSON="${STAGE_DIR}/release.json"
   curl -fsSL --retry 3 -H "Accept: application/vnd.github+json" -o "${RELEASE_JSON}" "${RELEASE_API_URL}"
   RESOLVED_ASSET="$(REL_JSON="${RELEASE_JSON}" REL_VER="${VERSION}" PRI_NAME="${PRIMARY_BUNDLE_NAME}" FB_NAME="${FALLBACK_BUNDLE_NAME}" node -e '
@@ -96,6 +142,7 @@ else
   ')"
   BUNDLE_URL="${RESOLVED_ASSET%%$'\t'*}"
   EXPECTED_SHA256="${RESOLVED_ASSET#*$'\t'}"
+  validate_github_https_url "${BUNDLE_URL}" "release bundle download URL"
 fi
 
 BUNDLE_ARCHIVE="${STAGE_DIR}/bundle.tar.gz"
@@ -116,16 +163,57 @@ if [ ! -f "${EXTRACT_DIR}/package.json" ] || [ ! -f "${EXTRACT_DIR}/server/remot
   exit 1
 fi
 
-BACKUP_STAGE="${STAGE_DIR}/prev"
+BACKUP_STAGE="${INSTALL_DIR}/.backup-stage.$$"
+rm -rf "${BACKUP_STAGE}"
 mkdir -p "${BACKUP_STAGE}"
+SWAPPED_TARGETS=()
+HAD_PREV_FLAGS=()
+SWAP_FAILED=0
+
+set +e
 for target in dist server scripts package.json README.md README.ko.md; do
   if [ -e "${EXTRACT_DIR}/${target}" ]; then
+    had_prev=0
     if [ -e "${INSTALL_DIR}/${target}" ]; then
-      mv "${INSTALL_DIR}/${target}" "${BACKUP_STAGE}/${target}"
+      had_prev=1
+      if ! mv "${INSTALL_DIR}/${target}" "${BACKUP_STAGE}/${target}"; then
+        SWAP_FAILED=1
+        break
+      fi
     fi
-    mv "${EXTRACT_DIR}/${target}" "${INSTALL_DIR}/${target}"
+    SWAPPED_TARGETS+=("${target}")
+    HAD_PREV_FLAGS+=("${had_prev}")
+    if ! mv "${EXTRACT_DIR}/${target}" "${INSTALL_DIR}/${target}"; then
+      SWAP_FAILED=1
+      break
+    fi
   fi
 done
+
+if [ "${SWAP_FAILED}" -ne 0 ]; then
+  echo "Error: Atomic bundle swap failed mid-flight; rolling back previous installation..." >&2
+  ROLLBACK_CLEAN=1
+  idx=$(( ${#SWAPPED_TARGETS[@]} - 1 ))
+  while [ "${idx}" -ge 0 ]; do
+    t="${SWAPPED_TARGETS[$idx]}"
+    prev_flag="${HAD_PREV_FLAGS[$idx]}"
+    rm -rf "${INSTALL_DIR:?}/${t}" || ROLLBACK_CLEAN=0
+    if [ "${prev_flag}" -eq 1 ] && [ -e "${BACKUP_STAGE}/${t}" ]; then
+      mv "${BACKUP_STAGE}/${t}" "${INSTALL_DIR}/${t}" || ROLLBACK_CLEAN=0
+    fi
+    idx=$(( idx - 1 ))
+  done
+  if [ "${ROLLBACK_CLEAN}" -eq 1 ]; then
+    rm -rf "${BACKUP_STAGE}"
+  else
+    echo "Warning: Partial rollback error; backup preserved at ${BACKUP_STAGE}" >&2
+  fi
+  set -e
+  exit 1
+fi
+rm -rf "${INSTALL_DIR}/.backup-prev"
+mv "${BACKUP_STAGE}" "${INSTALL_DIR}/.backup-prev" || true
+set -e
 
 TLS_DIR="${INSTALL_DIR}/tls"
 TLS_CERT="${OPENDIY_REMOTE_TLS_CERT:-${TLS_DIR}/cert.pem}"
@@ -297,6 +385,7 @@ fi
 echo "[3] Workstation PC Host Secret (--host-secret):"
 echo "    ${PC_SECRET}"
 if [ -n "${PUBLIC_IP}" ]; then
-  echo "    Connect command: node server/remote-server.mjs --connect https://${PUBLIC_IP}:${PORT} --host-secret \"${PC_SECRET}\" --tls-ca ./relay-cert.pem"
+  QUOTED_PC_SECRET="$(shell_quote_single "${PC_SECRET}")"
+  echo "    Connect command: node server/remote-server.mjs --connect https://${PUBLIC_IP}:${PORT} --host-secret ${QUOTED_PC_SECRET} --tls-ca ./relay-cert.pem"
 fi
 echo "======================================================================"

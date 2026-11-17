@@ -110,7 +110,7 @@ node server/remote-server.mjs \
 ```
 
 #### Open in a Web Browser
-Navigate to `https://<relay-ip-or-domain>:3210/` and submit the browser access token on the login form (`POST /auth/token`). The server sets an `HttpOnly; SameSite=Strict` session cookie without storing the token in `sessionStorage` or URL query strings (Google OAuth callbacks issue an `HttpOnly; SameSite=Lax` session cookie, and legacy `/?token=...` links immediately `302`-redirect to `/` after setting `HttpOnly; SameSite=Strict`).
+Navigate to `https://<relay-ip-or-domain>:3210/` and submit the browser access token on the login form (`POST /auth/token`). The server sets an `HttpOnly; SameSite=Strict` session cookie without storing the token in `sessionStorage` or accepting URL `?token=...` query credentials (any `?token=` query parameter on `GET` routes is stripped via `302` redirect without authenticating, Google OAuth callbacks issue an `HttpOnly; SameSite=Lax` session cookie, and `/auth/logout` is `POST`-only with strict `Origin` verification).
 
 ### Scenario B: Single-Machine Direct Mode (`direct`)
 

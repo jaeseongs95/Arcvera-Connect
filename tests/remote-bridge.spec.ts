@@ -45,7 +45,11 @@ test('remote browser bridge renders REMOTE WORKSPACE and bridges project, sessio
     const errors: string[] = [];
     page.on('pageerror', err => errors.push(err.message));
 
-    await page.goto(`${apiOrigin}/?token=e2e-secret-token`);
+    await page.goto(apiOrigin);
+    const gateForm = page.locator('form[method="POST"][action="/auth/token"]');
+    await expect(gateForm).toBeVisible();
+    await gateForm.locator('input[name="token"]').fill('e2e-secret-token');
+    await gateForm.locator('button.tok-btn').click();
     await expect(page.locator('#app')).toHaveAttribute('aria-busy', 'false');
     await expect(page.locator('#mode-label')).toHaveText('원격 작업 공간');
 
@@ -139,7 +143,11 @@ test('mobile viewport (390x844) renders dedicated mobile UI with slide-over draw
 
   try {
     await page.setViewportSize({ width: 390, height: 844 });
-    await page.goto(`${apiOrigin}/?token=mobile-secret-token`);
+    await page.goto(apiOrigin);
+    const mobileGateForm = page.locator('form[method="POST"][action="/auth/token"]');
+    await expect(mobileGateForm).toBeVisible();
+    await mobileGateForm.locator('input[name="token"]').fill('mobile-secret-token');
+    await mobileGateForm.locator('button.tok-btn').click();
     await expect(page.locator('#app')).toHaveAttribute('aria-busy', 'false');
 
     // No horizontal overflow on mobile (min-width: 800px removed)
@@ -372,6 +380,7 @@ test('relay + host connector mode renders mirrored desktop terminal rollout on i
   );
   desktopDb.close();
 
+  const ghReleaseApiUrl = 'https://api.github.com/repos/jaeseongs95/Arcvera-Connect/releases/latest';
   const mockReleaseFetch = async (url: string) => {
     if (url.endsWith('/releases/latest')) {
       return {
@@ -379,13 +388,14 @@ test('relay + host connector mode renders mirrored desktop terminal rollout on i
         status: 200,
         json: async () => ({
           tag_name: 'v9.9.9',
-          html_url: 'https://github.com/jaeseongs95/opendiy-remote/releases/tag/v9.9.9',
+          html_url: 'https://github.com/jaeseongs95/Arcvera-Connect/releases/tag/v9.9.9',
           body: 'Auto-update E2E verification',
           published_at: '2026-11-08T13:00:00Z',
           assets: [
             {
-              name: 'opendiy-remote-v9.9.9-relay-bundle.tar.gz',
-              browser_download_url: 'https://mock.local/opendiy-remote-v9.9.9-relay-bundle.tar.gz',
+              name: 'arcvera-connect-v9.9.9-relay-bundle.tar.gz',
+              browser_download_url:
+                'https://github.com/jaeseongs95/Arcvera-Connect/releases/download/v9.9.9/arcvera-connect-v9.9.9-relay-bundle.tar.gz',
               size: 1024,
               digest: 'sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
             },
@@ -401,7 +411,7 @@ test('relay + host connector mode renders mirrored desktop terminal rollout on i
     workspaceDir: path.join(tmpRoot, 'relay-workspace'),
     token: 'relay-user-token',
     hostSecret: 'relay-connector-secret',
-    releaseApiUrl: 'https://mock.local/releases/latest',
+    releaseApiUrl: ghReleaseApiUrl,
     updateFetchFn: mockReleaseFetch,
     allowPathDiscovery: false,
   });
@@ -416,7 +426,7 @@ test('relay + host connector mode renders mirrored desktop terminal rollout on i
     workspaceDir: path.join(tmpRoot, 'host-workspace'),
     desktopDbPath,
     codexHomeDir,
-    releaseApiUrl: 'https://mock.local/releases/latest',
+    releaseApiUrl: ghReleaseApiUrl,
     updateFetchFn: mockReleaseFetch,
     allowPathDiscovery: false,
     rpcTransport: Object.assign(
@@ -728,6 +738,91 @@ test('relay + host connector mode renders mirrored desktop terminal rollout on i
   } finally {
     await connector.close();
     await relay.close();
+    try { fs.rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch {}
+  }
+});
+
+test('cross-port same-site CSRF (<img src="/auth/logout">, cross-port POST /auth/logout, cross-port POST /api/invoke) and URL ?token= backdoors are blocked in Chromium', async ({ page }) => {
+  const http = await import('node:http');
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'opendiy-remote-csrf-e2e-'));
+  const remote = createRemoteServer({
+    workspaceDir: path.join(tmpRoot, 'workspace'),
+    token: 'csrf-e2e-token',
+    allowPathDiscovery: false,
+    spawnProcess: false,
+  });
+  await new Promise<void>(resolve => remote.server.listen(0, '127.0.0.1', () => resolve()));
+  const targetPort = (remote.server.address() as { port: number }).port;
+  const targetOrigin = `http://127.0.0.1:${targetPort}`;
+
+  let attackerPort = 0;
+  let imgLogoutStatusSeen = 0;
+  let formPostLogoutStatusSeen = 0;
+  let crossPortInvokeStatusSeen = 0;
+  remote.server.on('request', (req: any, res: any) => {
+    res.once('finish', () => {
+      if (req.url === '/auth/logout' && req.method === 'GET') {
+        imgLogoutStatusSeen = res.statusCode;
+      }
+      if (req.url === '/auth/logout' && req.method === 'POST' && String(req.headers.origin || '').includes(`:${attackerPort}`)) {
+        formPostLogoutStatusSeen = res.statusCode;
+      }
+      if (req.url === '/api/invoke' && req.method === 'POST' && String(req.headers.origin || '').includes(`:${attackerPort}`)) {
+        crossPortInvokeStatusSeen = res.statusCode;
+      }
+    });
+  });
+
+  const attackerServer = http.createServer((_req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(`<!doctype html><html><body>
+      <img id="csrf-img" src="${targetOrigin}/auth/logout" />
+      <form id="csrf-form" method="POST" action="${targetOrigin}/auth/logout"><button id="csrf-btn" type="submit">csrf</button></form>
+      <script>
+        fetch(${JSON.stringify(`${targetOrigin}/api/invoke`)}, {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'Content-Type': 'text/plain' },
+          body: JSON.stringify({ command: 'get_ui_language', args: {} })
+        }).catch(() => {});
+      </script>
+    </body></html>`);
+  });
+  await new Promise<void>(resolve => attackerServer.listen(0, '127.0.0.1', () => resolve()));
+  attackerPort = (attackerServer.address() as { port: number }).port;
+
+  try {
+    // 1. Visiting /?token=... strips ?token= via 302 WITHOUT authenticating (login gate remains visible)
+    await page.goto(`${targetOrigin}/?token=csrf-e2e-token`);
+    expect(page.url()).toBe(`${targetOrigin}/`);
+    const loginForm = page.locator('form[method="POST"][action="/auth/token"]');
+    await expect(loginForm).toBeVisible();
+
+    // 2. Sign in legitimately via POST /auth/token
+    await loginForm.locator('input[name="token"]').fill('csrf-e2e-token');
+    await loginForm.locator('button.tok-btn').click();
+    await expect(page.locator('#app')).toHaveAttribute('aria-busy', 'false');
+    await expect(page.locator('#mode-label')).toHaveText('원격 작업 공간');
+
+    // 3. Open same-site different-port attacker page in the SAME Chromium BrowserContext (SameSite=Strict cookie IS sent across ports!)
+    const attackerPage = await page.context().newPage();
+    try {
+      await attackerPage.goto(`http://127.0.0.1:${attackerPort}/`);
+      await expect.poll(() => imgLogoutStatusSeen).toBe(405);
+      await expect.poll(() => crossPortInvokeStatusSeen).toBe(403);
+      await attackerPage.locator('#csrf-btn').click();
+      await expect.poll(() => formPostLogoutStatusSeen).toBe(403);
+    } finally {
+      await attackerPage.close();
+    }
+
+    // 4. Reload workspace tab and verify user session was NOT revoked by cross-port CSRF!
+    await page.reload();
+    await expect(page.locator('#app')).toHaveAttribute('aria-busy', 'false');
+    await expect(page.locator('#mode-label')).toHaveText('원격 작업 공간');
+  } finally {
+    await new Promise<void>(resolve => attackerServer.close(() => resolve()));
+    await remote.close();
     try { fs.rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch {}
   }
 });

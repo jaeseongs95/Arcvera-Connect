@@ -128,16 +128,49 @@ export function readInstalledVersion(rootDir = ROOT_DIR) {
   }
 }
 
+const ALLOWED_GITHUB_RELEASE_HOSTS = new Set([
+  'github.com',
+  'api.github.com',
+  'objects.githubusercontent.com',
+  'release-assets.githubusercontent.com',
+  'codeload.github.com',
+]);
+
+export function assertTrustedGitHubHttpsUrl(rawUrl, label = 'URL') {
+  const trimmed = String(rawUrl ?? '').trim();
+  let parsed;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    throw new Error(`유효하지 않은 ${label}입니다: ${trimmed}`);
+  }
+  const host = parsed.hostname.toLowerCase();
+  if (
+    parsed.protocol !== 'https:' ||
+    parsed.username !== '' ||
+    parsed.password !== '' ||
+    (parsed.port !== '' && parsed.port !== '443') ||
+    !ALLOWED_GITHUB_RELEASE_HOSTS.has(host)
+  ) {
+    throw new Error(
+      `보안 정책 위반: ${label}은(는) 공식 GitHub HTTPS 호스트만 허용됩니다 (${trimmed}).`,
+    );
+  }
+  return parsed.toString();
+}
+
 export async function fetchLatestReleaseInfo(options = {}) {
   const rootDir = options.rootDir || ROOT_DIR;
   const currentVersion = options.currentVersion
     ? String(options.currentVersion).trim().replace(/^v/i, '')
     : readInstalledVersion(rootDir);
   const repoSlug = options.repoSlug || process.env.OPENDIY_REMOTE_UPDATE_REPO || GITHUB_REPO_SLUG;
-  const releaseApiUrl =
+  const releaseApiUrl = assertTrustedGitHubHttpsUrl(
     options.releaseApiUrl ||
-    process.env.OPENDIY_REMOTE_RELEASE_API_URL ||
-    `https://api.github.com/repos/${repoSlug}/releases/latest`;
+      process.env.OPENDIY_REMOTE_RELEASE_API_URL ||
+      `https://api.github.com/repos/${repoSlug}/releases/latest`,
+    '릴리스 조회 API 주소',
+  );
   const fetchFn = options.fetchFn || globalThis.fetch;
 
   const res = await fetchFn(releaseApiUrl, {
@@ -230,6 +263,7 @@ export async function performSelfUpdate(options = {}) {
     if (!info.bundleUrl) {
       throw new Error(`릴리스(${info.tagName})에서 업데이트 번들(.tar.gz)을 찾을 수 없습니다.`);
     }
+    const trustedBundleUrl = assertTrustedGitHubHttpsUrl(info.bundleUrl, '릴리스 업데이트 번들 다운로드 주소');
     const expectedSha256 = String(info.sha256 || '').trim().toLowerCase();
     if (!/^[a-f0-9]{64}$/.test(expectedSha256)) {
       throw new Error(
@@ -237,7 +271,7 @@ export async function performSelfUpdate(options = {}) {
       );
     }
 
-    const bundleRes = await fetchFn(info.bundleUrl, {
+    const bundleRes = await fetchFn(trustedBundleUrl, {
       headers: {
         Accept: 'application/octet-stream',
         'User-Agent': `opendiy-remote/${info.currentVersion}`,
@@ -260,9 +294,9 @@ export async function performSelfUpdate(options = {}) {
     fs.mkdirSync(rootDir, { recursive: true });
     const stageStamp = `${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
     const tmpStageDir = path.join(rootDir, `.update-stage-${stageStamp}`);
+    const stagedBackupDir = path.join(rootDir, `.backup-stage-${stageStamp}`);
     const archivePath = path.join(tmpStageDir, 'bundle.tar.gz');
     const extractDir = path.join(tmpStageDir, 'extracted');
-    const stagedBackupDir = path.join(tmpStageDir, 'backup');
     fs.mkdirSync(extractDir, { recursive: true });
     fs.mkdirSync(stagedBackupDir, { recursive: true });
 
@@ -301,6 +335,7 @@ export async function performSelfUpdate(options = {}) {
           swapped[swapped.length - 1].promoted = true;
         }
       } catch (applyErr) {
+        let rollbackClean = true;
         for (let idx = swapped.length - 1; idx >= 0; idx -= 1) {
           const item = swapped[idx];
           const currentTarget = path.join(rootDir, item.rel);
@@ -312,6 +347,13 @@ export async function performSelfUpdate(options = {}) {
             if (item.hadPrev && fs.existsSync(backupTarget)) {
               movePathAtomicSync(backupTarget, currentTarget);
             }
+          } catch {
+            rollbackClean = false;
+          }
+        }
+        if (rollbackClean) {
+          try {
+            fs.rmSync(stagedBackupDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
           } catch {}
         }
         throw applyErr;
@@ -321,7 +363,11 @@ export async function performSelfUpdate(options = {}) {
       try {
         fs.rmSync(backupDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
         movePathAtomicSync(stagedBackupDir, backupDir);
-      } catch {}
+      } catch {
+        try {
+          fs.rmSync(stagedBackupDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+        } catch {}
+      }
 
       const installedVersion = readInstalledVersion(rootDir);
       const shouldScheduleRestart = options.scheduleRestart === true;
@@ -5389,7 +5435,16 @@ export function createRemoteServer(options = {}) {
   const useTls = Boolean(tlsCert && tlsKey);
 
   const requestHandler = (req, res) => {
-    const reqUrl = new URL(req.url || '/', `${useTls ? 'https' : 'http'}://${req.headers.host || '127.0.0.1'}`);
+    const rawReqPath = String(req.url || '/');
+    const normalizedReqPath = rawReqPath.startsWith('/') ? `/${rawReqPath.replace(/^[\/\\]+/, '')}` : '/';
+    let reqUrl;
+    try {
+      reqUrl = new URL(normalizedReqPath, 'http://127.0.0.1');
+    } catch {
+      res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
+      res.end('Bad Request');
+      return;
+    }
     const pathname = reqUrl.pathname;
     const clientIp = String(req.socket?.remoteAddress || 'unknown');
 
@@ -5699,33 +5754,62 @@ export function createRemoteServer(options = {}) {
       return;
     }
 
-    function isCrossOriginBrowserRequest(request) {
+    function isLoopbackSocketAddress(rawAddress) {
+      const addr = String(rawAddress || '').trim().toLowerCase();
+      return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
+    }
+
+    function isCrossOriginBrowserRequest(request, { requireOrigin = true } = {}) {
       const secFetchSite = String(request.headers['sec-fetch-site'] || '').trim().toLowerCase();
-      if (secFetchSite && secFetchSite !== 'same-origin' && secFetchSite !== 'none') {
+      if (secFetchSite && secFetchSite !== 'same-origin') {
         return true;
       }
       const originHeader = String(request.headers.origin || '').trim();
-      if (!originHeader) return false;
+      if (!originHeader) {
+        return Boolean(requireOrigin);
+      }
       if (originHeader.toLowerCase() === 'null') return true;
-      let originHost = '';
+      let parsedOrigin;
       try {
-        originHost = new URL(originHeader).host.toLowerCase();
+        parsedOrigin = new URL(originHeader);
       } catch {
         return true;
       }
+      const originProto = parsedOrigin.protocol.toLowerCase();
+      if (originProto !== 'http:' && originProto !== 'https:') {
+        return true;
+      }
+      const expectedProto = isRequestHttps(request, useTls) ? 'https:' : 'http:';
+      if (originProto !== expectedProto) {
+        return true;
+      }
+      const originHost = parsedOrigin.host.toLowerCase();
       const reqHost = String(request.headers.host || '').trim().toLowerCase();
-      const fwdHost = String(request.headers['x-forwarded-host'] || '')
-        .split(',')[0]
-        .trim()
-        .toLowerCase();
+      const fwdHost = isLoopbackSocketAddress(request.socket?.remoteAddress)
+        ? String(request.headers['x-forwarded-host'] || '')
+            .split(',')[0]
+            .trim()
+            .toLowerCase()
+        : '';
+      if (!reqHost && !fwdHost) return true;
       return originHost !== reqHost && (!fwdHost || originHost !== fwdHost);
     }
 
-    if (req.method === 'POST' && pathname === '/auth/token') {
-      if (isCrossOriginBrowserRequest(req)) {
+    if (pathname === '/auth/token') {
+      if (req.method !== 'POST') {
+        sendJsonResponse(
+          req,
+          res,
+          405,
+          { ok: false, error: '인증 토큰 제출은 POST 메서드만 허용됩니다.' },
+          { Allow: 'POST' },
+        );
+        return;
+      }
+      if (isCrossOriginBrowserRequest(req, { requireOrigin: true })) {
         sendJsonResponse(req, res, 403, {
           ok: false,
-          error: '교차 출처(Cross-Origin) 인증 요청이 보안 정책에 의해 차단되었습니다.',
+          error: '교차 출처(Cross-Origin) 또는 출처 미기재 인증 요청이 보안 정책에 의해 차단되었습니다.',
         });
         return;
       }
@@ -5800,21 +5884,31 @@ export function createRemoteServer(options = {}) {
       return;
     }
 
-    if ((req.method === 'GET' || req.method === 'POST') && pathname === '/auth/logout') {
-      if (req.method === 'POST' && isCrossOriginBrowserRequest(req)) {
+    if (pathname === '/auth/logout') {
+      if (req.method !== 'POST') {
+        sendJsonResponse(
+          req,
+          res,
+          405,
+          { ok: false, error: '로그아웃은 POST 메서드만 허용됩니다.' },
+          { Allow: 'POST' },
+        );
+        return;
+      }
+      if (isCrossOriginBrowserRequest(req, { requireOrigin: true })) {
         sendJsonResponse(req, res, 403, {
           ok: false,
-          error: '교차 출처(Cross-Origin) 로그아웃 요청이 보안 정책에 의해 차단되었습니다.',
+          error: '교차 출처(Cross-Origin) 또는 출처 미기재 로그아웃 요청이 보안 정책에 의해 차단되었습니다.',
         });
         return;
       }
       const isHttps = isRequestHttps(req, useTls);
       const clearCookie = `${AUTH_COOKIE_NAME}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${isHttps ? '; Secure' : ''}`;
-      if (req.method === 'POST' && String(req.headers.accept || '').toLowerCase().includes('application/json')) {
+      if (String(req.headers.accept || '').toLowerCase().includes('application/json')) {
         sendJsonResponse(req, res, 200, { ok: true }, { 'Set-Cookie': clearCookie });
         return;
       }
-      res.writeHead(302, {
+      res.writeHead(303, {
         Location: '/',
         'Cache-Control': 'no-store',
         'Set-Cookie': clearCookie,
@@ -5824,7 +5918,7 @@ export function createRemoteServer(options = {}) {
     }
 
     if (pathname.startsWith('/api/')) {
-      if (req.method === 'POST' && isCrossOriginBrowserRequest(req)) {
+      if (isCrossOriginBrowserRequest(req, { requireOrigin: false })) {
         res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
         res.end(JSON.stringify({
           ok: false,
@@ -5836,6 +5930,18 @@ export function createRemoteServer(options = {}) {
       const bearer = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
       const cookies = parseCookies(req.headers.cookie);
       const cookieToken = cookies[AUTH_COOKIE_NAME] || '';
+      const isStateChangingMethod = req.method !== 'GET' && req.method !== 'HEAD';
+      if (isStateChangingMethod && !bearer) {
+        const usesBrowserOrImplicitSession = Boolean(cookieToken) || (!tokenSha256 && !googleOAuthEnabled);
+        if (usesBrowserOrImplicitSession && isCrossOriginBrowserRequest(req, { requireOrigin: true })) {
+          res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+          res.end(JSON.stringify({
+            ok: false,
+            error: '출처(Origin) 헤더가 누락되었거나 일치하지 않는 쿠키 인증 요청이 차단되었습니다.',
+          }));
+          return;
+        }
+      }
       const provided = bearer || cookieToken;
       const valid = isClientCredentialValid(provided);
       const rate = checkAndRecordAuth(`client:${clientIp}`, valid, Boolean(String(provided).trim()));
@@ -5881,7 +5987,17 @@ export function createRemoteServer(options = {}) {
       return;
     }
 
-    if (req.method === 'POST' && pathname === '/api/invoke') {
+    if (pathname === '/api/invoke') {
+      if (req.method !== 'POST') {
+        sendJsonResponse(
+          req,
+          res,
+          405,
+          { ok: false, error: '/api/invoke 엔드포인트는 POST 메서드만 허용됩니다.' },
+          { Allow: 'POST' },
+        );
+        return;
+      }
       readJsonBody(req, res, async body => {
         try {
           const result = await dispatchCommand(String(body.command ?? ''), body.args || {});
@@ -5896,6 +6012,19 @@ export function createRemoteServer(options = {}) {
     if (req.method === 'GET') {
       const filePath = resolveStaticFile(pathname);
       if (filePath) {
+        if (reqUrl.searchParams.has('token')) {
+          const cleanUrl = new URL(reqUrl.toString());
+          cleanUrl.searchParams.delete('token');
+          const safePathname = `/${cleanUrl.pathname.replace(/^\/+/, '')}`;
+          const redirectTarget = `${safePathname}${cleanUrl.search}`;
+          res.writeHead(302, {
+            Location: redirectTarget,
+            'Cache-Control': 'no-store',
+            'Referrer-Policy': 'same-origin',
+          });
+          res.end();
+          return;
+        }
         const ctype = contentTypeFor(filePath);
         const headers = {
           'Content-Type': ctype,
@@ -5904,41 +6033,13 @@ export function createRemoteServer(options = {}) {
           'X-Frame-Options': 'DENY',
           'Referrer-Policy': 'same-origin',
         };
-        const urlToken = reqUrl.searchParams.get('token') || '';
         const cookies = parseCookies(req.headers.cookie);
         const cookieToken = cookies[AUTH_COOKIE_NAME] || '';
-        const isHttps = isRequestHttps(req, useTls);
-        let hasValidAuth = isClientCredentialValid(cookieToken);
-        let authGateError = '';
-        if (urlToken) {
-          const urlValid = verifyToken(tokenSha256, urlToken);
-          const urlRate = checkAndRecordAuth(`client:${clientIp}`, urlValid, true);
-          if (urlRate.allowed) {
-            const strictCookie = `${AUTH_COOKIE_NAME}=${encodeURIComponent(urlToken.trim())}; HttpOnly; SameSite=Strict; Path=/${isHttps ? '; Secure' : ''}`;
-            headers['Set-Cookie'] = strictCookie;
-            hasValidAuth = true;
-            if (path.basename(filePath) === 'index.html') {
-              const cleanUrl = new URL(reqUrl.toString());
-              cleanUrl.searchParams.delete('token');
-              const redirectTarget = `${cleanUrl.pathname || '/'}${cleanUrl.search}`;
-              res.writeHead(302, {
-                Location: redirectTarget,
-                'Cache-Control': 'no-store',
-                'Set-Cookie': strictCookie,
-              });
-              res.end();
-              return;
-            }
-          } else {
-            authGateError = urlRate.locked
-              ? '반복된 인증 실패로 접속이 일시 차단되었습니다. 잠시 후 다시 시도하세요.'
-              : '접속 토큰이 올바르지 않습니다.';
-          }
-        }
+        const hasValidAuth = isClientCredentialValid(cookieToken);
         if (path.basename(filePath) === 'index.html') {
           if ((googleOAuthEnabled || tokenSha256) && !hasValidAuth) {
-            res.writeHead(authGateError ? 401 : 200, headers);
-            res.end(renderAuthGatePage({ errorMsg: authGateError }), 'utf8');
+            res.writeHead(200, headers);
+            res.end(renderAuthGatePage({ errorMsg: '' }), 'utf8');
             return;
           }
           const htmlBuf = Buffer.from(injectRemoteFlag(fs.readFileSync(filePath, 'utf8')), 'utf8');
