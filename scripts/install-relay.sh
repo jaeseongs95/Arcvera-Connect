@@ -1,22 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# OpenDIY Remote 1:1 Relay — One-Click VPS Installer (Ubuntu / Debian, Full TLS + Google OAuth support)
+# Arcvera Connect (OpenDIY Remote) 1:1 Relay — One-Click VPS Installer (Ubuntu / Debian, Full TLS + Google OAuth support)
 # Usage:
-#   curl -fsSL https://github.com/jaeseongs95/opendiy-remote/releases/download/v1.2.2/install-relay.sh | bash
+#   curl -fsSL https://github.com/jaeseongs95/Arcvera-Connect/releases/download/v1.2.3/install-relay.sh | bash
 # Optional Google OAuth flags (via env vars):
 #   OPENDIY_REMOTE_GOOGLE_CLIENT_ID="..." \
 #   OPENDIY_REMOTE_GOOGLE_CLIENT_SECRET="..." \
 #   OPENDIY_REMOTE_ALLOWED_EMAIL="me@gmail.com" \
-#   bash <(curl -fsSL https://github.com/jaeseongs95/opendiy-remote/releases/download/v1.2.2/install-relay.sh)
+#   bash <(curl -fsSL https://github.com/jaeseongs95/Arcvera-Connect/releases/download/v1.2.3/install-relay.sh)
 
-VERSION="${OPENDIY_REMOTE_VERSION:-v1.2.2}"
+VERSION="${OPENDIY_REMOTE_VERSION:-v1.2.3}"
 PORT="${OPENDIY_REMOTE_PORT:-3210}"
 BIND_HOST="${OPENDIY_REMOTE_BIND_HOST:-0.0.0.0}"
 INSTALL_DIR="${OPENDIY_REMOTE_DIR:-$HOME/opendiy-remote}"
 SERVICE_NAME="opendiy-remote"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-BUNDLE_URL="https://github.com/jaeseongs95/opendiy-remote/releases/download/${VERSION}/opendiy-remote-${VERSION}-relay-bundle.tar.gz"
+REPO_SLUG="${OPENDIY_REMOTE_REPO:-jaeseongs95/Arcvera-Connect}"
+PRIMARY_BUNDLE_URL="https://github.com/${REPO_SLUG}/releases/download/${VERSION}/arcvera-connect-${VERSION}-relay-bundle.tar.gz"
+FALLBACK_BUNDLE_URL="https://github.com/${REPO_SLUG}/releases/download/${VERSION}/opendiy-remote-${VERSION}-relay-bundle.tar.gz"
 
 echo "==> [1/5] Checking Node.js (>= 22)..."
 NEED_NODE=1
@@ -35,9 +37,11 @@ if [ "${NEED_NODE}" -eq 1 ]; then
   echo "    Installed Node.js $(node -v)"
 fi
 
-echo "==> [2/5] Downloading & extracting OpenDIY Remote (${VERSION}) to ${INSTALL_DIR}..."
+echo "==> [2/5] Downloading & extracting Arcvera Connect / OpenDIY Remote (${VERSION}) to ${INSTALL_DIR}..."
 mkdir -p "${INSTALL_DIR}"
-curl -fsSL "${BUNDLE_URL}" | tar -xz -C "${INSTALL_DIR}"
+if ! curl -fsSL "${PRIMARY_BUNDLE_URL}" | tar -xz -C "${INSTALL_DIR}" 2>/dev/null; then
+  curl -fsSL "${FALLBACK_BUNDLE_URL}" | tar -xz -C "${INSTALL_DIR}"
+fi
 
 TLS_DIR="${INSTALL_DIR}/tls"
 TLS_CERT="${OPENDIY_REMOTE_TLS_CERT:-${TLS_DIR}/cert.pem}"
@@ -57,17 +61,33 @@ else
 fi
 
 # Preserve existing tokens and Google OAuth settings on upgrade unless explicitly overridden
+ENV_FILE="${INSTALL_DIR}/.relay.env"
 EXISTING_TOKEN=""
 EXISTING_SECRET=""
 EXISTING_GOOGLE_ID=""
 EXISTING_GOOGLE_SECRET=""
 EXISTING_ALLOWED_EMAIL=""
+
+read_env_var() {
+  local key="$1"
+  local file="$2"
+  sed -n "s/^${key}=\"\(.*\)\"\$/\1/p; t; s/^${key}=\(.*\)\$/\1/p" "${file}" 2>/dev/null | head -n 1 || true
+}
+
+if [ -r "${ENV_FILE}" ]; then
+  EXISTING_TOKEN="$(read_env_var "OPENDIY_REMOTE_TOKEN" "${ENV_FILE}")"
+  EXISTING_SECRET="$(read_env_var "OPENDIY_REMOTE_HOST_SECRET" "${ENV_FILE}")"
+  EXISTING_GOOGLE_ID="$(read_env_var "OPENDIY_REMOTE_GOOGLE_CLIENT_ID" "${ENV_FILE}")"
+  EXISTING_GOOGLE_SECRET="$(read_env_var "OPENDIY_REMOTE_GOOGLE_CLIENT_SECRET" "${ENV_FILE}")"
+  EXISTING_ALLOWED_EMAIL="$(read_env_var "OPENDIY_REMOTE_ALLOWED_EMAIL" "${ENV_FILE}")"
+fi
+
 if [ -f "${SERVICE_FILE}" ]; then
-  EXISTING_TOKEN="$(sed -n 's/.*--token "\([^"]*\)".*/\1/p' "${SERVICE_FILE}" | head -n 1 || true)"
-  EXISTING_SECRET="$(sed -n 's/.*--host-secret "\([^"]*\)".*/\1/p' "${SERVICE_FILE}" | head -n 1 || true)"
-  EXISTING_GOOGLE_ID="$(sed -n 's/.*--google-client-id "\([^"]*\)".*/\1/p' "${SERVICE_FILE}" | head -n 1 || true)"
-  EXISTING_GOOGLE_SECRET="$(sed -n 's/.*--google-client-secret "\([^"]*\)".*/\1/p' "${SERVICE_FILE}" | head -n 1 || true)"
-  EXISTING_ALLOWED_EMAIL="$(sed -n 's/.*--allowed-email "\([^"]*\)".*/\1/p' "${SERVICE_FILE}" | head -n 1 || true)"
+  [ -z "${EXISTING_TOKEN}" ] && EXISTING_TOKEN="$(sed -n 's/.*--token "\([^"]*\)".*/\1/p' "${SERVICE_FILE}" 2>/dev/null | head -n 1 || true)"
+  [ -z "${EXISTING_SECRET}" ] && EXISTING_SECRET="$(sed -n 's/.*--host-secret "\([^"]*\)".*/\1/p' "${SERVICE_FILE}" 2>/dev/null | head -n 1 || true)"
+  [ -z "${EXISTING_GOOGLE_ID}" ] && EXISTING_GOOGLE_ID="$(sed -n 's/.*--google-client-id "\([^"]*\)".*/\1/p' "${SERVICE_FILE}" 2>/dev/null | head -n 1 || true)"
+  [ -z "${EXISTING_GOOGLE_SECRET}" ] && EXISTING_GOOGLE_SECRET="$(sed -n 's/.*--google-client-secret "\([^"]*\)".*/\1/p' "${SERVICE_FILE}" 2>/dev/null | head -n 1 || true)"
+  [ -z "${EXISTING_ALLOWED_EMAIL}" ] && EXISTING_ALLOWED_EMAIL="$(sed -n 's/.*--allowed-email "\([^"]*\)".*/\1/p' "${SERVICE_FILE}" 2>/dev/null | head -n 1 || true)"
 fi
 
 BROWSER_TOKEN="${OPENDIY_REMOTE_TOKEN:-${EXISTING_TOKEN:-$(openssl rand -hex 24)}}"
@@ -78,12 +98,23 @@ ALLOWED_EMAIL="${OPENDIY_REMOTE_ALLOWED_EMAIL:-${EXISTING_ALLOWED_EMAIL}}"
 RUN_USER="$(id -un)"
 NODE_BIN="$(command -v node)"
 
-OAUTH_ARGS=""
-if [ -n "${GOOGLE_CLIENT_ID}" ] && [ -n "${GOOGLE_CLIENT_SECRET}" ] && [ -n "${ALLOWED_EMAIL}" ]; then
-  OAUTH_ARGS="  --google-client-id \"${GOOGLE_CLIENT_ID}\" \\
-  --google-client-secret \"${GOOGLE_CLIENT_SECRET}\" \\
-  --allowed-email \"${ALLOWED_EMAIL}\" \\"
-fi
+escape_env_val() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+(
+  umask 077
+  {
+    printf 'OPENDIY_REMOTE_TOKEN="%s"\n' "$(escape_env_val "${BROWSER_TOKEN}")"
+    printf 'OPENDIY_REMOTE_HOST_SECRET="%s"\n' "$(escape_env_val "${PC_SECRET}")"
+    if [ -n "${GOOGLE_CLIENT_ID}" ] && [ -n "${GOOGLE_CLIENT_SECRET}" ] && [ -n "${ALLOWED_EMAIL}" ]; then
+      printf 'OPENDIY_REMOTE_GOOGLE_CLIENT_ID="%s"\n' "$(escape_env_val "${GOOGLE_CLIENT_ID}")"
+      printf 'OPENDIY_REMOTE_GOOGLE_CLIENT_SECRET="%s"\n' "$(escape_env_val "${GOOGLE_CLIENT_SECRET}")"
+      printf 'OPENDIY_REMOTE_ALLOWED_EMAIL="%s"\n' "$(escape_env_val "${ALLOWED_EMAIL}")"
+    fi
+  } > "${ENV_FILE}"
+)
+chmod 600 "${ENV_FILE}"
 
 echo "==> [4/5] Registering systemd service (${SERVICE_NAME}.service with Full TLS)..."
 sudo tee "${SERVICE_FILE}" > /dev/null <<EOF
@@ -95,14 +126,12 @@ After=network.target
 Type=simple
 User=${RUN_USER}
 WorkingDirectory=${INSTALL_DIR}
-ExecStart=${NODE_BIN} ${INSTALL_DIR}/server/remote-server.mjs \\
+EnvironmentFile=${ENV_FILE}
+ExecStart="${NODE_BIN}" "${INSTALL_DIR}/server/remote-server.mjs" \\
   --mode relay \\
-  --bind ${BIND_HOST}:${PORT} \\
+  --bind "${BIND_HOST}:${PORT}" \\
   --tls-cert "${TLS_CERT}" \\
-  --tls-key "${TLS_KEY}" \\
-${OAUTH_ARGS}
-  --token "${BROWSER_TOKEN}" \\
-  --host-secret "${PC_SECRET}"
+  --tls-key "${TLS_KEY}"
 Restart=always
 RestartSec=3
 
@@ -121,6 +150,11 @@ echo ""
 echo "======================================================================"
 echo " OpenDIY Remote 1:1 Relay (${VERSION}) is running with HTTPS (TLS)!"
 echo "======================================================================"
+if [ -n "${PUBLIC_IP}" ]; then
+  echo "[0] Relay Endpoint:"
+  echo "    https://${PUBLIC_IP}:${PORT}/?token=${BROWSER_TOKEN}"
+  echo ""
+fi
 echo "[1] Browser Access Token (--token):"
 echo "    ${BROWSER_TOKEN}"
 if [ -n "${GOOGLE_CLIENT_ID}" ] && [ -n "${ALLOWED_EMAIL}" ]; then
@@ -129,4 +163,7 @@ fi
 echo ""
 echo "[2] Workstation PC Host Secret (--host-secret):"
 echo "    ${PC_SECRET}"
+if [ -n "${PUBLIC_IP}" ]; then
+  echo "    Connect command: node server/remote-server.mjs --connect https://${PUBLIC_IP}:${PORT} --host-secret \"${PC_SECRET}\" --tls-insecure"
+fi
 echo "======================================================================"

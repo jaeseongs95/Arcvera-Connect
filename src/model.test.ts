@@ -1323,6 +1323,13 @@ test('Auto-update (T-0003) and live session state sync / Desktop parity (D-0008)
       }),
     ];
     fs.writeFileSync(rolloutPath, rolloutLines.join('\n') + '\n', 'utf8');
+    fs.writeFileSync(
+      path.join(codexHome, 'models_cache.json'),
+      JSON.stringify({
+        models: [{ slug: 'gpt-6.1-sol', display_name: 'GPT-6.1-Sol', context_window: 285000 }],
+      }),
+      'utf8',
+    );
 
     const stateDb = new DatabaseSync(path.join(codexHome, 'state_5.sqlite'));
     stateDb.exec(`
@@ -1569,4 +1576,1143 @@ test('Auto-update (T-0003) and live session state sync / Desktop parity (D-0008)
   } finally {
     try { fs.rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch {}
   }
+});
+
+test('D-0012 through D-0022: security boundaries, runtime metadata, weekly window, process errors, hostId persistence, resource cleanup, and relay schema parity', async () => {
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const http = await import('node:http');
+  const { fileURLToPath } = await import('node:url');
+  const {
+    RELAY_COMMAND_ALLOWLIST,
+    RELAY_EVENT_ALLOWLIST,
+    isPathInsideDir,
+    parseBindAddress,
+    createRemoteServer,
+    startHostConnector,
+  } = await import('../server/remote-server.mjs');
+
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+  // 1. D-0013 & D-0021: Installer script safety, LF line endings, and protocol/README doc parity
+  const installerPath = path.join(repoRoot, 'scripts', 'install-relay.sh');
+  const installerBytes = fs.readFileSync(installerPath);
+  assert.equal(installerBytes.includes(0x0d), false, 'install-relay.sh must use LF line endings');
+  const installerText = installerBytes.toString('utf8');
+  assert.match(installerText, /EnvironmentFile=\$\{ENV_FILE\}/);
+  assert.equal(installerText.includes('${OAUTH_ARGS}'), false);
+  const execStartMatch = installerText.match(/ExecStart=[\s\S]*?Restart=always/);
+  assert.ok(execStartMatch, 'ExecStart block must exist in install-relay.sh');
+  assert.equal(execStartMatch[0].includes('--token'), false);
+  assert.equal(execStartMatch[0].includes('--host-secret'), false);
+  assert.equal(execStartMatch[0].includes('--google-client-secret'), false);
+
+  const protocolDoc = fs.readFileSync(path.join(repoRoot, 'docs', 'relay-protocol.md'), 'utf8');
+  for (const cmd of RELAY_COMMAND_ALLOWLIST) {
+    assert.equal(protocolDoc.includes(`\`${cmd}\``), true, `docs/relay-protocol.md missing command: ${cmd}`);
+  }
+  for (const evt of RELAY_EVENT_ALLOWLIST) {
+    assert.equal(protocolDoc.includes(`\`${evt}\``), true, `docs/relay-protocol.md missing event: ${evt}`);
+  }
+  const readmeEn = fs.readFileSync(path.join(repoRoot, 'README.md'), 'utf8');
+  const readmeKo = fs.readFileSync(path.join(repoRoot, 'README.ko.md'), 'utf8');
+  assert.equal(readmeEn.includes('SameSite=Lax'), true);
+  assert.equal(readmeEn.includes('SameSite=Strict'), false);
+  assert.equal(readmeKo.includes('SameSite=Lax'), true);
+  assert.equal(readmeKo.includes('SameSite=Strict'), false);
+
+  // 2. D-0015: Verify zero hardcoded model names or 380000 context window literals in production code
+  const scanDirs = [path.join(repoRoot, 'server'), path.join(repoRoot, 'src')];
+  const collectProdFiles = (dir: string): string[] => {
+    const out: string[] = [];
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        out.push(...collectProdFiles(full));
+      } else if (/\.(mjs|js|ts)$/.test(entry.name) && !entry.name.endsWith('.test.ts')) {
+        out.push(full);
+      }
+    }
+    return out;
+  };
+  for (const dir of scanDirs) {
+    for (const filePath of collectProdFiles(dir)) {
+      const content = fs.readFileSync(filePath, 'utf8');
+      assert.equal(/gpt-6\.1-sol/i.test(content), false, `Hardcoded model name found in ${filePath}`);
+      assert.equal(/gpt-5\.4/i.test(content), false, `Hardcoded model name found in ${filePath}`);
+      assert.equal(/\b380000\b/.test(content), false, `Hardcoded 380000 window found in ${filePath}`);
+    }
+  }
+
+  // 3. D-0014: parseBindAddress IPv4 / IPv6 / host-only handling
+  assert.deepEqual(parseBindAddress('127.0.0.1:4100', '0.0.0.0', 3210), { host: '127.0.0.1', port: 4100 });
+  assert.deepEqual(parseBindAddress('0.0.0.0', '127.0.0.1', 3210), { host: '0.0.0.0', port: 3210 });
+  assert.deepEqual(parseBindAddress('[::]:4200', '127.0.0.1', 3210), { host: '::', port: 4200 });
+  assert.deepEqual(parseBindAddress('::1', '127.0.0.1', 3210), { host: '::1', port: 3210 });
+  assert.deepEqual(parseBindAddress('[::1]:4300', '127.0.0.1', 3210), { host: '::1', port: 4300 });
+
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'opendiy-remote-d0012-d0022-'));
+  try {
+    // 4. D-0012: Static file sibling-prefix traversal protection & attachment cleanup boundary + quota
+    const distDir = path.join(tmpRoot, 'dist');
+    const siblingDistDir = path.join(tmpRoot, 'dist-secret');
+    fs.mkdirSync(distDir, { recursive: true });
+    fs.mkdirSync(siblingDistDir, { recursive: true });
+    fs.writeFileSync(path.join(distDir, 'index.html'), '<!doctype html><html><body>safe-index</body></html>', 'utf8');
+    fs.writeFileSync(path.join(siblingDistDir, 'secret.js'), 'TOP_SECRET_SIBLING_PAYLOAD', 'utf8');
+
+    assert.equal(isPathInsideDir(distDir, path.join(siblingDistDir, 'secret.js')), false);
+    assert.equal(isPathInsideDir(distDir, path.join(distDir, 'index.html')), true);
+    assert.equal(isPathInsideDir(distDir, distDir, { allowBase: false }), false);
+
+    const codexHome = path.join(tmpRoot, '.codex');
+    fs.mkdirSync(codexHome, { recursive: true });
+    fs.writeFileSync(
+      path.join(codexHome, 'config.toml'),
+      'model = "vendor-alpha-1"\nmodel_reasoning_effort = "medium"\n',
+      'utf8',
+    );
+    fs.writeFileSync(
+      path.join(codexHome, 'models_cache.json'),
+      JSON.stringify({
+        models: [{ slug: 'vendor-alpha-1', display_name: 'Vendor Alpha 1', context_window: 192000 }],
+      }),
+      'utf8',
+    );
+
+    // Rollout with 5h primary (15% used) + 7d secondary (82% used) and NO model_context_window in rollout
+    const rolloutWeeklyPath = path.join(codexHome, 'rollout-weekly.jsonl');
+    fs.writeFileSync(
+      rolloutWeeklyPath,
+      [
+        JSON.stringify({ type: 'event_msg', payload: { type: 'user_message', turn_id: 't-wk-1', message: '주간 한도 확인' } }),
+        JSON.stringify({
+          type: 'event_msg',
+          payload: {
+            type: 'token_count',
+            info: {
+              total_token_usage: { total_tokens: 64000 },
+              last_token_usage: { total_tokens: 32000 },
+            },
+            rate_limits: {
+              limit_id: 'codex',
+              primary: { used_percent: 15, window_minutes: 300, resets_at: 1794000000 },
+              secondary: { used_percent: 82, window_minutes: 10080, resets_at: 1794500000 },
+            },
+          },
+        }),
+      ].join('\n') + '\n',
+      'utf8',
+    );
+    const { DatabaseSync } = await import('node:sqlite');
+    const sdb = new DatabaseSync(path.join(codexHome, 'state_5.sqlite'));
+    sdb.exec('CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, model TEXT, reasoning_effort TEXT);');
+    sdb.prepare('INSERT INTO threads VALUES (?, ?, ?, ?)').run('thread-wk-1', rolloutWeeklyPath, 'vendor-alpha-1', 'medium');
+    sdb.close();
+
+    const directWs = path.join(tmpRoot, 'direct-ws');
+    const directServer = createRemoteServer({
+      mode: 'direct',
+      token: 'tok-sec',
+      distDir,
+      workspaceDir: directWs,
+      codexHomeDir: codexHome,
+      allowPathDiscovery: false,
+      spawnProcess: false,
+      rpcTransport: async (method: string, params: any) => {
+        if (method === 'initialize') {
+          return {
+            userAgent: 'codex-app-server/test',
+            opendiyCapabilities: { passiveSubscription: true, compactStartIfIdle: true },
+          };
+        }
+        if (method === 'thread/read') {
+          return {
+            thread: {
+              id: params.threadId,
+              model: 'vendor-alpha-1',
+              modelContextWindow: 128000,
+              turns: [],
+            },
+          };
+        }
+        return {};
+      },
+    });
+    const directPort = await new Promise<number>(resolve => {
+      directServer.server.listen(0, '127.0.0.1', () => {
+        const addr = directServer.server.address();
+        resolve(typeof addr === 'object' && addr ? addr.port : 0);
+      });
+    });
+
+    try {
+      // Raw HTTP request with encoded ..%2fdist-secret/secret.js (even with valid token) must return 404 and NEVER leak sibling file
+      const rawTraversalRes = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+        const req = http.request(
+          {
+            hostname: '127.0.0.1',
+            port: directPort,
+            path: '/..%2fdist-secret/secret.js?token=tok-sec',
+            method: 'GET',
+          },
+          res => {
+            let chunks = '';
+            res.setEncoding('utf8');
+            res.on('data', d => { chunks += d; });
+            res.on('end', () => resolve({ status: res.statusCode ?? 0, body: chunks }));
+          },
+        );
+        req.on('error', reject);
+        req.end();
+      });
+      assert.equal(rawTraversalRes.status, 404);
+      assert.equal(rawTraversalRes.body.includes('TOP_SECRET_SIBLING_PAYLOAD'), false);
+
+      // D-0014: Empty-credential /api/invoke calls return 401 without brute-force locking out the IP
+      for (let i = 0; i < 6; i++) {
+        const emptyRes = await fetch(`http://127.0.0.1:${directPort}/api/invoke`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ command: 'get_ui_language', args: {} }),
+        });
+        assert.equal(emptyRes.status, 401);
+      }
+
+      // D-0014: /auth/logout behind multi-hop X-Forwarded-Proto: https, http sets Secure cookie
+      const logoutCookie = await new Promise<string>((resolve, reject) => {
+        const req = http.request(
+          {
+            hostname: '127.0.0.1',
+            port: directPort,
+            path: '/auth/logout',
+            method: 'GET',
+            headers: { 'X-Forwarded-Proto': 'https, http' },
+          },
+          res => {
+            const setCookie = Array.isArray(res.headers['set-cookie'])
+              ? res.headers['set-cookie'].join('; ')
+              : String(res.headers['set-cookie'] || '');
+            res.resume();
+            res.on('end', () => resolve(setCookie));
+          },
+        );
+        req.on('error', reject);
+        req.end();
+      });
+      assert.match(logoutCookie, /Secure/);
+
+      const invokeDirect = async (command: string, args: Record<string, unknown> = {}) => {
+        const res = await fetch(`http://127.0.0.1:${directPort}/api/invoke`, {
+          method: 'POST',
+          headers: { Authorization: 'Bearer tok-sec', 'Content-Type': 'application/json' },
+          body: JSON.stringify({ command, args }),
+        });
+        return { status: res.status, body: await res.json() };
+      };
+
+      // D-0012 & D-0019: Attachment staging quota + cleanup boundary protection
+      const stagedRes = await invokeDirect('stage_conversation_image', {
+        dataUrl: `data:image/png;base64,${Buffer.from('tiny-png-bytes').toString('base64')}`,
+      });
+      assert.equal(stagedRes.body.ok, true);
+      const stagedPath = String(stagedRes.body.result.path);
+      assert.equal(fs.existsSync(stagedPath), true);
+
+      const sentinelPath = path.join(directWs, 'sentinel-outside-attachments.txt');
+      fs.writeFileSync(sentinelPath, 'keep-me', 'utf8');
+      assert.equal(fs.existsSync(sentinelPath), true);
+      const cleanupOutsideRes = await invokeDirect('cleanup_conversation_attachment', {
+        path: sentinelPath,
+      });
+      assert.equal(cleanupOutsideRes.body.ok, true);
+      assert.equal(fs.existsSync(sentinelPath), true, 'File outside attachmentsDir must NEVER be deleted');
+
+      const cleanupInsideRes = await invokeDirect('cleanup_conversation_attachment', {
+        path: stagedPath,
+      });
+      assert.equal(cleanupInsideRes.body.ok, true);
+      assert.equal(fs.existsSync(stagedPath), false, 'Staged attachment inside attachmentsDir should be deleted');
+
+      // Oversized >10MiB base64 payload is rejected
+      const hugeB64 = 'A'.repeat(Math.ceil(((10 * 1024 * 1024 + 1024) * 4) / 3));
+      const hugeStageRes = await invokeDirect('stage_conversation_image', {
+        dataUrl: `data:image/png;base64,${hugeB64}`,
+      });
+      assert.equal(hugeStageRes.body.ok, false);
+      assert.match(String(hugeStageRes.body.error || ''), /10MiB/);
+
+      // D-0015 & D-0016: Dynamic model metadata from config.toml/models_cache.json + weekly 7-day secondary window (18% left, not 85%)
+      const projDir = path.join(tmpRoot, 'proj-alpha');
+      fs.mkdirSync(projDir, { recursive: true });
+      const started = await invokeDirect('start_session', {
+        request: { title: '주간 검증 세션', cwd: projDir, threadId: 'thread-wk-1' },
+      });
+      assert.equal(started.body.ok, true);
+      const sessListRes = await invokeDirect('list_sessions');
+      assert.equal(sessListRes.body.ok, true);
+      const sessInfo = sessListRes.body.result.find((s: any) => s.id === started.body.result.id);
+      assert.ok(sessInfo);
+      assert.equal(sessInfo.model, 'Vendor Alpha 1');
+      assert.equal(sessInfo.effort, 'medium');
+      assert.equal(sessInfo.weeklyLeftPercent, 18);
+
+      // D-0015: Rollout without model_context_window does not clobber thread/read's 128000 context window
+      const ctxRes = await invokeDirect('conversation_request', {
+        id: sessInfo.id,
+        generation: sessInfo.generation,
+        request: { type: 'contextStatus' },
+      });
+      assert.equal(ctxRes.body.ok, true);
+      assert.equal(ctxRes.body.result.modelContextWindow, 128000);
+    } finally {
+      await directServer.close();
+    }
+
+    // 5. D-0017: exec resume spawn error / non-zero exit settles turn.status to 'failed' without crashing server
+    const bogusCliPath = path.join(tmpRoot, 'missing-codex-binary');
+    const execFailWs = path.join(tmpRoot, 'exec-fail-ws');
+    fs.mkdirSync(execFailWs, { recursive: true });
+    fs.writeFileSync(
+      path.join(execFailWs, 'workspace-state.json'),
+      JSON.stringify({ codexSavedPath: bogusCliPath, projects: [], layout: { version: 1, columns: 2, columnSizes: [1, 1], rowSizes: [1, 1], sessions: [] }, threads: {} }),
+      'utf8',
+    );
+    const execFailServer = createRemoteServer({
+      mode: 'direct',
+      token: 'tok-exec',
+      workspaceDir: execFailWs,
+      allowPathDiscovery: false,
+      spawnProcess: false,
+    });
+    const execFailPort = await new Promise<number>(resolve => {
+      execFailServer.server.listen(0, '127.0.0.1', () => {
+        const addr = execFailServer.server.address();
+        resolve(typeof addr === 'object' && addr ? addr.port : 0);
+      });
+    });
+    try {
+      const invokeExec = async (command: string, args: Record<string, unknown> = {}) => {
+        const res = await fetch(`http://127.0.0.1:${execFailPort}/api/invoke`, {
+          method: 'POST',
+          headers: { Authorization: 'Bearer tok-exec', 'Content-Type': 'application/json' },
+          body: JSON.stringify({ command, args }),
+        });
+        return res.json();
+      };
+      // Point codexSavedPath to a real file (`process.execPath`) whose `exec resume ...` will immediately exit non-zero because `--json` / `exec` is invalid for node without script
+      fs.writeFileSync(path.join(tmpRoot, 'fail-cli.mjs'), 'process.exit(2);\n', 'utf8');
+      const setCli = await invokeExec('set_codex_executable', { path: process.execPath });
+      assert.equal(setCli.ok, true);
+      const projDir = path.join(tmpRoot, 'proj-exec');
+      fs.mkdirSync(projDir, { recursive: true });
+      const sStarted = await invokeExec('start_session', {
+        request: { title: '실패 복구 검증', cwd: projDir, threadId: 'thread-exec-fail' },
+      });
+      assert.equal(sStarted.ok, true);
+      const sendRes = await invokeExec('conversation_request', {
+        id: sStarted.result.id,
+        generation: sStarted.result.generation,
+        request: { type: 'send', text: '실행 실패 테스트' },
+      });
+      assert.equal(sendRes.ok, true);
+      // Wait up to 2s for child exit to transition turn status from 'inProgress' to 'failed' and emit turn/completed poll event
+      let finalTurnStatus = 'inProgress';
+      let sawCompletedPollEvent = false;
+      for (let attempt = 0; attempt < 25; attempt++) {
+        const pollRes = await invokeExec('conversation_request', {
+          id: sStarted.result.id,
+          generation: sStarted.result.generation,
+          request: { type: 'poll' },
+        });
+        if ((pollRes.result?.events || []).some((e: any) => e.method === 'turn/completed' && e.params?.turn?.status === 'failed')) {
+          sawCompletedPollEvent = true;
+        }
+        const turnsRes = await invokeExec('conversation_request', {
+          id: sStarted.result.id,
+          generation: sStarted.result.generation,
+          request: { type: 'turns' },
+        });
+        const turns = turnsRes.result?.turns || [];
+        const lastTurn = turns[turns.length - 1];
+        if (lastTurn && lastTurn.status !== 'inProgress') {
+          finalTurnStatus = lastTurn.status;
+          break;
+        }
+        await new Promise(r => setTimeout(r, 80));
+      }
+      assert.equal(finalTurnStatus, 'failed');
+      assert.equal(sawCompletedPollEvent, true);
+    } finally {
+      await execFailServer.close();
+    }
+
+    // 6. D-0018, D-0019, D-0020 & D-0022: Host connector persisted hostId, session_stop cleanup, and relay read-only / compatibility schema
+    const relayWs = path.join(tmpRoot, 'relay-ws-2');
+    const hostWs = path.join(tmpRoot, 'host-ws-2');
+    const relaySrv = createRemoteServer({
+      mode: 'relay',
+      token: 'tok-r2',
+      hostSecret: 'sec-r2',
+      workspaceDir: relayWs,
+      allowPathDiscovery: false,
+    });
+    const rPort = await new Promise<number>(resolve => {
+      relaySrv.server.listen(0, '127.0.0.1', () => {
+        const addr = relaySrv.server.address();
+        resolve(typeof addr === 'object' && addr ? addr.port : 0);
+      });
+    });
+    const rBase = `http://127.0.0.1:${rPort}`;
+
+    let rpcNotify: ((msg: any) => void) | null = null;
+    const makeRpcTransport = () =>
+      Object.assign(
+        async (method: string) => {
+          if (method === 'initialize') {
+            return { userAgent: 'codex-app-server/r2', opendiyCapabilities: { passiveSubscription: true } };
+          }
+          return {};
+        },
+        {
+          subscribe(fn: (msg: any) => void) {
+            rpcNotify = fn;
+            return () => { if (rpcNotify === fn) rpcNotify = null; };
+          },
+        },
+      );
+
+    let reg1Resolve!: () => void;
+    const reg1 = new Promise<void>(r => { reg1Resolve = r; });
+    const conn1 = startHostConnector({
+      relayUrl: rBase,
+      hostSecret: 'sec-r2',
+      workspaceDir: hostWs,
+      allowPathDiscovery: false,
+      spawnProcess: false,
+      silent: true,
+      onRegistered: () => reg1Resolve(),
+    });
+    await reg1;
+    const persistedHostId = fs.readFileSync(path.join(hostWs, 'host-connector-id'), 'utf8').trim();
+    assert.equal(conn1.hostId, persistedHostId);
+
+    // D-0022: When appServer is disconnected and CLI unavailable, runtime_compatibility returns string executable & 'unavailable'
+    const invokeRelay2 = async (command: string, args: Record<string, unknown> = {}) => {
+      const res = await fetch(`${rBase}/api/invoke`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer tok-r2', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ command, args }),
+      });
+      return res.json();
+    };
+    const compatDisconnected = await invokeRelay2('runtime_compatibility');
+    assert.equal(compatDisconnected.ok, true);
+    assert.equal(typeof compatDisconnected.result.executable, 'string');
+    assert.equal(compatDisconnected.result.executable, 'codex');
+    assert.equal(compatDisconnected.result.serverState, 'unavailable');
+
+    // D-0020: Relay injects relayReadOnly=true and canApply=false
+    const relaySettings = await invokeRelay2('get_codex_settings');
+    assert.equal(relaySettings.ok, true);
+    assert.equal(relaySettings.result.relayReadOnly, true);
+    const relayPreview = await invokeRelay2('runtime_transition_preview');
+    assert.equal(relayPreview.ok, true);
+    assert.equal(relayPreview.result.canApply, false);
+    assert.match(String(relayPreview.result.reason || ''), /원격 중계/);
+
+    // D-0018: Restart host connector without specifying hostId -> reuses persisted hostId cleanly without 409
+    await conn1.close();
+    let reg2Resolve!: () => void;
+    const reg2 = new Promise<void>(r => { reg2Resolve = r; });
+    const conn2 = startHostConnector({
+      relayUrl: rBase,
+      hostSecret: 'sec-r2',
+      workspaceDir: hostWs,
+      allowPathDiscovery: false,
+      spawnProcess: false,
+      silent: true,
+      rpcTransport: makeRpcTransport(),
+      onRegistered: () => reg2Resolve(),
+    });
+    try {
+      await reg2;
+      assert.equal(conn2.hostId, persistedHostId);
+
+      // D-0019: Start session, create pending question + cron + terminal output, then session_stop purges all three
+      const projCleanup = path.join(tmpRoot, 'proj-cleanup');
+      fs.mkdirSync(projCleanup, { recursive: true });
+      await invokeRelay2('prepare_runtime');
+      const sessStarted = await invokeRelay2('start_session', {
+        request: { title: '정리 검증 세션', cwd: projCleanup, threadId: 'thread-cleanup-1' },
+      });
+      assert.equal(sessStarted.ok, true);
+      const sid = sessStarted.result.id;
+      const sgen = sessStarted.result.generation;
+
+      // Emit output + pending approval + cron
+      await invokeRelay2('session_write', { id: sid, generation: sgen, data: '/status\r' });
+      rpcNotify?.({
+        id: 'req-approval-1',
+        method: 'item/commandExecution/requestApproval',
+        params: { threadId: 'thread-cleanup-1', turnId: 'turn-c-1', command: 'rm -rf tmp' },
+      });
+      const cronCreated = await invokeRelay2('cron_request', {
+        id: sid,
+        generation: sgen,
+        request: { type: 'add', prompt: '점검 실행', schedule: { type: 'every', seconds: 600 } },
+      });
+      assert.equal(cronCreated.ok, true);
+      assert.equal(cronCreated.result.status, 'applied');
+      const cronBefore = await invokeRelay2('cron_request', {
+        id: sid,
+        generation: sgen,
+        request: { type: 'list' },
+      });
+      assert.equal(cronBefore.result.jobs.length, 1);
+
+      const pendingBefore = await invokeRelay2('list_pending_questions');
+      assert.equal(pendingBefore.result.items.length, 1);
+
+      // Stop session
+      const stopRes = await invokeRelay2('session_stop', { id: sid, generation: sgen });
+      assert.equal(stopRes.ok, true);
+
+      const pendingAfter = await invokeRelay2('list_pending_questions');
+      assert.equal(pendingAfter.result.items.length, 0);
+
+      // Restarting a session on the same threadId sees zero leaked cliLifetime cron jobs from the stopped session
+      const sessRestarted = await invokeRelay2('start_session', {
+        request: { title: '정리 후 재개 세션', cwd: projCleanup, threadId: 'thread-cleanup-1' },
+      });
+      assert.equal(sessRestarted.ok, true);
+      const cronAfter = await invokeRelay2('cron_request', {
+        id: sessRestarted.result.id,
+        generation: sessRestarted.result.generation,
+        request: { type: 'list' },
+      });
+      assert.equal(cronAfter.result.jobs.length, 0);
+
+      // Connect a fresh SSE client to relay and confirm zero replayed terminal-output frames for stopped session
+      const sseReplayFrames = await new Promise<any[]>((resolve, reject) => {
+        const frames: any[] = [];
+        const req = http.request(
+          {
+            hostname: '127.0.0.1',
+            port: rPort,
+            path: '/api/events?token=tok-r2',
+            method: 'GET',
+          },
+          res => {
+            res.setEncoding('utf8');
+            res.on('data', chunk => {
+              for (const line of chunk.split('\n')) {
+                if (line.startsWith('data: ')) {
+                  try { frames.push(JSON.parse(line.slice(6))); } catch {}
+                }
+              }
+            });
+            setTimeout(() => {
+              req.destroy();
+              resolve(frames);
+            }, 200);
+          },
+        );
+        req.on('error', err => {
+          if ((err as any)?.code === 'ECONNRESET') resolve(frames);
+          else reject(err);
+        });
+        req.end();
+      });
+      const leakedForStopped = sseReplayFrames.filter(
+        f => (f.event === 'terminal-output' || f.event === 'session-output') && f.payload?.id === sid,
+      );
+      assert.equal(leakedForStopped.length, 0);
+    } finally {
+      await conn2.close();
+      await relaySrv.close();
+    }
+  } finally {
+    try { fs.rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch {}
+  }
+});
+
+test('D-0023 through D-0030: Arcvera-Connect slug/installer parity, pending question auth, attachment validation, subagent/mobile/weekly normalization, catalog pagination, UTF-8 detail snapshot, and cron guards', async () => {
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const { fileURLToPath } = await import('node:url');
+  const {
+    GITHUB_REPO_SLUG,
+    fetchLatestReleaseInfo,
+    createRemoteServer,
+  } = await import('../server/remote-server.mjs');
+
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+  // 1. D-0023: Canonical GitHub repository slug, installer bundle fallback, and README URL parity
+  assert.equal(GITHUB_REPO_SLUG, 'jaeseongs95/Arcvera-Connect');
+  const installerText = fs.readFileSync(path.join(repoRoot, 'scripts', 'install-relay.sh'), 'utf8');
+  assert.equal(installerText.includes('jaeseongs95/Arcvera-Connect'), true);
+  assert.equal(installerText.includes('arcvera-connect-${VERSION}-relay-bundle.tar.gz'), true);
+  assert.equal(installerText.includes('opendiy-remote-${VERSION}-relay-bundle.tar.gz'), true);
+  const readmeEn = fs.readFileSync(path.join(repoRoot, 'README.md'), 'utf8');
+  const readmeKo = fs.readFileSync(path.join(repoRoot, 'README.ko.md'), 'utf8');
+  assert.equal(readmeEn.includes('https://github.com/jaeseongs95/Arcvera-Connect'), true);
+  assert.equal(readmeKo.includes('https://github.com/jaeseongs95/Arcvera-Connect'), true);
+  assert.equal(readmeEn.includes('https://github.com/jaeseongs95/opendiy-remote'), false);
+  assert.equal(readmeKo.includes('https://github.com/jaeseongs95/opendiy-remote'), false);
+
+  const releaseCheck = await fetchLatestReleaseInfo({
+    currentVersion: '1.2.2',
+    fetchFn: async (url: string) => {
+      assert.equal(url, 'https://api.github.com/repos/jaeseongs95/Arcvera-Connect/releases/latest');
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          tag_name: 'v1.2.3',
+          assets: [
+            {
+              name: 'arcvera-connect-v1.2.3-relay-bundle.tar.gz',
+              browser_download_url: 'https://github.com/jaeseongs95/Arcvera-Connect/releases/download/v1.2.3/arcvera-connect-v1.2.3-relay-bundle.tar.gz',
+              size: 4096,
+              digest: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+            },
+          ],
+        }),
+      };
+    },
+  });
+  assert.equal(releaseCheck.updateAvailable, true);
+  assert.equal(releaseCheck.bundleName, 'arcvera-connect-v1.2.3-relay-bundle.tar.gz');
+
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'arcvera-d0023-d0030-'));
+  try {
+    const projDir = path.join(tmpRoot, 'proj');
+    fs.mkdirSync(projDir, { recursive: true });
+    const validAttachFile = path.join(tmpRoot, 'sample-note.txt');
+    fs.writeFileSync(validAttachFile, 'attachment-body', 'utf8');
+
+    let notifyFn: ((msg: any) => void) | null = null;
+    const sentResponses: Array<{ id: any; result: any }> = [];
+    let rateLimitsResetValue: unknown = 1794878138000; // epoch ms initially
+    let lastTurnStartParams: any = null;
+    const emojiKoreanBlock = '한글🚀세부내용검증-'.repeat(1800); // > 40 KB UTF-8 with surrogate pairs
+
+    const srv = createRemoteServer({
+      mode: 'direct',
+      token: 'tok-d23',
+      workspaceDir: path.join(tmpRoot, 'ws'),
+      allowPathDiscovery: false,
+      spawnProcess: false,
+      rpcTransport: Object.assign(
+        async (method: string, params: any) => {
+          if (method === 'initialize') {
+            return {
+              userAgent: 'codex-app-server/d23',
+              supportsSubagentManagement: true,
+              supportsExpectedTurnInterrupt: true,
+              opendiyCapabilities: {
+                passiveSubscription: true,
+                userTurnStartIfIdle: true,
+                compactStartIfIdle: true,
+                historySummary: true,
+              },
+            };
+          }
+          if (method === 'thread/start' || method === 'thread/resume') {
+            return { thread: { id: params.threadId || 'thread-d23-main', cwd: projDir, turns: [] } };
+          }
+          if (method === 'thread/read') {
+            if (params.threadId === 'thread-d23-detail') {
+              return {
+                thread: {
+                  id: 'thread-d23-detail',
+                  cwd: projDir,
+                  turns: [
+                    {
+                      id: 'turn-detail-1',
+                      status: 'completed',
+                      items: [
+                        {
+                          id: 'item-detail-big',
+                          type: 'agentMessage',
+                          text: emojiKoreanBlock,
+                          status: 'completed',
+                        },
+                      ],
+                    },
+                  ],
+                },
+              };
+            }
+            if (params.threadId === 'thread-preview-paged') {
+              const turns = Array.from({ length: 25 }, (_, i) => ({
+                id: `turn-p-${i + 1}`,
+                status: 'completed',
+                items:
+                  i % 2 === 0
+                    ? [
+                        {
+                          id: `u-p-${i + 1}`,
+                          type: 'userMessage',
+                          content: [{ type: 'text', text: `구조화 질문 ${i + 1}` }],
+                        },
+                      ]
+                    : [
+                        {
+                          id: `cmd-p-${i + 1}`,
+                          type: 'commandExecution',
+                          command: `git log -n ${i + 1}`,
+                          aggregatedOutput: `commit-${i + 1}`,
+                        },
+                      ],
+              }));
+              return { thread: { id: 'thread-preview-paged', cwd: projDir, turns } };
+            }
+            return { thread: { id: params.threadId, cwd: projDir, turns: [] } };
+          }
+          if (method === 'turn/start') {
+            lastTurnStartParams = params;
+            return {
+              turn: {
+                id: `turn-${Date.now()}`,
+                status: 'completed',
+                items: [{ id: 'a-ok', type: 'agentMessage', text: 'ok', status: 'completed' }],
+              },
+            };
+          }
+          if (method === 'thread/subagents/list') {
+            return {
+              data: [
+                {
+                  id: 'sub-raw-1',
+                  status: 'inProgress',
+                  runtimeId: 'not-a-valid-uuid',
+                  name: 'Worker 1',
+                },
+              ],
+            };
+          }
+          if (method === 'thread/subagents/control') {
+            return { status: 'applied' };
+          }
+          if (method === 'account/rateLimits/read') {
+            return {
+              rateLimits: {
+                limitName: 'weekly-plan',
+                weekly: { usedPercent: 42, resetsAt: rateLimitsResetValue },
+              },
+            };
+          }
+          if (method === 'remoteControl/pairing/start') {
+            return {
+              status: 'ACTIVE_UNKNOWN_ENUM',
+              manualCode: '123-456',
+              expiresAt: 1794878138000, // ms instead of sec
+              environmentId: '',
+            };
+          }
+          return {};
+        },
+        {
+          subscribe(fn: (msg: any) => void) {
+            notifyFn = fn;
+            return () => { if (notifyFn === fn) notifyFn = null; };
+          },
+          sendResponse(id: any, result: any) {
+            sentResponses.push({ id, result });
+          },
+        },
+      ),
+    });
+
+    const port = await new Promise<number>(resolve => {
+      srv.server.listen(0, '127.0.0.1', () => {
+        const addr = srv.server.address();
+        resolve(typeof addr === 'object' && addr ? addr.port : 0);
+      });
+    });
+
+    try {
+      const invoke = async (command: string, args: Record<string, unknown> = {}) => {
+        const res = await fetch(`http://127.0.0.1:${port}/api/invoke`, {
+          method: 'POST',
+          headers: { Authorization: 'Bearer tok-d23', 'Content-Type': 'application/json' },
+          body: JSON.stringify({ command, args }),
+        });
+        return res.json() as Promise<{ ok: boolean; result?: any; error?: string }>;
+      };
+
+      await invoke('prepare_runtime');
+      const sessRes = await invoke('start_session', {
+        request: { title: 'D0024-D0030 검증', cwd: projDir, threadId: 'thread-d23-main' },
+      });
+      assert.equal(sessRes.ok, true);
+      const sid = sessRes.result.id;
+      const sgen = sessRes.result.generation;
+
+      // 2. D-0024: respond_pending_question & conversation_request(respond) enforce active session, generation, canRespond, valid payload, and single-shot
+      notifyFn?.({
+        id: 'rpc-unsupported-1',
+        method: 'item/unknownCustomPrompt',
+        params: { threadId: 'thread-d23-main' },
+      });
+      notifyFn?.({
+        id: 'rpc-approval-valid',
+        method: 'item/commandExecution/requestApproval',
+        params: { threadId: 'thread-d23-main', command: 'npm test', availableDecisions: ['accept', 'decline'] },
+      });
+
+      // Unknown requestId must fail
+      const missingResp = await invoke('respond_pending_question', {
+        sessionId: sid,
+        generation: sgen,
+        requestId: 'non-existent-req',
+        decision: 'accept',
+      });
+      assert.equal(missingResp.ok, false);
+
+      // Mismatched generation must fail
+      const wrongGenResp = await invoke('respond_pending_question', {
+        sessionId: sid,
+        generation: sgen + 1,
+        requestId: 'rpc-approval-valid',
+        decision: 'accept',
+      });
+      assert.equal(wrongGenResp.ok, false);
+
+      // Unsupported request (canRespond === false) must fail
+      const unsupportedResp = await invoke('respond_pending_question', {
+        sessionId: sid,
+        generation: sgen,
+        requestId: 'rpc-unsupported-1',
+        decision: 'accept',
+      });
+      assert.equal(unsupportedResp.ok, false);
+
+      // Disallowed approval decision must fail without consuming the pending request
+      const badDecisionResp = await invoke('respond_pending_question', {
+        sessionId: sid,
+        generation: sgen,
+        requestId: 'rpc-approval-valid',
+        decision: 'acceptForSession',
+      });
+      assert.equal(badDecisionResp.ok, false);
+
+      // Valid single-shot approval succeeds and dispatches JSON-RPC response
+      const okApprovalResp = await invoke('respond_pending_question', {
+        sessionId: sid,
+        generation: sgen,
+        requestId: 'rpc-approval-valid',
+        decision: 'accept',
+      });
+      assert.equal(okApprovalResp.ok, true);
+      assert.equal(sentResponses.length, 1);
+      assert.deepEqual(sentResponses[0], { id: 'rpc-approval-valid', result: { decision: 'accept' } });
+
+      // Duplicate second response to the same requestId must fail
+      const dupApprovalResp = await invoke('conversation_request', {
+        id: sid,
+        generation: sgen,
+        request: { type: 'respond', requestId: 'rpc-approval-valid', result: { decision: 'accept' } },
+      });
+      assert.equal(dupApprovalResp.ok, false);
+
+      // 3. D-0025: conversation_request(send) validates attachments, caps count/size, and permits attachment-only messages
+      const relAttachRes = await invoke('conversation_request', {
+        id: sid,
+        generation: sgen,
+        request: { type: 'send', text: '상대경로 첨부', attachments: [{ type: 'file', path: '../secret.txt' }] },
+      });
+      assert.equal(relAttachRes.ok, false);
+
+      const dirAttachRes = await invoke('conversation_request', {
+        id: sid,
+        generation: sgen,
+        request: { type: 'send', text: '폴더 첨부', attachments: [{ type: 'file', path: projDir }] },
+      });
+      assert.equal(dirAttachRes.ok, false);
+
+      const tooManyAttachRes = await invoke('conversation_request', {
+        id: sid,
+        generation: sgen,
+        request: {
+          type: 'send',
+          text: '초과 첨부',
+          attachments: Array.from({ length: 13 }, () => ({ type: 'file', path: validAttachFile })),
+        },
+      });
+      assert.equal(tooManyAttachRes.ok, false);
+
+      const oversizedTextRes = await invoke('conversation_request', {
+        id: sid,
+        generation: sgen,
+        request: { type: 'send', text: '가'.repeat(25000) }, // 75,000 UTF-8 bytes > 64 KiB
+      });
+      assert.equal(oversizedTextRes.ok, false);
+
+      // Attachment-only send (empty text + valid attachment) succeeds
+      const attachOnlyRes = await invoke('conversation_request', {
+        id: sid,
+        generation: sgen,
+        request: { type: 'send', text: '', attachments: [{ type: 'file', path: validAttachFile }] },
+      });
+      assert.equal(attachOnlyRes.ok, true);
+      assert.equal(
+        lastTurnStartParams.input.some((item: any) => item.type === 'file' && item.path === validAttachFile),
+        true,
+      );
+
+      // 4. D-0026: subagents_request normalizes raw agent schema and reconciles mutated requestId (and cron_request reconciles too)
+      const subMutReqId = '11111111-2222-4333-8444-555555555555';
+      const subMutRes = await invoke('subagents_request', {
+        id: sid,
+        generation: sgen,
+        request: { type: 'interrupt', agentId: 'sub-raw-1', requestId: subMutReqId },
+      });
+      assert.equal(subMutRes.ok, true);
+      assert.equal(subMutRes.result.status, 'applied');
+
+      const subListRes = await invoke('subagents_request', {
+        id: sid,
+        generation: sgen,
+        request: { type: 'list' },
+      });
+      assert.equal(subListRes.ok, true);
+      assert.equal(subListRes.result.reconciledRequestId, subMutReqId);
+      assert.equal(subListRes.result.agents.length, 1);
+      const normAgent = subListRes.result.agents[0];
+      assert.equal(normAgent.id, 'sub-raw-1');
+      assert.equal(normAgent.parentThreadId, 'thread-d23-main');
+      assert.equal(normAgent.status, 'running');
+      assert.equal(normAgent.runtimeId, null);
+      assert.equal(typeof normAgent.capabilities.send, 'boolean');
+      assert.equal(typeof normAgent.capabilities.interrupt, 'boolean');
+      assert.equal(typeof normAgent.capabilities.close, 'boolean');
+      assert.equal(typeof normAgent.capabilities.resume, 'boolean');
+
+      const cronMutReqId = '22222222-3333-4444-8555-666666666666';
+      const cronAddOk = await invoke('cron_request', {
+        id: sid,
+        generation: sgen,
+        request: { type: 'add', requestId: cronMutReqId, prompt: '주기 점검', schedule: { type: 'every', seconds: 120 } },
+      });
+      assert.equal(cronAddOk.ok, true);
+      const cronListReconciled = await invoke('cron_request', {
+        id: sid,
+        generation: sgen,
+        request: { type: 'list' },
+      });
+      assert.equal(cronListReconciled.ok, true);
+      assert.equal(cronListReconciled.result.reconciledRequestId, cronMutReqId);
+
+      // 5. D-0027: weekly_usage normalizes ms & ISO resetsAt to Unix seconds; mobile_control normalizes status & pairing
+      const wkMs = await invoke('weekly_usage');
+      assert.equal(wkMs.ok, true);
+      assert.equal(wkMs.result.weekly.resetsAt, 1794878138);
+
+      rateLimitsResetValue = '2026-11-20T00:00:00Z';
+      const wkIso = await invoke('weekly_usage');
+      assert.equal(wkIso.ok, true);
+      assert.equal(wkIso.result.weekly.resetsAt, Math.floor(Date.parse('2026-11-20T00:00:00Z') / 1000));
+
+      const mobilePair = await invoke('mobile_control', {
+        id: sid,
+        generation: sgen,
+        action: 'pair',
+      });
+      assert.equal(mobilePair.ok, true);
+      assert.equal(
+        ['disabled', 'connecting', 'connected', 'reconnecting', 'disconnected', 'error'].includes(mobilePair.result.status.status),
+        true,
+      );
+      assert.equal(typeof mobilePair.result.status.serverName, 'string');
+      assert.equal(mobilePair.result.pairing.manualCode, '123-456');
+      assert.equal(mobilePair.result.pairing.expiresAt, 1794878138);
+      assert.equal(mobilePair.result.pairing.environmentId.length > 0, true);
+
+      // 6. D-0028: catalog_list & catalog_preview cursor pagination + structured/tool message preview
+      for (let i = 0; i < 115; i++) {
+        await invoke('start_session', {
+          request: { title: `카탈로그 세션 ${i}`, cwd: projDir, threadId: `thread-cat-${i}` },
+        });
+      }
+      const catPage1 = await invoke('catalog_list', { request: { query: 'thread-cat-' } });
+      assert.equal(catPage1.ok, true);
+      assert.equal(catPage1.result.sessions.length, 100);
+      assert.ok(catPage1.result.nextCursor);
+      const catPage2 = await invoke('catalog_list', {
+        request: { query: 'thread-cat-', cursor: catPage1.result.nextCursor },
+      });
+      assert.equal(catPage2.ok, true);
+      assert.equal(catPage2.result.sessions.length, 15);
+      assert.equal(catPage2.result.nextCursor, null);
+
+      const prevPage1 = await invoke('catalog_preview', { threadId: 'thread-preview-paged' });
+      assert.equal(prevPage1.ok, true);
+      assert.equal(prevPage1.result.messages.length, 20);
+      assert.ok(prevPage1.result.nextCursor);
+      assert.equal(
+        prevPage1.result.messages.some((m: any) => m.text.includes('git log -n')),
+        true,
+      );
+      assert.equal(
+        prevPage1.result.messages.some((m: any) => m.text.includes('구조화 질문')),
+        true,
+      );
+      const prevPage2 = await invoke('catalog_preview', {
+        threadId: 'thread-preview-paged',
+        cursor: prevPage1.result.nextCursor,
+      });
+      assert.equal(prevPage2.ok, true);
+      assert.equal(prevPage2.result.messages.length, 5);
+      assert.equal(prevPage2.result.nextCursor, null);
+
+      // 7. D-0029: detail UTF-8 byte slicing preserves multi-byte/surrogate boundaries and validates snapshotId
+      const detailSess = await invoke('start_session', {
+        request: { title: '상세 검증', cwd: projDir, threadId: 'thread-d23-detail' },
+      });
+      assert.equal(detailSess.ok, true);
+      const expectedTotalBytes = Buffer.byteLength(emojiKoreanBlock, 'utf8');
+      let assembled = '';
+      let detailOffset: number | null = 0;
+      let snapId = '';
+      while (detailOffset !== null) {
+        const dRes = await invoke('conversation_request', {
+          id: detailSess.result.id,
+          generation: detailSess.result.generation,
+          request: {
+            type: 'detail',
+            turnId: 'turn-detail-1',
+            itemId: 'item-detail-big',
+            offset: detailOffset,
+            ...(detailOffset > 0 ? { snapshotId: snapId } : {}),
+          },
+        });
+        assert.equal(dRes.ok, true);
+        assert.equal(dRes.result.totalBytes, expectedTotalBytes);
+        assert.equal(dRes.result.text.includes('\uFFFD'), false, 'UTF-8 boundary slice must never emit U+FFFD');
+        if (!snapId) snapId = dRes.result.snapshotId;
+        assert.equal(dRes.result.snapshotId, snapId);
+        assembled += dRes.result.text;
+        detailOffset = dRes.result.nextOffset;
+      }
+      assert.equal(assembled, emojiKoreanBlock);
+
+      const staleSnapRes = await invoke('conversation_request', {
+        id: detailSess.result.id,
+        generation: detailSess.result.generation,
+        request: {
+          type: 'detail',
+          turnId: 'turn-detail-1',
+          itemId: 'item-detail-big',
+          offset: 100,
+          snapshotId: 'stale-snapshot-id',
+        },
+      });
+      assert.equal(staleSnapRes.ok, false);
+
+      // 8. D-0030: saved_cron_save / saved_cron_delete / cron_request(add) validation & registration guard
+      const badCronAdd = await invoke('cron_request', {
+        id: sid,
+        generation: sgen,
+        request: { type: 'add', prompt: '   ', schedule: { type: 'every', seconds: 60 } },
+      });
+      assert.equal(badCronAdd.ok, false);
+
+      const badScheduleSave = await invoke('saved_cron_save', {
+        threadId: 'thread-d23-main',
+        prompt: '유효 프롬프트',
+        schedule: { type: 'every', seconds: 0 },
+      });
+      assert.equal(badScheduleSave.ok, false);
+
+      const savedDefRes = await invoke('saved_cron_save', {
+        threadId: 'thread-d23-main',
+        prompt: '  들여쓰기 보존 프롬프트  ',
+        schedule: { type: 'every', seconds: 300 },
+      });
+      assert.equal(savedDefRes.ok, true);
+      assert.equal(savedDefRes.result.prompt, '  들여쓰기 보존 프롬프트  ');
+
+      const regSavedRes = await invoke('saved_cron_register', {
+        id: sid,
+        generation: sgen,
+        definitionId: savedDefRes.result.id,
+        threadId: 'thread-d23-main',
+      });
+      assert.equal(regSavedRes.ok, true);
+
+      // Overwriting an already registered definition via saved_cron_save must be rejected
+      const overwriteRegRes = await invoke('saved_cron_save', {
+        id: savedDefRes.result.id,
+        threadId: 'thread-d23-main',
+        prompt: '덮어쓰기 시도',
+        schedule: { type: 'every', seconds: 300 },
+      });
+      assert.equal(overwriteRegRes.ok, false);
+
+      // Deleting with mismatched threadId must be rejected
+      const wrongThreadDel = await invoke('saved_cron_delete', {
+        id: savedDefRes.result.id,
+        threadId: 'other-thread-id',
+      });
+      assert.equal(wrongThreadDel.ok, false);
+
+      // Deleting with matching threadId succeeds when registration.state === 'registered'
+      const okDel = await invoke('saved_cron_delete', {
+        id: savedDefRes.result.id,
+        threadId: 'thread-d23-main',
+      });
+      assert.equal(okDel.ok, true);
+    } finally {
+      await srv.close();
+    }
+  } finally {
+    try { fs.rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch {}
+  }
+});
+
+test('release metadata, installer version, bilingual READMEs, and document templates stay synchronized', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const repoRoot = path.resolve(import.meta.dirname, '..');
+  const pkg = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+  const pkgLock = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package-lock.json'), 'utf8'));
+  const expectedTag = `v${pkg.version}`;
+
+  assert.equal(pkg.version, '1.2.3');
+  assert.equal(pkgLock.version, pkg.version);
+  assert.equal(pkgLock.packages?.['']?.version, pkg.version);
+
+  const installer = fs.readFileSync(path.join(repoRoot, 'scripts', 'install-relay.sh'), 'utf8');
+  assert.equal(installer.includes(`VERSION="\${OPENDIY_REMOTE_VERSION:-${expectedTag}}"`), true);
+  assert.equal(
+    installer.includes(`https://github.com/jaeseongs95/Arcvera-Connect/releases/download/${expectedTag}/install-relay.sh`),
+    true,
+  );
+
+  const readmeTemplatePath = path.join(repoRoot, 'docs', 'templates', 'README_TEMPLATE.md');
+  const releaseNotesTemplatePath = path.join(repoRoot, 'docs', 'templates', 'RELEASE_NOTES_TEMPLATE.md');
+  assert.equal(fs.existsSync(readmeTemplatePath), true);
+  assert.equal(fs.existsSync(releaseNotesTemplatePath), true);
+
+  const readmeEn = fs.readFileSync(path.join(repoRoot, 'README.md'), 'utf8');
+  const readmeKo = fs.readFileSync(path.join(repoRoot, 'README.ko.md'), 'utf8');
+  assert.equal(readmeEn.includes(`\`${expectedTag}\``), true);
+  assert.equal(readmeKo.includes(`\`${expectedTag}\``), true);
+  assert.equal(readmeEn.includes('README.ko.md'), true);
+  assert.equal(readmeKo.includes('README.md'), true);
+  assert.equal(
+    readmeEn.includes(`https://github.com/jaeseongs95/Arcvera-Connect/releases/download/${expectedTag}/install-relay.sh`),
+    true,
+  );
+  assert.equal(
+    readmeKo.includes(`https://github.com/jaeseongs95/Arcvera-Connect/releases/download/${expectedTag}/install-relay.sh`),
+    true,
+  );
+  assert.equal(readmeKo.includes('깡통'), false);
 });

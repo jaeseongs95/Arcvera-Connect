@@ -3,6 +3,19 @@
 // or when ?remote=1 is present in the URL, preserving standard desktop and test modes.
 
 const TOKEN_STORAGE_KEY = 'opendiy_remote_token';
+let activeEventSourceCleanup: (() => void) | null = null;
+
+export function signOutRemote(): void {
+  setStoredToken('');
+  try {
+    activeEventSourceCleanup?.();
+  } catch {
+    // Ignore cleanup errors during navigation.
+  }
+  if (typeof window !== 'undefined') {
+    window.location.href = '/auth/logout';
+  }
+}
 
 export function isRemoteBrowser(): boolean {
   if (typeof window === 'undefined') return false;
@@ -60,6 +73,12 @@ export function installRemoteBridge(): void {
   const callbacks = new Map<number, (value: unknown) => void>();
   const listeners = new Map<string, Set<number>>();
   let eventSource: EventSource | null = null;
+  activeEventSourceCleanup = () => {
+    if (eventSource) {
+      eventSource.close();
+      eventSource = null;
+    }
+  };
 
   function emitLocal(event: string, payload: unknown): void {
     const ids = listeners.get(event);
