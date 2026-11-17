@@ -2675,3 +2675,44 @@ test('D-0023 through D-0030: Arcvera-Connect slug/installer parity, pending ques
     try { fs.rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch {}
   }
 });
+
+test('release metadata, installer version, bilingual READMEs, and document templates stay synchronized', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const repoRoot = path.resolve(import.meta.dirname, '..');
+  const pkg = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+  const pkgLock = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package-lock.json'), 'utf8'));
+  const expectedTag = `v${pkg.version}`;
+
+  assert.equal(pkg.version, '1.2.3');
+  assert.equal(pkgLock.version, pkg.version);
+  assert.equal(pkgLock.packages?.['']?.version, pkg.version);
+
+  const installer = fs.readFileSync(path.join(repoRoot, 'scripts', 'install-relay.sh'), 'utf8');
+  assert.equal(installer.includes(`VERSION="\${OPENDIY_REMOTE_VERSION:-${expectedTag}}"`), true);
+  assert.equal(
+    installer.includes(`https://github.com/jaeseongs95/Arcvera-Connect/releases/download/${expectedTag}/install-relay.sh`),
+    true,
+  );
+
+  const readmeTemplatePath = path.join(repoRoot, 'docs', 'templates', 'README_TEMPLATE.md');
+  const releaseNotesTemplatePath = path.join(repoRoot, 'docs', 'templates', 'RELEASE_NOTES_TEMPLATE.md');
+  assert.equal(fs.existsSync(readmeTemplatePath), true);
+  assert.equal(fs.existsSync(releaseNotesTemplatePath), true);
+
+  const readmeEn = fs.readFileSync(path.join(repoRoot, 'README.md'), 'utf8');
+  const readmeKo = fs.readFileSync(path.join(repoRoot, 'README.ko.md'), 'utf8');
+  assert.equal(readmeEn.includes(`\`${expectedTag}\``), true);
+  assert.equal(readmeKo.includes(`\`${expectedTag}\``), true);
+  assert.equal(readmeEn.includes('README.ko.md'), true);
+  assert.equal(readmeKo.includes('README.md'), true);
+  assert.equal(
+    readmeEn.includes(`https://github.com/jaeseongs95/Arcvera-Connect/releases/download/${expectedTag}/install-relay.sh`),
+    true,
+  );
+  assert.equal(
+    readmeKo.includes(`https://github.com/jaeseongs95/Arcvera-Connect/releases/download/${expectedTag}/install-relay.sh`),
+    true,
+  );
+  assert.equal(readmeKo.includes('깡통'), false);
+});
